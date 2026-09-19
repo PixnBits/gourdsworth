@@ -1,0 +1,25 @@
+[project]
+name = "gourdsworth"
+version = "0.1.0"
+description = "Mayor Gourdsworth — private local-voice Halloween greeter"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "faster-whisper>=1.1.0",
+  "sounddevice>=0.5.1",
+  "numpy>=2.0.0",
+  "requests>=2.32.0",
+  "pyyaml>=6.0.2",
+  "piper-tts>=1.2.0",
+  "soundfile>=0.13.0",
+]
+
+[project.scripts]
+gourdsworth = "gourdsworth.app:main"
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]

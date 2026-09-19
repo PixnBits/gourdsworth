@@ -1,0 +1,33 @@
+# Copy to config.yaml. Audio never written to disk.
+
+mode: ptt          # ptt (spacebar) | vad (energy silence detect)
+sample_rate: 16000
+listen_limit_s: 8.0
+silence_s: 0.85
+energy_threshold: 0.012
+
+ollama:
+  host: http://127.0.0.1:11434
+  model: llama3.1:8b    # any small local instruct model already pulled
+  num_predict: 40
+  temperature: 0.6
+
+stt:
+  model: base.en        # tiny.en | base.en | small.en | turbo
+  device: auto          # auto | cpu | cuda
+  compute_type: int8
+
+tts:
+  engine: piper         # piper | espeak
+  voice: en_US-lessac-medium
+  speaker_id: 0
+
+privacy:
+  bind_host: 127.0.0.1
+  save_audio: false
+  save_transcripts: false
+  session_log: memory   # memory | none  (never disk)
+
+character: mayor
+max_history_turns: 4
+cooldown_s: 0.4
