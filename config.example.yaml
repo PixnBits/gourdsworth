@@ -21,7 +21,7 @@ stt:
 
 tts:
   engine: piper         # piper | espeak
-  voice: en_US-lessac-medium
+  voice: en_US-danny-low  # elected; lessac-medium is a fine fallback
   speaker_id: 0
 
 privacy:
