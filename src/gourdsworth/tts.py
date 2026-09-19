@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 import shutil
 import subprocess
 import tempfile
@@ -14,6 +16,22 @@ try:
 except Exception:  # pragma: no cover
     SynthesisConfig = None  # type: ignore
 
+
+
+
+_GOURD_GEOUS = re.compile(r"\b[Gg]ourd[-\s]*geous\b")
+
+
+def rewrite_puns_for_tts(text: str) -> str:
+    """Speak porch puns so Piper lands them (display text can stay normal)."""
+    def repl(m: re.Match[str]) -> str:
+        raw = m.group(0)
+        # Preserve leading capital if the model wrote Gourd-geous
+        if raw[0].isupper():
+            return "Gourd----geous"
+        return "gourd----geous"
+
+    return _GOURD_GEOUS.sub(repl, text or "")
 
 
 def split_bang_ending(text: str) -> str:
@@ -85,6 +103,7 @@ class Speaker:
         t0 = perf_counter()
         first = None
         text = split_bang_ending(text)
+        text = rewrite_puns_for_tts(text)
         if self.engine == "espeak" or (self._piper is None and not self._use_cli):
             audio, rate = self._espeak(text)
             first = (perf_counter() - t0) * 1000
