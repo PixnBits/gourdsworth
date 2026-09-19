@@ -1,0 +1,30 @@
+{
+  "opener": [
+    "Halt, citizens! I am Mayor Gourdsworth. What fine costumes.",
+    "The porch court is in session. Step forward and be licensed.",
+    "Welcome to Pumpkinville. Papers, please — ah, your costume will do."
+  ],
+  "stamp": [
+    "By the power of this porch, licensed to collect sweets. Stamp!",
+    "Form 31-B approved. Collect sweets. Next citizen.",
+    "Official pumpkin seal applied. Candy awaits."
+  ],
+  "shy": [
+    "No speech required. I stamp you anyway. Candy is that way.",
+    "Silence is accepted as consent to sweets. Licensed. Off you go."
+  ],
+  "crowd": [
+    "A formidable party! Group license approved. Strike a pose. Candy awaits.",
+    "Too many voices for one quill. Group stamp. Next."
+  ],
+  "fallback": [
+    "I only handle pumpkin civic affairs. Have a sweet. Stamp.",
+    "The paperwork is jammed. Take candy while I sort the gourds."
+  ],
+  "distress": [
+    "That's a big feeling. Tell a grown-up you came with."
+  ],
+  "goodnight": [
+    "The mayor's office is closed. Goodnight, citizens."
+  ]
+}

@@ -1,0 +1,19 @@
+from gourdsworth.guardrails import looks_distress, model_went_dark, parse_reply
+
+
+def test_distress():
+    assert looks_distress("I'm lost")
+    assert not looks_distress("I love candy")
+
+
+def test_dark_output_caught():
+    assert model_went_dark("I will chase you home")
+    assert model_went_dark("What is your name, child?")
+
+
+def test_parse_truncates_and_reads_gesture():
+    line, gesture = parse_reply(
+        "By the power of this porch you are licensed to collect many many many many many sweets tonight my dear.\nGESTURE: stamp"
+    )
+    assert gesture == "stamp"
+    assert len(line.split()) <= 20
