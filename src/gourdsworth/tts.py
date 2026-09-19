@@ -16,6 +16,7 @@ class Speaker:
         self.voice = voice
         self._piper = None
         self._voice_path: Path | None = None
+        self._use_cli = False
         if engine == "piper":
             self._init_piper(voice)
 
@@ -46,25 +47,103 @@ class Speaker:
             raise RuntimeError(f"Could not locate Piper voice {voice}")
         self._voice_path = onnx
         self._piper = PiperVoice.load(str(onnx))
+        # Some piper-tts builds expose synthesize; others only CLI / stream_raw.
+        if not hasattr(self._piper, "synthesize"):
+            self._use_cli = True
+            print("  PiperVoice.synthesize missing; will use piper CLI fallback")
 
     def synthesize(self, text: str) -> tuple[np.ndarray, int, float, float]:
         t0 = perf_counter()
         first = None
-        if self.engine == "espeak" or self._piper is None:
+        if self.engine == "espeak" or (self._piper is None and not self._use_cli):
             audio, rate = self._espeak(text)
             first = (perf_counter() - t0) * 1000
             return audio, rate, first, (perf_counter() - t0) * 1000
 
-        chunks: list[np.ndarray] = []
-        rate = 22050
-        for chunk in self._piper.synthesize(text):
-            if first is None:
-                first = (perf_counter() - t0) * 1000
-            samples = np.asarray(chunk.audio_float_array, dtype=np.float32)
-            rate = int(chunk.sample_rate)
-            chunks.append(samples)
-        audio = np.concatenate(chunks) if chunks else np.zeros(1, dtype=np.float32)
-        return audio, rate, (first or 0.0), (perf_counter() - t0) * 1000
+        if self._use_cli or not hasattr(self._piper, "synthesize"):
+            audio, rate = self._piper_cli(text)
+            first = (perf_counter() - t0) * 1000
+            return audio, rate, first, (perf_counter() - t0) * 1000
+
+        try:
+            chunks: list[np.ndarray] = []
+            rate = 22050
+            for chunk in self._piper.synthesize(text):
+                if first is None:
+                    first = (perf_counter() - t0) * 1000
+                samples = self._chunk_to_float(chunk)
+                rate = int(getattr(chunk, "sample_rate", rate) or rate)
+                chunks.append(samples)
+            audio = np.concatenate(chunks) if chunks else np.zeros(1, dtype=np.float32)
+            return audio, rate, (first or 0.0), (perf_counter() - t0) * 1000
+        except Exception as exc:
+            print(f"  Piper Python synthesize failed ({exc}); falling back to CLI")
+            self._use_cli = True
+            audio, rate = self._piper_cli(text)
+            first = (perf_counter() - t0) * 1000
+            return audio, rate, first, (perf_counter() - t0) * 1000
+
+    @staticmethod
+    def _chunk_to_float(chunk) -> np.ndarray:
+        if hasattr(chunk, "audio_float_array"):
+            return np.asarray(chunk.audio_float_array, dtype=np.float32)
+        if hasattr(chunk, "audio_int16_bytes"):
+            raw = np.frombuffer(chunk.audio_int16_bytes, dtype=np.int16)
+            return (raw.astype(np.float32) / 32768.0)
+        if isinstance(chunk, (bytes, bytearray)):
+            raw = np.frombuffer(chunk, dtype=np.int16)
+            return raw.astype(np.float32) / 32768.0
+        return np.asarray(chunk, dtype=np.float32)
+
+    def _piper_cli(self, text: str) -> tuple[np.ndarray, int]:
+        """Fall back to `piper` CLI writing WAV to an unlinked NamedTemporaryFile."""
+        if self._voice_path is None:
+            raise RuntimeError("No Piper voice path for CLI fallback")
+        piper_bin = shutil.which("piper") or shutil.which("piper-tts")
+        if not piper_bin:
+            raise RuntimeError(
+                "PiperVoice.synthesize unavailable and no `piper` CLI on PATH"
+            )
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            tmp_path = tmp.name
+        try:
+            proc = subprocess.run(
+                [
+                    piper_bin,
+                    "--model",
+                    str(self._voice_path),
+                    "--output_file",
+                    tmp_path,
+                ],
+                input=text.encode("utf-8"),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            if proc.returncode != 0:
+                proc2 = subprocess.run(
+                    [
+                        piper_bin,
+                        "--model",
+                        str(self._voice_path),
+                        "--output_file",
+                        "-",
+                    ],
+                    input=text.encode("utf-8"),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                )
+                if proc2.returncode != 0 or not proc2.stdout:
+                    err = (proc.stderr or proc2.stderr or b"").decode("utf-8", "replace")
+                    raise RuntimeError(f"piper CLI failed: {err.strip() or proc.returncode}")
+                rate = int(getattr(self._piper, "config", None) and getattr(self._piper.config, "sample_rate", 22050) or 22050)
+                raw = np.frombuffer(proc2.stdout, dtype=np.int16)
+                return raw.astype(np.float32) / 32768.0, rate
+            audio, rate = sf.read(tmp_path, dtype="float32")
+            return np.asarray(audio, dtype=np.float32).reshape(-1), int(rate)
+        finally:
+            Path(tmp_path).unlink(missing_ok=True)
 
     def _espeak(self, text: str) -> tuple[np.ndarray, int]:
         if not shutil.which("espeak-ng") and not shutil.which("espeak"):
