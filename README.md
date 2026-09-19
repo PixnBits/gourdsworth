@@ -21,18 +21,20 @@ Ollama must already be running with a small instruct model:
 
 ```bash
 ollama pull llama3.1:8b
-# or whatever 4B–8B model you already keep warm
+# or whatever 4B–14B instruct model you already keep warm (e.g. qwen2.5:14b)
 ```
 
-Set `ollama.model` in `config.yaml` to that name.
+Set `ollama.model` in `config.yaml` to that name. If the configured name is not pulled, startup auto-selects the best already-pulled instruct model (prefers ~7–8B; 14B is accepted when that is the smallest).
 
 ```bash
-python -m gourdsworth          # push-to-talk: Enter to listen, Enter to stop
+python -m gourdsworth --list-devices   # pick mic/speaker ids
+python -m gourdsworth --input N --output N
+python -m gourdsworth                  # push-to-talk: Enter to listen, Enter to stop
 python -m gourdsworth --mode vad
 python -m gourdsworth --dry-run
 ```
 
-`--dry-run` skips the mic and TTS so you can type kid-proxy lines and still see LLM timing.
+`--dry-run` skips the mic and speaker playback so you can type kid-proxy lines and still see LLM (+ optional TTS synth) timing. Startup still preloads Whisper, warms Ollama (`keep_alive`), and loads Piper, printing load times.
 
 Every spoken turn prints a metrics line:
 
@@ -47,7 +49,7 @@ record=…ms  stt=…ms  llm_ttft=…ms  llm=…ms  tts_first=…ms  tts=…ms  
 - `save_audio` and `save_transcripts` are hard-refused at startup if set true
 - Ollama is called at `127.0.0.1` only
 - History is four turns of **text**, in process memory
-- No WAV files in the project workflow (espeak fallback may use a NamedTemporaryFile that is unlinked immediately)
+- No WAV files in the project workflow (espeak / Piper-CLI fallback may use a NamedTemporaryFile that is unlinked immediately)
 
 ## Character
 
