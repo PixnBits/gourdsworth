@@ -41,16 +41,36 @@ def strip_markdown(text: str) -> str:
     return " ".join(text.split())
 
 
-def parse_reply(raw: str) -> tuple[str, str]:
+GESTURE_RE = re.compile(
+    r"(?:^|\s)GESTURE\s*:\s*([A-Za-z]+)\b",
+    re.I | re.M,
+)
+ALLOWED_GESTURES = frozenset({"stamp", "wave", "think", "laugh", "bow", "listen"})
+
+
+def _extract_gesture(raw: str) -> tuple[str, str]:
+    """Return (text_without_gesture, gesture_name). Default gesture is stamp."""
     gesture = "stamp"
-    lines = [ln.strip() for ln in (raw or "").splitlines() if ln.strip()]
-    spoken: list[str] = []
-    for line in lines:
-        if line.upper().startswith("GESTURE:"):
-            gesture = line.split(":", 1)[1].strip().lower() or "stamp"
-            continue
-        spoken.append(line)
-    line = strip_markdown(" ".join(spoken))
+    matches = list(GESTURE_RE.finditer(raw or ""))
+    if matches:
+        name = matches[-1].group(1).strip().lower()
+        if name in ALLOWED_GESTURES:
+            gesture = name
+        # Strip all GESTURE tags from spoken text
+        cleaned = GESTURE_RE.sub(" ", raw or "")
+    else:
+        cleaned = raw or ""
+    return cleaned, gesture
+
+
+def parse_reply(raw: str) -> tuple[str, str]:
+    cleaned, gesture = _extract_gesture(raw)
+    # Drop empty lines left behind after tag removal
+    lines = [ln.strip() for ln in cleaned.splitlines() if ln.strip()]
+    line = strip_markdown(" ".join(lines))
+    # Belt-and-suspenders: never speak the word GESTURE
+    line = re.sub(r"\bGESTURE\b\s*:?", "", line, flags=re.I)
+    line = strip_markdown(line)
     words = line.split()
     if len(words) > 22:
         line = " ".join(words[:20]).rstrip(".,;") + "."
@@ -61,15 +81,8 @@ def early_speakable(raw: str, *, min_words: int = 12) -> str | None:
     """Return a speakable prefix once we have a sentence or min_words (M1 early TTS)."""
     if not raw:
         return None
-    spoken: list[str] = []
-    for line in raw.splitlines():
-        s = line.strip()
-        if not s:
-            continue
-        if s.upper().startswith("GESTURE:"):
-            continue
-        spoken.append(s)
-    text = strip_markdown(" ".join(spoken)).strip()
+    cleaned, _gesture = _extract_gesture(raw)
+    text = strip_markdown(cleaned).strip()
     if not text:
         return None
     # Prefer first sentence boundary after a few words
