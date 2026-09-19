@@ -132,20 +132,27 @@ def parse_reply(raw: str) -> tuple[str, str]:
 
 
 def early_speakable(raw: str, *, min_words: int = 12) -> str | None:
-    """Return a speakable prefix once we have a sentence or min_words (M1 early TTS)."""
+    """Return a speakable prefix at a prosodic boundary (M1 early TTS).
+
+    Flush only at `.?!` or a comma — never a bare N-word chop mid-phrase
+    (that was splitting "...permitted to" / "collect treats...").
+    `min_words` is a floor before we accept a comma flush so we don't
+    speak a tiny fragment.
+    """
     if not raw:
         return None
     cleaned, _gesture = _extract_gesture(raw)
     text = strip_markdown(cleaned).strip()
     if not text:
         return None
-    # Prefer first sentence boundary after a few words
+    # Strong boundary: first sentence end after a few words
     for i, ch in enumerate(text):
         if ch in ".!?" and len(text[: i + 1].split()) >= 3:
             return text[: i + 1].strip()
-    words = text.split()
-    if len(words) >= min_words:
-        return " ".join(words[:min_words])
+    # Softer boundary: comma, but only once we have enough words
+    for i, ch in enumerate(text):
+        if ch == "," and len(text[: i + 1].split()) >= min_words:
+            return text[: i + 1].strip()
     return None
 
 
