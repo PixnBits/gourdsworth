@@ -68,6 +68,7 @@ Measured on Framework Desktop (AMD Ryzen AI Max / Strix Halo), pipewire I/O, Pip
 | Setup | first_syllable | notes |
 |-------|----------------:|-------|
 | M0 · qwen2.5:14b · base.en · wait-for-full-reply | ~1650 ms | live VAD |
-| M1 · early TTS + tiny.en · qwen2.5:14b | **~903 ms** | dry-run `[early-tts]`; live TBD |
+| M1 · early TTS + tiny.en · qwen2.5:14b | **~903 ms** | dry-run `[early-tts]` |
+| M1 · early TTS + tiny.en · llama3.1:8b | **~655–821 ms** | live VAD, pipewire I/O |
 
 `first_syllable ≈ stt + time_to_first_audio` after the kid stops talking.
