@@ -32,6 +32,7 @@ python -m gourdsworth --input N --output N
 python -m gourdsworth                  # push-to-talk: Enter to listen, Enter to stop
 python -m gourdsworth --mode vad
 python -m gourdsworth --dry-run
+python -m gourdsworth --stt-model tiny.en --mode vad --input 6 --output 8
 ```
 
 `--dry-run` skips the mic and speaker playback so you can type kid-proxy lines and still see LLM (+ optional TTS synth) timing. Startup still preloads Whisper, warms Ollama (`keep_alive`), and loads Piper, printing load times.
@@ -58,3 +59,16 @@ record=…ms  stt=…ms  llm_ttft=…ms  llm=…ms  tts_first=…ms  tts=…ms  
 ## Hardware later
 
 Jaw = RMS of the outgoing samples. Body = six canned gestures the model *names*. Do not generate servo trajectories. See `ARCHITECTURE.md`.
+
+
+## Latency results
+
+Measured on Framework Desktop (AMD Ryzen AI Max / Strix Halo), pipewire I/O, Piper `en_US-lessac-medium`.
+
+| Setup | first_syllable | notes |
+|-------|----------------:|-------|
+| M0 · qwen2.5:14b · base.en · wait-for-full-reply | ~1650 ms | live VAD |
+| M1 · early TTS + tiny.en · qwen2.5:14b | **~903 ms** | dry-run `[early-tts]` |
+| M1 · early TTS + tiny.en · llama3.1:8b | **~655–821 ms** | live VAD, pipewire I/O |
+
+`first_syllable ≈ stt + time_to_first_audio` after the kid stops talking.

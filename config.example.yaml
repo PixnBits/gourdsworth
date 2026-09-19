@@ -3,7 +3,7 @@
 mode: ptt          # ptt (spacebar) | vad (energy silence detect)
 sample_rate: 16000
 listen_limit_s: 8.0
-silence_s: 0.85
+silence_s: 0.55  # was 0.85; snappier end-of-utterance
 energy_threshold: 0.012
 
 ollama:

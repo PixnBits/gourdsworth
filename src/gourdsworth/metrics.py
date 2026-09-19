@@ -14,14 +14,19 @@ class TurnMetrics:
     tts_first_ms: float = 0.0
     tts_total_ms: float = 0.0
     play_ms: float = 0.0
+    # Wall time from end of STT to first audio sample leaving TTS (early flush aware)
+    to_first_audio_ms: float = 0.0
     words_in: int = 0
     words_out: int = 0
     used_canned: bool = False
+    early_flush: bool = False
 
     def end_to_end_ms(self) -> float:
         return (perf_counter() - self.t0) * 1000
 
     def first_audio_from_silence_ms(self) -> float:
+        if self.to_first_audio_ms > 0:
+            return self.stt_ms + self.to_first_audio_ms
         return self.stt_ms + self.llm_ttft_ms + self.tts_first_ms
 
     def render(self) -> str:
@@ -35,5 +40,6 @@ class TurnMetrics:
             f"play={self.play_ms:.0f}ms  "
             f"first_syllable≈{self.first_audio_from_silence_ms():.0f}ms  "
             f"turn={self.end_to_end_ms():.0f}ms"
+            + ("  [early-tts]" if self.early_flush else "")
             + ("  [canned]" if self.used_canned else "")
         )

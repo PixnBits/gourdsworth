@@ -115,12 +115,26 @@ class LocalMayor:
         return (perf_counter() - t0) * 1000
 
     def reply(self, user_text: str, history: list[dict]) -> tuple[str, float, float]:
+        t0 = perf_counter()
+        chunks: list[str] = []
+        ttft = None
+        for piece, piece_ttft, done in self.reply_stream(user_text, history):
+            if piece_ttft is not None and ttft is None:
+                ttft = piece_ttft
+            if piece:
+                chunks.append(piece)
+        total = (perf_counter() - t0) * 1000
+        return "".join(chunks).strip(), (ttft or total), total
+
+    def reply_stream(self, user_text: str, history: list[dict]):
+        """Yield (piece, ttft_ms_or_None, done). ttft set on first non-empty piece only."""
+        import json
+
         messages = [{"role": "system", "content": self.system}]
         messages.extend(history)
         messages.append({"role": "user", "content": user_text or "(silence)"})
         t0 = perf_counter()
-        ttft = None
-        chunks: list[str] = []
+        ttft_sent = False
         with requests.post(
             f"{self.host}/api/chat",
             json={
@@ -140,15 +154,15 @@ class LocalMayor:
             for line in r.iter_lines():
                 if not line:
                     continue
-                import json
-
                 payload = json.loads(line)
                 piece = payload.get("message", {}).get("content", "")
-                if piece:
-                    if ttft is None:
-                        ttft = (perf_counter() - t0) * 1000
-                    chunks.append(piece)
-                if payload.get("done"):
+                done = bool(payload.get("done"))
+                ttft = None
+                if piece and not ttft_sent:
+                    ttft = (perf_counter() - t0) * 1000
+                    ttft_sent = True
+                if piece or done:
+                    yield piece, ttft, done
+                if done:
                     break
-        total = (perf_counter() - t0) * 1000
-        return "".join(chunks).strip(), (ttft or total), total
+
