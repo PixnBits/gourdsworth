@@ -31,6 +31,7 @@ python -m gourdsworth --list-devices   # pick mic/speaker ids
 python -m gourdsworth --input N --output N
 python -m gourdsworth                  # push-to-talk: Enter to listen, Enter to stop
 python -m gourdsworth --mode vad
+python -m gourdsworth --continuous --input 6 --output 8   # hands-free porch loop
 python -m gourdsworth --dry-run
 python -m gourdsworth --stt-model tiny.en --mode vad --input 6 --output 8
 ```
