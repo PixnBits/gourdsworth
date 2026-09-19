@@ -9,6 +9,35 @@ from time import perf_counter
 import numpy as np
 import soundfile as sf
 
+try:
+    from piper.config import SynthesisConfig
+except Exception:  # pragma: no cover
+    SynthesisConfig = None  # type: ignore
+
+
+
+def split_bang_ending(text: str) -> str:
+    """Make trailing ! land as its own short beat (Piper often flattens ', I see!').
+
+    Preferred porch shape: '...their game. I see!' instead of '...game, I see!'.
+    Only splits when the final tag after a comma/dash is short (1–5 words).
+    """
+    text = (text or "").strip()
+    if not text.endswith("!"):
+        return text
+    body = text[:-1].rstrip()
+    for sep in (", ", " — ", " – ", " - "):
+        if sep not in body:
+            continue
+        head, tail = body.rsplit(sep, 1)
+        tail = tail.strip()
+        n = len(tail.split())
+        if 1 <= n <= 5 and head.strip():
+            if tail and tail[0].islower():
+                tail = tail[0].upper() + tail[1:]
+            return f"{head.rstrip(' .,;:')}. {tail}!"
+    return text
+
 
 class Speaker:
     def __init__(self, engine: str, voice: str):
@@ -55,6 +84,7 @@ class Speaker:
     def synthesize(self, text: str) -> tuple[np.ndarray, int, float, float]:
         t0 = perf_counter()
         first = None
+        text = split_bang_ending(text)
         if self.engine == "espeak" or (self._piper is None and not self._use_cli):
             audio, rate = self._espeak(text)
             first = (perf_counter() - t0) * 1000
@@ -68,7 +98,11 @@ class Speaker:
         try:
             chunks: list[np.ndarray] = []
             rate = 22050
-            for chunk in self._piper.synthesize(text):
+            syn_cfg = None
+            if SynthesisConfig is not None and text.rstrip().endswith("!"):
+                # Slightly snappier on exclamations; split_bang_ending did the prosody shape
+                syn_cfg = SynthesisConfig(length_scale=0.92)
+            for chunk in self._piper.synthesize(text, syn_config=syn_cfg):
                 if first is None:
                     first = (perf_counter() - t0) * 1000
                 samples = self._chunk_to_float(chunk)
