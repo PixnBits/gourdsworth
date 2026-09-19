@@ -61,6 +61,10 @@ record=…ms  stt=…ms  llm_ttft=…ms  llm=…ms  tts_first=…ms  tts=…ms  
 Jaw = RMS of the outgoing samples. Body = six canned gestures the model *names*. Do not generate servo trajectories. See `ARCHITECTURE.md`.
 
 
+## Mayor voice
+
+Default Piper voice is `en_US-danny-low` (fun, not intimidating). Switch back with `tts.voice: en_US-lessac-medium` in `config.yaml`.
+
 ## Latency results
 
 Measured on Framework Desktop (AMD Ryzen AI Max / Strix Halo), pipewire I/O, Piper `en_US-lessac-medium`.
