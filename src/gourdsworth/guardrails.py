@@ -61,8 +61,9 @@ def strip_markdown(text: str) -> str:
     return " ".join(text.split())
 
 
+# Model sometimes emits "GESTURE: wave", "Gesture: wave", or even "Wave: wave".
 GESTURE_RE = re.compile(
-    r"(?:^|\s)GESTURE\s*:\s*([A-Za-z]+)\b",
+    r"(?:^|\s)(?:GESTURE|Gesture|gesture|Wave|WAVE)\s*:\s*([A-Za-z]+)\b",
     re.I | re.M,
 )
 ALLOWED_GESTURES = frozenset({"stamp", "wave", "think", "laugh", "bow", "listen"})
@@ -148,6 +149,20 @@ def parse_reply(raw: str) -> tuple[str, str]:
     line = re.sub(r"\bGESTURE\b\s*:?", "", line, flags=re.I)
     line = strip_markdown(line)
     line = clip_spoken(line, max_words=20)
+    # If the model only emitted a gesture tag, don't speak "Wave: wave"
+    if not line:
+        line = "Stamp applied. Candy awaits."
+    # Catch residual "Wave: wave" / "Gesture: stamp" left as spoken text
+    only_gesture = re.fullmatch(
+        r"(?:GESTURE|Gesture|gesture|Wave|WAVE)\s*:\s*([A-Za-z]+)\s*",
+        line,
+        flags=re.I,
+    )
+    if only_gesture:
+        name = only_gesture.group(1).strip().lower()
+        if name in ALLOWED_GESTURES:
+            gesture = name
+        line = "Stamp applied. Candy awaits."
     return line, gesture
 
 
