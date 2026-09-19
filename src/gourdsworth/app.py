@@ -10,7 +10,13 @@ from time import perf_counter
 
 from gourdsworth.audio_io import list_devices, play, record_ptt, record_vad, set_devices
 from gourdsworth.config import canned_path, load_config, prompt_path
-from gourdsworth.guardrails import looks_distress, model_went_dark, parse_reply
+from gourdsworth.guardrails import (
+    early_speakable,
+    looks_distress,
+    model_went_dark,
+    parse_reply,
+    remainder_after,
+)
 from gourdsworth.llm import LocalMayor
 from gourdsworth.metrics import TurnMetrics
 from gourdsworth.stt import SpeechToText
@@ -26,6 +32,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--config", type=Path, default=None)
     parser.add_argument("--mode", choices=["ptt", "vad"], default=None)
     parser.add_argument("--model", default=None, help="Override Ollama model name")
+    parser.add_argument(
+        "--stt-model",
+        default=None,
+        choices=["tiny.en", "base.en", "small.en", "turbo"],
+        help="Override faster-whisper model",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Skip audio; type lines instead")
     parser.add_argument(
         "--list-devices",
@@ -53,6 +65,8 @@ def main(argv: list[str] | None = None) -> int:
         cfg["mode"] = args.mode
     if args.model:
         cfg["ollama"]["model"] = args.model
+    if args.stt_model:
+        cfg["stt"]["model"] = args.stt_model
     cfg["_input_device"] = args.input
     cfg["_output_device"] = args.output
 
@@ -190,6 +204,10 @@ def _handle_turn(user_text, mayor, speaker, canned, history, cfg, metrics, typed
     metrics.words_in = len(user_text.split())
     print(f"Heard: {user_text!r}" if user_text else "Heard: (silence)")
 
+    gesture = "stamp"
+    line = ""
+    t_post_stt = perf_counter()
+
     if looks_distress(user_text):
         line = canned["distress"][0]
         gesture = "listen"
@@ -199,25 +217,73 @@ def _handle_turn(user_text, mayor, speaker, canned, history, cfg, metrics, typed
         gesture = "stamp"
         metrics.used_canned = True
     else:
-        raw, metrics.llm_ttft_ms, metrics.llm_total_ms = mayor.reply(user_text, history)
+        # M1: stream tokens; start TTS on first sentence or 12 words — do not wait for full reply
+        parts: list[str] = []
+        early: str | None = None
+        ttft = None
+        t_llm0 = perf_counter()
+        for piece, piece_ttft, done in mayor.reply_stream(user_text, history):
+            if piece_ttft is not None and ttft is None:
+                ttft = piece_ttft
+                metrics.llm_ttft_ms = ttft
+            if piece:
+                parts.append(piece)
+            buf = "".join(parts)
+            if early is None:
+                early = early_speakable(buf, min_words=12)
+                if early and speaker is not None:
+                    metrics.early_flush = True
+                    samples, rate, tts_first, tts_total = speaker.synthesize(early)
+                    if metrics.tts_first_ms == 0:
+                        metrics.tts_first_ms = tts_first
+                    metrics.tts_total_ms += tts_total
+                    if metrics.to_first_audio_ms == 0:
+                        metrics.to_first_audio_ms = (perf_counter() - t_post_stt) * 1000
+                    if not typed:
+                        metrics.play_ms += play(samples, rate, cfg.get("_output_device"))
+                    del samples
+            if done:
+                break
+        metrics.llm_total_ms = (perf_counter() - t_llm0) * 1000
+        raw = "".join(parts).strip()
         line, gesture = parse_reply(raw)
         if not line or model_went_dark(line):
             line = random.choice(canned["fallback"])
             gesture = "stamp"
             metrics.used_canned = True
+            early = None  # speak full canned below
+        elif early:
+            # Speak only the not-yet-spoken tail (if any)
+            rem = remainder_after(line, early)
+            if rem and speaker is not None and not typed:
+                samples, rate, tts_first, tts_total = speaker.synthesize(rem)
+                metrics.tts_total_ms += tts_total
+                metrics.play_ms += play(samples, rate, cfg.get("_output_device"))
+                del samples
+            elif rem and speaker is not None and typed:
+                samples, rate, tts_first, tts_total = speaker.synthesize(rem)
+                if metrics.tts_first_ms == 0:
+                    metrics.tts_first_ms = tts_first
+                metrics.tts_total_ms += tts_total
+                del samples
 
     metrics.words_out = len(line.split())
     print(f"Mayor: {line}")
     print(f"Gesture: {gesture}")
 
-    if speaker is not None and not typed:
-        samples, rate, metrics.tts_first_ms, metrics.tts_total_ms = speaker.synthesize(line)
-        metrics.play_ms = play(samples, rate, cfg.get("_output_device"))
-        del samples
-    elif speaker is not None and typed:
-        # dry-run / typed: still synthesize for timing if speaker loaded, but do not play
-        samples, rate, metrics.tts_first_ms, metrics.tts_total_ms = speaker.synthesize(line)
-        del samples
+    # Canned / no-early path: synthesize full line once
+    if speaker is not None and (metrics.used_canned or not metrics.early_flush):
+        if typed:
+            samples, rate, metrics.tts_first_ms, metrics.tts_total_ms = speaker.synthesize(line)
+            if metrics.to_first_audio_ms == 0:
+                metrics.to_first_audio_ms = (perf_counter() - t_post_stt) * 1000
+            del samples
+        else:
+            samples, rate, metrics.tts_first_ms, metrics.tts_total_ms = speaker.synthesize(line)
+            if metrics.to_first_audio_ms == 0:
+                metrics.to_first_audio_ms = (perf_counter() - t_post_stt) * 1000
+            metrics.play_ms = play(samples, rate, cfg.get("_output_device"))
+            del samples
 
     if cfg["privacy"]["session_log"] == "memory" and user_text and not metrics.used_canned:
         history.append({"role": "user", "content": user_text})
@@ -227,6 +293,7 @@ def _handle_turn(user_text, mayor, speaker, canned, history, cfg, metrics, typed
 
     print(metrics.render())
     print()
+
 
 
 if __name__ == "__main__":

@@ -55,3 +55,44 @@ def parse_reply(raw: str) -> tuple[str, str]:
     if len(words) > 22:
         line = " ".join(words[:20]).rstrip(".,;") + "."
     return line, gesture
+
+
+def early_speakable(raw: str, *, min_words: int = 12) -> str | None:
+    """Return a speakable prefix once we have a sentence or min_words (M1 early TTS)."""
+    if not raw:
+        return None
+    spoken: list[str] = []
+    for line in raw.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        if s.upper().startswith("GESTURE:"):
+            continue
+        spoken.append(s)
+    text = strip_markdown(" ".join(spoken)).strip()
+    if not text:
+        return None
+    # Prefer first sentence boundary after a few words
+    for i, ch in enumerate(text):
+        if ch in ".!?" and len(text[: i + 1].split()) >= 3:
+            return text[: i + 1].strip()
+    words = text.split()
+    if len(words) >= min_words:
+        return " ".join(words[:min_words])
+    return None
+
+
+def remainder_after(full: str, spoken_prefix: str) -> str:
+    """Words in full not already covered by spoken_prefix."""
+    full_words = (full or "").split()
+    pref_words = (spoken_prefix or "").split()
+    if not pref_words:
+        return full or ""
+    # If full starts with prefix words, drop them
+    n = len(pref_words)
+    if full_words[:n] == pref_words:
+        return " ".join(full_words[n:]).strip()
+    # Fallback: if prefix is a substring, cut once
+    if spoken_prefix and spoken_prefix in (full or ""):
+        return (full.split(spoken_prefix, 1)[1]).strip(" .,;:")
+    return ""
