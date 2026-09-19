@@ -6,8 +6,9 @@ import random
 import sys
 import time
 from pathlib import Path
+from time import perf_counter
 
-from gourdsworth.audio_io import play, record_ptt, record_vad
+from gourdsworth.audio_io import list_devices, play, record_ptt, record_vad, set_devices
 from gourdsworth.config import canned_path, load_config, prompt_path
 from gourdsworth.guardrails import looks_distress, model_went_dark, parse_reply
 from gourdsworth.llm import LocalMayor
@@ -26,13 +27,34 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--mode", choices=["ptt", "vad"], default=None)
     parser.add_argument("--model", default=None, help="Override Ollama model name")
     parser.add_argument("--dry-run", action="store_true", help="Skip audio; type lines instead")
+    parser.add_argument(
+        "--list-devices",
+        action="store_true",
+        help="Print sounddevice input/output ids and exit",
+    )
+    parser.add_argument("--input", type=int, default=None, metavar="N", help="Input device id")
+    parser.add_argument("--output", type=int, default=None, metavar="N", help="Output device id")
     args = parser.parse_args(argv)
+
+    if args.list_devices:
+        print(list_devices())
+        return 0
+
+    if args.input is not None or args.output is not None:
+        try:
+            set_devices(args.input, args.output)
+        except OSError as exc:
+            print(f"Could not set audio devices ({exc})")
+            if not args.dry_run:
+                return 1
 
     cfg = load_config(args.config)
     if args.mode:
         cfg["mode"] = args.mode
     if args.model:
         cfg["ollama"]["model"] = args.model
+    cfg["_input_device"] = args.input
+    cfg["_output_device"] = args.output
 
     if cfg["privacy"].get("save_audio") or cfg["privacy"].get("save_transcripts"):
         print("Refusing to start: save_audio / save_transcripts must stay false.")
@@ -42,6 +64,8 @@ def main(argv: list[str] | None = None) -> int:
     canned = _load_canned()
     print("Gourdsworth 0.1 — local only, audio stays in RAM")
     print(f"  mode={cfg['mode']}  ollama={cfg['ollama']['model']}  stt={cfg['stt']['model']}")
+    if args.input is not None or args.output is not None:
+        print(f"  devices: input={args.input} output={args.output}")
 
     mayor = LocalMayor(
         host=cfg["ollama"]["host"],
@@ -50,24 +74,56 @@ def main(argv: list[str] | None = None) -> int:
         temperature=float(cfg["ollama"]["temperature"]),
         system=system,
     )
+
+    # --- Preload: Ollama resolve + keep_alive warm, Whisper, Piper ---
+    print("  loading Ollama…")
+    t0 = perf_counter()
     try:
-        mayor.ping()
+        chosen = mayor.ping()
+        cfg["ollama"]["model"] = chosen
+        ollama_resolve_ms = (perf_counter() - t0) * 1000
+        print(f"  ollama model={chosen}  resolve={ollama_resolve_ms:.0f}ms")
+        t1 = perf_counter()
+        warm_ms = mayor.warm()
+        print(f"  ollama warm(keep_alive)={warm_ms:.0f}ms  (ping wall={(perf_counter()-t1)*1000:.0f}ms)")
     except Exception as exc:
         print(f"Ollama not ready at {cfg['ollama']['host']}: {exc}")
-        print("Start ollama and pull a small instruct model, e.g. `ollama pull llama3.1:8b`")
+        print("Start ollama and pull a small instruct model, e.g. `ollama pull qwen2.5:14b`")
         return 1
 
     stt = None
     speaker = None
-    if not args.dry_run:
-        print("  loading STT…")
+    # Preload STT + TTS even in dry-run so load times are visible; dry-run still skips mic/play.
+    print("  loading STT…")
+    t0 = perf_counter()
+    try:
         stt = SpeechToText(cfg["stt"]["model"], cfg["stt"]["device"], cfg["stt"]["compute_type"])
-        print("  loading TTS…")
+        print(f"  stt load={((perf_counter()-t0)*1000):.0f}ms  model={cfg['stt']['model']}")
+    except Exception as exc:
+        if args.dry_run:
+            print(f"  STT load skipped/failed in dry-run ({exc})")
+        else:
+            print(f"  STT failed: {exc}")
+            return 1
+
+    print("  loading TTS…")
+    t0 = perf_counter()
+    try:
+        speaker = Speaker(cfg["tts"]["engine"], cfg["tts"]["voice"])
+        print(f"  tts load={((perf_counter()-t0)*1000):.0f}ms  engine={cfg['tts']['engine']}")
+    except Exception as exc:
+        print(f"  Piper failed ({exc}); trying espeak fallback")
         try:
-            speaker = Speaker(cfg["tts"]["engine"], cfg["tts"]["voice"])
-        except Exception as exc:
-            print(f"  Piper failed ({exc}); trying espeak fallback")
+            t0 = perf_counter()
             speaker = Speaker("espeak", cfg["tts"]["voice"])
+            print(f"  tts load={((perf_counter()-t0)*1000):.0f}ms  engine=espeak")
+        except Exception as exc2:
+            if args.dry_run:
+                print(f"  TTS unavailable in dry-run ({exc2}); will print only")
+                speaker = None
+            else:
+                print(f"  TTS failed: {exc2}")
+                return 1
 
     history: list[dict] = []
     print()
@@ -80,7 +136,7 @@ def main(argv: list[str] | None = None) -> int:
     if not args.dry_run and speaker:
         audio, rate, _, _ = speaker.synthesize(opener)
         print(f"Mayor: {opener}")
-        play(audio, rate)
+        play(audio, rate, cfg.get("_output_device"))
     else:
         print(f"Mayor: {opener}")
 
@@ -110,11 +166,16 @@ def main(argv: list[str] | None = None) -> int:
                 cfg["listen_limit_s"],
                 cfg["silence_s"],
                 cfg["energy_threshold"],
+                input_device=cfg.get("_input_device"),
             )
             user_text, metrics.stt_ms = stt.transcribe(audio_in, cfg["sample_rate"])
             del audio_in
         else:
-            audio_in, metrics.record_ms = record_ptt(cfg["sample_rate"], cfg["listen_limit_s"])
+            audio_in, metrics.record_ms = record_ptt(
+                cfg["sample_rate"],
+                cfg["listen_limit_s"],
+                input_device=cfg.get("_input_device"),
+            )
             user_text, metrics.stt_ms = stt.transcribe(audio_in, cfg["sample_rate"])
             del audio_in
 
@@ -149,9 +210,13 @@ def _handle_turn(user_text, mayor, speaker, canned, history, cfg, metrics, typed
     print(f"Mayor: {line}")
     print(f"Gesture: {gesture}")
 
-    if speaker is not None:
+    if speaker is not None and not typed:
         samples, rate, metrics.tts_first_ms, metrics.tts_total_ms = speaker.synthesize(line)
-        metrics.play_ms = play(samples, rate)
+        metrics.play_ms = play(samples, rate, cfg.get("_output_device"))
+        del samples
+    elif speaker is not None and typed:
+        # dry-run / typed: still synthesize for timing if speaker loaded, but do not play
+        samples, rate, metrics.tts_first_ms, metrics.tts_total_ms = speaker.synthesize(line)
         del samples
 
     if cfg["privacy"]["session_log"] == "memory" and user_text and not metrics.used_canned:
