@@ -41,6 +41,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--dry-run", action="store_true", help="Skip audio; type lines instead")
     parser.add_argument(
+        "--continuous",
+        action="store_true",
+        help="Hands-free porch loop: auto-listen after each reply (implies vad; Ctrl+C to quit)",
+    )
+    parser.add_argument(
         "--list-devices",
         action="store_true",
         help="Print sounddevice input/output ids and exit",
@@ -62,7 +67,12 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
 
     cfg = load_config(args.config)
-    if args.mode:
+    if args.continuous and args.dry_run:
+        print("Refusing: --continuous cannot be used with --dry-run.")
+        return 2
+    if args.continuous:
+        cfg["mode"] = "vad"
+    elif args.mode:
         cfg["mode"] = args.mode
     if args.model:
         cfg["ollama"]["model"] = args.model
@@ -143,9 +153,12 @@ def main(argv: list[str] | None = None) -> int:
     history: list[dict] = []
     print()
     print("Disembodied test loop. Kids hear a voice with no pumpkin yet — that is the point.")
-    print("  Enter  = start a turn" + (" (then Enter again to stop listening)" if cfg["mode"] == "ptt" else " (VAD listens until you pause)"))
-    print("  or type a kid line to skip the mic (speakers still play)")
-    print("  q      = quit")
+    if args.continuous:
+        pass  # continuous banner prints just before the loop
+    else:
+        print("  Enter  = start a turn" + (" (then Enter again to stop listening)" if cfg["mode"] == "ptt" else " (VAD listens until you pause)"))
+        print("  or type a kid line to skip the mic (speakers still play)")
+        print("  q      = quit")
     print()
 
     opener = random.choice(canned["opener"])
@@ -155,6 +168,43 @@ def main(argv: list[str] | None = None) -> int:
         play(audio, rate, cfg.get("_output_device"))
     else:
         print(f"Mayor: {opener}")
+
+    if args.continuous:
+        print("Continuous porch mode. Speak, pause, he answers — then listens again.")
+        print("  Ctrl+C = quit")
+        print()
+        try:
+            while True:
+                print("  listening… speak, then pause")
+                metrics = TurnMetrics()
+                audio_in, metrics.record_ms = record_vad(
+                    cfg["sample_rate"],
+                    cfg["listen_limit_s"],
+                    cfg["silence_s"],
+                    cfg["energy_threshold"],
+                    input_device=cfg.get("_input_device"),
+                )
+                user_text, metrics.stt_ms = stt.transcribe(audio_in, cfg["sample_rate"])
+                del audio_in
+                user_text = (user_text or "").strip()
+                if not user_text:
+                    # Don't stamp empty air all night
+                    print("  (silence — still listening)")
+                    time.sleep(float(cfg["cooldown_s"]))
+                    continue
+                _handle_turn(
+                    user_text, mayor, speaker, canned, history, cfg, metrics, typed=False
+                )
+                time.sleep(float(cfg["cooldown_s"]))
+        except KeyboardInterrupt:
+            print()
+            line = random.choice(canned["goodnight"])
+            print(f"Mayor: {line}")
+            if speaker is not None:
+                samples, rate, _, _ = speaker.synthesize(line)
+                play(samples, rate, cfg.get("_output_device"))
+                del samples
+        return 0
 
     while True:
         try:
