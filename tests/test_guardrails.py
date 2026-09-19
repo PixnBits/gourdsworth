@@ -44,3 +44,29 @@ def test_parse_unknown_gesture_defaults_stamp():
     assert gesture == "stamp"
     assert "GESTURE" not in line.upper()
     assert "moonwalk" not in line.lower()
+
+
+def test_clip_prefers_full_sentences():
+    raw = (
+        "A classic rhyme, well-executed! "
+        "I'm delighted to issue you a Trick-or-Treat License. "
+        "Off you go to the candy bowl, where."
+    )
+    line, _ = parse_reply(raw + "\nGESTURE: stamp")
+    assert "where" not in line.lower()
+    assert line.endswith(("!", "."))
+    assert len(line.split()) <= 20
+    # Should keep the first two sentences if they fit
+    assert "classic rhyme" in line.lower()
+    assert "license" in line.lower()
+
+
+def test_clip_drops_dangling_where():
+    from gourdsworth.guardrails import clip_spoken
+    long = (
+        "Off you go to the candy bowl where the treats await you "
+        "and also more words padding out this sentence beyond twenty"
+    )
+    out = clip_spoken(long, max_words=20)
+    assert not out.lower().rstrip(".").endswith("where")
+    assert len(out.split()) <= 20
