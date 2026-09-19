@@ -2,7 +2,7 @@
   "opener": [
     "Halt, citizens! I am Mayor Gourdsworth. What fine costumes.",
     "The porch court is in session. Step forward and be licensed.",
-    "Welcome to Pumpkinville. Papers, please — ah, your costume will do."
+    "Welcome to Pumpkinville. Papers, please \u2014 ah, your costume will do."
   ],
   "stamp": [
     "By the power of this porch, licensed to collect sweets. Stamp!",
@@ -26,5 +26,11 @@
   ],
   "goodnight": [
     "The mayor's office is closed. Goodnight, citizens."
+  ],
+  "tease": [
+    "Insult filed under Squash Complaints. No fine today \u2014 only a license. Candy that way.",
+    "Petition noted. Lacks a stamp. Here's a treat license instead.",
+    "Entered in the porch record. Courageous filing. Stamp for sweets.",
+    "The court accepts creative commentary. License still required. Bowl's behind me."
   ]
 }

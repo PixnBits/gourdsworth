@@ -28,6 +28,26 @@ def looks_distress(text: str) -> bool:
     return bool(DISTRESS.search(text or ""))
 
 
+# Light porch teasing / middle-school digs aimed at the Mayor — not distress, not banned dark content.
+TEASE = re.compile(
+    r"\b("
+    r"poo[- ]?poo|poopy|butt|fart|stinky|smell my feet|"
+    r"you('?re| are) (a )?(dummy|idiot|stupid|dumb|fool|loser|poop|butthead|poo|"
+    r"stupid head|poo-poo head|poopo head)|"
+    r"stupid (pumpkin|mayor|gourd)|"
+    r"you suck|shut up|nerd|noob|"
+    r"give me all (your|the) candy|i('?m| am) taking (all|everything)"
+    r")\b",
+    re.I,
+)
+
+
+def looks_tease(text: str) -> bool:
+    """True for light insults / candy demands aimed at the Mayor bit."""
+    return bool(TEASE.search(text or ""))
+
+
+
 def looks_banned(text: str) -> bool:
     return bool(BANNED.search(text or ""))
 

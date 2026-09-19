@@ -13,6 +13,7 @@ from gourdsworth.config import canned_path, load_config, prompt_path
 from gourdsworth.guardrails import (
     early_speakable,
     looks_distress,
+    looks_tease,
     model_went_dark,
     parse_reply,
     remainder_after,
@@ -226,6 +227,11 @@ def _handle_turn(user_text, mayor, speaker, canned, history, cfg, metrics, typed
     if looks_distress(user_text):
         line = canned["distress"][0]
         gesture = "listen"
+        metrics.used_canned = True
+    elif looks_tease(user_text) and canned.get("tease"):
+        # Dry bureaucratic clapback — never roast the child (littles may be imitating).
+        line = random.choice(canned["tease"])
+        gesture = random.choice(["stamp", "bow", "think", "laugh"])
         metrics.used_canned = True
     elif not user_text:
         line = random.choice(canned["shy"])
