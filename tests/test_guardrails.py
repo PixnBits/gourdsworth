@@ -70,3 +70,16 @@ def test_clip_drops_dangling_where():
     out = clip_spoken(long, max_words=20)
     assert not out.lower().rstrip(".").endswith("where")
     assert len(out.split()) <= 20
+
+
+def test_parse_wave_colon_leak():
+    line, gesture = parse_reply("Wave: wave")
+    assert gesture == "wave"
+    assert "wave: wave" not in line.lower()
+    assert line  # some spoken fallback
+
+
+def test_parse_gesture_only_line():
+    line, gesture = parse_reply("GESTURE: bow")
+    assert gesture == "bow"
+    assert "gesture" not in line.lower()
