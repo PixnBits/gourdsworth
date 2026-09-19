@@ -63,6 +63,62 @@ def _extract_gesture(raw: str) -> tuple[str, str]:
     return cleaned, gesture
 
 
+
+_DANGLING = frozenset(
+    {
+        "a", "an", "the", "to", "of", "and", "or", "but", "for", "with",
+        "your", "my", "our", "in", "on", "at", "as", "by", "from", "into",
+        "uh", "um", "where", "when", "who", "whom", "whose", "which", "that",
+        "this", "these", "those", "so", "if", "than", "then", "very",
+    }
+)
+
+
+def _trim_dangling(words: list[str]) -> list[str]:
+    out = list(words)
+    while len(out) > 8 and out[-1].lower().rstrip(".,!;:…") in _DANGLING:
+        out.pop()
+    return out
+
+
+def clip_spoken(line: str, max_words: int = 20) -> str:
+    """Keep ≤max_words, preferring whole sentences; never end on a dangling word."""
+    line = (line or "").strip()
+    if not line:
+        return line
+    words = line.split()
+    if len(words) <= max_words:
+        trimmed = _trim_dangling(words)
+        if len(trimmed) < len(words):
+            return " ".join(trimmed).rstrip(".,;:") + "."
+        return line
+
+    parts = re.split(r"(?<=[.!?])\s+", line)
+    kept: list[str] = []
+    count = 0
+    for sent in parts:
+        w = sent.split()
+        if not w:
+            continue
+        if count + len(w) <= max_words:
+            kept.append(sent.strip())
+            count += len(w)
+        else:
+            break
+    if kept:
+        last = kept[-1].split()
+        if last and last[-1].lower().rstrip(".,!;:…") in _DANGLING:
+            if len(kept) > 1:
+                kept = kept[:-1]
+            else:
+                trimmed = _trim_dangling(last)
+                return " ".join(trimmed).rstrip(".,;:") + "."
+        return " ".join(kept)
+
+    chunk = _trim_dangling(words[:max_words])
+    return " ".join(chunk).rstrip(".,;:") + "."
+
+
 def parse_reply(raw: str) -> tuple[str, str]:
     cleaned, gesture = _extract_gesture(raw)
     # Drop empty lines left behind after tag removal
@@ -71,9 +127,7 @@ def parse_reply(raw: str) -> tuple[str, str]:
     # Belt-and-suspenders: never speak the word GESTURE
     line = re.sub(r"\bGESTURE\b\s*:?", "", line, flags=re.I)
     line = strip_markdown(line)
-    words = line.split()
-    if len(words) > 22:
-        line = " ".join(words[:20]).rstrip(".,;") + "."
+    line = clip_spoken(line, max_words=20)
     return line, gesture
 
 
