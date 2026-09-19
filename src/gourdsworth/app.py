@@ -142,7 +142,8 @@ def main(argv: list[str] | None = None) -> int:
     history: list[dict] = []
     print()
     print("Disembodied test loop. Kids hear a voice with no pumpkin yet — that is the point.")
-    print("  Enter  = start a turn" + (" (then Enter again to stop listening)" if cfg["mode"] == "ptt" else ""))
+    print("  Enter  = start a turn" + (" (then Enter again to stop listening)" if cfg["mode"] == "ptt" else " (VAD listens until you pause)"))
+    print("  or type a kid line to skip the mic (speakers still play)")
     print("  q      = quit")
     print()
 
@@ -165,9 +166,12 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Mayor: {line}")
             break
         if cmd not in {"", "go", "talk", "t"}:
+            # Typed kid-proxy line: still run TTS/speakers (only --dry-run sets typed=True)
             user_text = cmd
             metrics = TurnMetrics()
-            _handle_turn(user_text, mayor, speaker, canned, history, cfg, metrics, typed=True)
+            _handle_turn(
+                user_text, mayor, speaker, canned, history, cfg, metrics, typed=args.dry_run
+            )
             continue
 
         metrics = TurnMetrics()
