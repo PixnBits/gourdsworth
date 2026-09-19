@@ -203,6 +203,17 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
+
+def _speakable_remainder(full: str, spoken_prefix: str) -> str:
+    """Tail after early flush; ignore quote/punct-only leftovers."""
+    rem = remainder_after(full, spoken_prefix).strip()
+    if not rem:
+        return ""
+    if all(ch in " \t.,!?;:\"'“”‘’…" for ch in rem):
+        return ""
+    return rem
+
+
 def _handle_turn(user_text, mayor, speaker, canned, history, cfg, metrics, typed=False):
     user_text = (user_text or "").strip()
     metrics.words_in = len(user_text.split())
@@ -258,7 +269,7 @@ def _handle_turn(user_text, mayor, speaker, canned, history, cfg, metrics, typed
             early = None  # speak full canned below
         elif early:
             # Speak only the not-yet-spoken tail (if any)
-            rem = remainder_after(line, early)
+            rem = _speakable_remainder(line, early)
             if rem and speaker is not None and not typed:
                 samples, rate, tts_first, tts_total = speaker.synthesize(rem)
                 metrics.tts_total_ms += tts_total
