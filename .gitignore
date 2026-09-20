@@ -19,3 +19,6 @@ build/
 
 .qa-costume.jpeg
 .qa-*.jpeg
+
+yolov8n.pt
+*.pt
