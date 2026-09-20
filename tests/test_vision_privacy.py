@@ -206,8 +206,8 @@ def test_select_costume_labels_multi():
     from gourdsworth.vision import select_costume_labels
 
     ranked = [
-        ("hot dog", 0.85),
-        ("animal", 0.12),
+        ("hot dog", 0.55),
+        ("animal", 0.40),
         ("group", 0.08),
         ("homemade", 0.02),
     ]
@@ -217,11 +217,21 @@ def test_select_costume_labels_multi():
     assert "homemade" not in picked
 
 
-def test_select_keeps_weak_second():
+def test_select_drops_weak_second():
     from gourdsworth.vision import select_costume_labels, format_visual_note
 
     ranked = [("hot dog", 0.85), ("animal", 0.03), ("group", 0.02)]
     picked = select_costume_labels(ranked, min_score=0.15)
-    assert picked[:2] == ["hot dog", "animal"]
-    note = format_visual_note(picked)
-    assert "hot dog costume" in note and "animal costume" in note
+    assert picked == ["hot dog"]
+
+
+def test_select_caps_by_person_count():
+    from gourdsworth.vision import select_costume_labels, format_visual_note
+
+    ranked = [("hot dog", 0.5), ("bear", 0.45), ("princess", 0.2)]
+    assert select_costume_labels(ranked, person_count=1) == ["hot dog"]
+    picked = select_costume_labels(ranked, person_count=2, min_score=0.15)
+    assert picked[0] == "hot dog" and "bear" in picked
+    note = format_visual_note(picked, person_count=2)
+    assert "about 2 citizens" in note
+    assert "hot dog costume" in note

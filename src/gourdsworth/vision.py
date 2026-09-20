@@ -73,6 +73,7 @@ class VisionResult:
     top3: list[tuple[str, float]] = field(default_factory=list)
     note: str = ""
     vision_ms: float = 0.0
+    person_count: int | None = None
     skip_reason: str | None = None
 
     @property
@@ -114,8 +115,12 @@ def _phrase_for_label(lab: str) -> str:
     return f"{lab} costume"
 
 
-def format_visual_note(label: str | Sequence[str]) -> str:
-    """One line for the mayor. Accepts a single label or a short list."""
+def format_visual_note(
+    label: str | Sequence[str],
+    *,
+    person_count: int | None = None,
+) -> str:
+    """One line for the mayor. Optional person_count is YOLO/presence — not CLIP."""
     if isinstance(label, str):
         labs = [label]
     else:
@@ -125,16 +130,27 @@ def format_visual_note(label: str | Sequence[str]) -> str:
         lab = (raw or "").strip().lower()
         if not lab or note_contains_identity(lab):
             continue
+        if lab == "group":
+            continue  # headcount comes from person_count, not the CLIP "group" tag
         if lab not in cleaned:
             cleaned.append(lab)
     if not cleaned:
         cleaned = ["homemade"]
     phrases = [_phrase_for_label(lab) for lab in cleaned]
-    # "hot dog costume, animal costume" / single "hot dog costume"
-    if len(phrases) == 1 and phrases[0] == "group":
-        body = "group costumes"
+    parts: list[str] = []
+    if person_count is not None and person_count >= 0:
+        n = min(int(person_count), 8)
+        if n == 0:
+            parts.append("walk looks empty")
+        elif n == 1:
+            parts.append("about 1 citizen")
+        else:
+            parts.append(f"about {n} citizens")
+    if len(phrases) == 1:
+        parts.append(phrases[0])
     else:
-        body = ", ".join(phrases)
+        parts.append(", ".join(phrases))
+    body = "; ".join(parts)
     note = f"{NOTE_PREFIX} {body}."
     if note_contains_identity(note):
         note = f"{NOTE_PREFIX} homemade costume."
@@ -145,31 +161,32 @@ def select_costume_labels(
     ranked: Sequence[tuple[str, float]],
     *,
     min_score: float = 0.15,
-    max_labels: int = 3,
-    relative_floor: float = 0.03,
+    max_labels: int = 2,
+    relative_floor: float = 0.40,
+    person_count: int | None = None,
 ) -> list[str]:
-    """Pick a short costume list for the mayor from CLIP rankings.
-
-    Always includes the top label (or homemade if nothing clears the floor).
-    Adds further labels that clear max(min_score*0.5, top*relative_floor),
-    skipping redundant homemade when a better label won.
-    """
+    """Pick a short costume list. Cap by person_count when known (1 person → 1 label)."""
+    if person_count is not None:
+        if person_count <= 0:
+            return ["homemade"]
+        max_labels = min(max_labels, max(1, int(person_count)))
     if not ranked:
         return ["homemade"]
     top_lab, top_score = ranked[0]
     if top_score < min_score or note_contains_identity(top_lab):
         return ["homemade"]
 
-    floor = max(0.02, float(top_score) * float(relative_floor))  # keep weak seconds
+    # Strong seconds only — weak CLIP tails were inventing "three costumes / three people"
+    floor = max(float(min_score), float(top_score) * float(relative_floor))
     picked: list[str] = []
     for lab, score in ranked:
         lab = (lab or "").strip().lower()
-        if not lab or note_contains_identity(lab):
+        if not lab or note_contains_identity(lab) or lab == "group":
             continue
         if score < floor and lab != top_lab:
             continue
         if lab == "homemade" and picked:
-            continue  # don't pad a real hit with homemade
+            continue
         if lab not in picked:
             picked.append(lab)
         if len(picked) >= max_labels:
@@ -281,14 +298,47 @@ def capture_jpeg_ram(
         del frame
 
 
+def count_persons_jpeg(
+    jpeg: bytes,
+    *,
+    model=None,
+    conf: float = 0.35,
+) -> int | None:
+    """Count COCO 'person' boxes in a RAM JPEG. None if YOLO is unavailable."""
+    if model is None:
+        return None
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        return None
+    arr = np.frombuffer(jpeg, dtype=np.uint8)
+    frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if frame is None:
+        return None
+    try:
+        results = model.predict(frame, classes=[0], conf=float(conf), verbose=False)
+        if not results:
+            return 0
+        boxes = getattr(results[0], "boxes", None)
+        if boxes is None:
+            return 0
+        return int(len(boxes))
+    except Exception:
+        return None
+    finally:
+        del frame
+
+
 def classify_costume(
     jpeg: bytes,
     labels: Sequence[str],
     *,
     classify_fn: Callable[[bytes, Sequence[str]], Sequence[tuple[str, float]]],
     min_score: float = 0.15,
+    person_count: int | None = None,
 ) -> VisionResult:
-    """Map a RAM JPEG to a closed-list label. Drops the bytes; never logs them."""
+    """Map a RAM JPEG to closed-list label(s). Drops the bytes; never logs them."""
     allowed = [str(x).strip().lower() for x in labels if str(x).strip()]
     if not allowed:
         allowed = list(DEFAULT_LABELS)
@@ -312,17 +362,26 @@ def classify_costume(
             labels_for_note = ["homemade"]
         else:
             labels_for_note = select_costume_labels(
-                ranked, min_score=min_score, max_labels=3
+                ranked,
+                min_score=min_score,
+                max_labels=2,
+                person_count=person_count,
             )
             label = labels_for_note[0]
             score = next(s for lab, s in ranked if lab == label)
 
-    note = format_visual_note(labels_for_note)
+    note = format_visual_note(labels_for_note, person_count=person_count)
     safe = safe_visual_note(note)
     if safe is None:
         label = "homemade"
-        note = format_visual_note("homemade")
-    return VisionResult(label=label, score=score, top3=top3, note=note)
+        note = format_visual_note("homemade", person_count=person_count)
+    return VisionResult(
+        label=label,
+        score=score,
+        top3=top3,
+        note=note,
+        person_count=person_count,
+    )
 
 
 def run_still(
@@ -331,12 +390,21 @@ def run_still(
     classify_fn: Callable[[bytes, Sequence[str]], Sequence[tuple[str, float]]],
     labels: Sequence[str],
     min_score: float = 0.15,
+    person_model=None,
+    person_conf: float = 0.35,
 ) -> VisionResult:
     t0 = perf_counter()
     jpeg = capture_fn()
     try:
+        person_count = count_persons_jpeg(
+            jpeg, model=person_model, conf=person_conf
+        )
         result = classify_costume(
-            jpeg, labels, classify_fn=classify_fn, min_score=min_score
+            jpeg,
+            labels,
+            classify_fn=classify_fn,
+            min_score=min_score,
+            person_count=person_count,
         )
     finally:
         del jpeg
@@ -457,6 +525,7 @@ class VisionSidecar:
         self.load_ms = 0.0
         self.skip_reason: str | None = None
         self._classifier = OpenClipClassifier(model_name, pretrained)
+        self._person_model = None
         self._future: Future | None = None
 
     @classmethod
@@ -489,6 +558,13 @@ class VisionSidecar:
         except Exception as exc:
             self.skip_reason = f"CLIP model failed to load ({exc})"
             return False, self.skip_reason
+        # Optional YOLOv8n person counter (V1). CLIP still works if YOLO is missing.
+        try:
+            from ultralytics import YOLO
+
+            self._person_model = YOLO("yolov8n.pt")
+        except Exception:
+            self._person_model = None
         self.skip_reason = None
         return True, ""
 
@@ -504,6 +580,7 @@ class VisionSidecar:
                 classify_fn=_classify,
                 labels=self.labels,
                 min_score=self.min_score,
+                person_model=self._person_model,
             )
         except Exception as exc:
             return VisionResult(skip_reason=str(exc))
