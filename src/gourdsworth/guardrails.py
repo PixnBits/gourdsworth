@@ -140,6 +140,37 @@ def clip_spoken(line: str, max_words: int = 20) -> str:
     return " ".join(chunk).rstrip(".,;:") + "."
 
 
+
+_GESTURE_WORDS = frozenset({"stamp", "wave", "think", "laugh", "bow", "listen"})
+
+
+def sanitize_spoken(line: str) -> str:
+    """Remove leaked gesture words and calm ALL CAPS yelling."""
+    line = (line or "").strip()
+    if not line:
+        return line
+    # Leading "Wave." / "Stamp:" leftovers
+    line = re.sub(
+        r"^(?:GESTURE|Gesture|Wave|Stamp|Think|Laugh|Bow|Listen)\s*[:.]\s*",
+        "",
+        line,
+        flags=re.I,
+    )
+    words = line.split()
+    cleaned: list[str] = []
+    for w in words:
+        core = w.strip(".,!?;:\"'").lower()
+        if core in _GESTURE_WORDS:
+            continue
+        cleaned.append(w)
+    line = " ".join(cleaned).strip()
+    # If most letters are uppercase and longer than a short acronym, title-case it
+    letters = [c for c in line if c.isalpha()]
+    if letters and sum(1 for c in letters if c.isupper()) / len(letters) > 0.7 and len(letters) > 4:
+        line = line.title()
+    return strip_markdown(line)
+
+
 def parse_reply(raw: str) -> tuple[str, str]:
     cleaned, gesture = _extract_gesture(raw)
     # Drop empty lines left behind after tag removal
@@ -149,6 +180,7 @@ def parse_reply(raw: str) -> tuple[str, str]:
     line = re.sub(r"\bGESTURE\b\s*:?", "", line, flags=re.I)
     line = strip_markdown(line)
     line = clip_spoken(line, max_words=20)
+    line = sanitize_spoken(line)
     # If the model only emitted a gesture tag, don't speak "Wave: wave"
     if not line:
         line = "Stamp applied. Candy awaits."
