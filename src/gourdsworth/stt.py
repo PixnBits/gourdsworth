@@ -58,7 +58,12 @@ def porch_correct(text: str) -> str:
         "theater theater pump and theater": "peter peter pumpkin eater",
     }
     if n in aliases:
-        return aliases[n]
+        fixed = aliases[n]
+        if fixed == "trick or treat":
+            return "Trick or treat."
+        if fixed == "peter peter pumpkin eater":
+            return "Peter Peter pumpkin eater."
+        return fixed
 
     best = None
     best_score = 0.0
