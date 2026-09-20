@@ -57,7 +57,7 @@ record=…ms  stt=…ms  llm_ttft=…ms  llm=…ms  tts_first=…ms  tts=…ms  
 
 Porch sign copy (vision, when enabled):
 
-*A camera looks only when someone is at the crate. No faces are saved. Nothing leaves this house.*
+*A camera looks only when someone is at the crate. No faces are saved. Nothing leaves this house. (Startup may download CLIP/YOLO *model weights* once into `~/.cache`; that is not porch audio or frames. Later runs stay offline for Hub.)*
 
 ## Vision (opt-in, V0 kitchen still)
 

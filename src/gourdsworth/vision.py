@@ -241,6 +241,26 @@ def missing_vision_deps() -> str | None:
     )
 
 
+def _clip_weights_cached() -> bool:
+    """True when the OpenAI ViT-B-32 open_clip weights already live under ~/.cache."""
+    hub = Path.home() / ".cache" / "huggingface" / "hub"
+    if not hub.is_dir():
+        return False
+    return any(
+        "vit_base_patch32_clip" in p.name.lower() or "open_clip" in p.name.lower()
+        for p in hub.iterdir()
+    )
+
+
+def _prefer_local_hub() -> None:
+    """Do not phone Hugging Face when weights are already on disk (porch privacy UX)."""
+    import os
+
+    os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+    if _clip_weights_cached():
+        os.environ["HF_HUB_OFFLINE"] = "1"
+
+
 def _limit_vision_cpu() -> None:
     """Keep CLIP/OpenCV from starving the voice loop on the same box."""
     try:
@@ -578,11 +598,26 @@ class OpenClipClassifier:
         import torch
 
         _limit_vision_cpu()
+        _prefer_local_hub()
         t0 = perf_counter()
         self._device = "cuda" if torch.cuda.is_available() else "cpu"
-        model, _, preprocess = open_clip.create_model_and_transforms(
-            self.model_name, pretrained=self.pretrained
-        )
+        try:
+            model, _, preprocess = open_clip.create_model_and_transforms(
+                self.model_name, pretrained=self.pretrained
+            )
+        except Exception:
+            # First-time install: allow one weight download, then stay offline next run.
+            import os
+
+            os.environ.pop("HF_HUB_OFFLINE", None)
+            print(
+                "  (one-time) downloading CLIP weights to local cache — "
+                "not porch audio/video; nothing from the camera is uploaded."
+            )
+            model, _, preprocess = open_clip.create_model_and_transforms(
+                self.model_name, pretrained=self.pretrained
+            )
+            os.environ["HF_HUB_OFFLINE"] = "1"
         model = model.to(self._device)
         model.eval()
         self._model = model
