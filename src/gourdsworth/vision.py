@@ -298,13 +298,13 @@ def capture_jpeg_ram(
         del frame
 
 
-def count_persons_jpeg(
+def detect_person_boxes(
     jpeg: bytes,
     *,
     model=None,
     conf: float = 0.35,
-) -> int | None:
-    """Count COCO 'person' boxes in a RAM JPEG. None if YOLO is unavailable."""
+) -> list[tuple[int, int, int, int]] | None:
+    """Return person boxes (x1,y1,x2,y2) from a RAM JPEG. None if YOLO unavailable."""
     if model is None:
         return None
     try:
@@ -319,15 +319,151 @@ def count_persons_jpeg(
     try:
         results = model.predict(frame, classes=[0], conf=float(conf), verbose=False)
         if not results:
-            return 0
+            return []
         boxes = getattr(results[0], "boxes", None)
-        if boxes is None:
-            return 0
-        return int(len(boxes))
+        if boxes is None or boxes.xyxy is None:
+            return []
+        out: list[tuple[int, int, int, int]] = []
+        h, w = frame.shape[:2]
+        for row in boxes.xyxy.detach().cpu().tolist():
+            x1, y1, x2, y2 = (int(v) for v in row[:4])
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(w - 1, x2), min(h - 1, y2)
+            if x2 > x1 and y2 > y1:
+                out.append((x1, y1, x2, y2))
+        # Largest first — helps when one person dominates
+        out.sort(key=lambda b: (b[2] - b[0]) * (b[3] - b[1]), reverse=True)
+        return out[:6]
     except Exception:
         return None
     finally:
         del frame
+
+
+def count_persons_jpeg(
+    jpeg: bytes,
+    *,
+    model=None,
+    conf: float = 0.35,
+) -> int | None:
+    """Count COCO 'person' boxes in a RAM JPEG. None if YOLO is unavailable."""
+    boxes = detect_person_boxes(jpeg, model=model, conf=conf)
+    if boxes is None:
+        return None
+    return len(boxes)
+
+
+def _crop_jpeg(
+    jpeg: bytes, box: tuple[int, int, int, int], *, pad: float = 0.12
+) -> bytes | None:
+    """Crop one person box (+pad) to a new RAM JPEG. Never writes a file."""
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        return None
+    arr = np.frombuffer(jpeg, dtype=np.uint8)
+    frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if frame is None:
+        return None
+    try:
+        h, w = frame.shape[:2]
+        x1, y1, x2, y2 = box
+        bw, bh = x2 - x1, y2 - y1
+        px, py = int(bw * pad), int(bh * pad)
+        x1, y1 = max(0, x1 - px), max(0, y1 - py)
+        x2, y2 = min(w, x2 + px), min(h, y2 + py)
+        crop = frame[y1:y2, x1:x2]
+        if crop.size == 0:
+            return None
+        ok, buf = cv2.imencode(".jpg", crop, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+        if not ok:
+            return None
+        return bytes(buf)
+    finally:
+        del frame
+
+
+def classify_persons_then_frame(
+    jpeg: bytes,
+    labels: Sequence[str],
+    *,
+    classify_fn: Callable[[bytes, Sequence[str]], Sequence[tuple[str, float]]],
+    min_score: float = 0.15,
+    person_model=None,
+    person_conf: float = 0.35,
+) -> VisionResult:
+    """Unify count + costumes: CLIP each YOLO person crop, else full-frame CLIP."""
+    boxes = detect_person_boxes(jpeg, model=person_model, conf=person_conf)
+    person_count = None if boxes is None else len(boxes)
+
+    per_labels: list[str] = []
+    per_scores: list[float] = []
+    if boxes:
+        for box in boxes:
+            crop = _crop_jpeg(jpeg, box)
+            if not crop:
+                continue
+            try:
+                ranked = sorted(
+                    (
+                        (str(lab).strip().lower(), float(score))
+                        for lab, score in classify_fn(crop, labels)
+                    ),
+                    key=lambda kv: kv[1],
+                    reverse=True,
+                )
+            finally:
+                del crop
+            if not ranked:
+                continue
+            lab, score = ranked[0]
+            if lab == "group" or note_contains_identity(lab):
+                continue
+            if score < min_score:
+                lab = "homemade"
+            per_labels.append(lab)
+            per_scores.append(score)
+
+    if per_labels:
+        # One costume per detected person; keep order, allow duplicates only once in note
+        unique: list[str] = []
+        for lab in per_labels:
+            if lab not in unique:
+                unique.append(lab)
+        label = unique[0]
+        score = per_scores[0]
+        # Full-frame top3 still useful for logs
+        full_ranked = sorted(
+            (
+                (str(lab).strip().lower(), float(sc))
+                for lab, sc in classify_fn(jpeg, labels)
+            ),
+            key=lambda kv: kv[1],
+            reverse=True,
+        )
+        top3 = full_ranked[:3]
+        note = format_visual_note(unique, person_count=person_count)
+        if safe_visual_note(note) is None:
+            note = format_visual_note("homemade", person_count=person_count)
+            label = "homemade"
+        return VisionResult(
+            label=label,
+            score=score,
+            top3=top3,
+            note=note,
+            person_count=person_count,
+        )
+
+    # No usable per-person crops → whole-frame CLIP (existing path)
+    return classify_costume(
+        jpeg,
+        labels,
+        classify_fn=classify_fn,
+        min_score=min_score,
+        person_count=person_count,
+    )
+
 
 
 def classify_costume(
@@ -396,15 +532,13 @@ def run_still(
     t0 = perf_counter()
     jpeg = capture_fn()
     try:
-        person_count = count_persons_jpeg(
-            jpeg, model=person_model, conf=person_conf
-        )
-        result = classify_costume(
+        result = classify_persons_then_frame(
             jpeg,
             labels,
             classify_fn=classify_fn,
             min_score=min_score,
-            person_count=person_count,
+            person_model=person_model,
+            person_conf=person_conf,
         )
     finally:
         del jpeg
