@@ -393,6 +393,11 @@ def main(argv: list[str] | None = None) -> int:
     except Exception:
         pass
 
+    if args.list_devices:
+        _list_audio_devices()
+        raise SystemExit(0)
+    _apply_audio_devices(args.input, args.output)
+
     print("Gourdsworth crate client — I/O only. No models on this machine.")
     print(f"  desktop {args.host}:{args.port}")
     if args.host not in {"127.0.0.1", "localhost", "::1"}:
