@@ -35,8 +35,12 @@ DEFAULT_LABELS: tuple[str, ...] = (
     "ninja",
     "pirate",
     "animal",
+    "bear",
     "sports",
     "robot",
+    "food",
+    "hot dog",
+    "pumpkin",
     "homemade",
     "group",
 )

@@ -16,3 +16,6 @@ models/*.onnx.json
 dist/
 build/
 .DS_Store
+
+.qa-costume.jpeg
+.qa-*.jpeg
