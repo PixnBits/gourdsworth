@@ -105,20 +105,76 @@ def note_contains_identity(note: str) -> bool:
     return bool(IDENTITY_RE.search(text))
 
 
-def format_visual_note(label: str) -> str:
-    lab = (label or "homemade").strip().lower() or "homemade"
-    if note_contains_identity(lab):
-        lab = "homemade"
+def _phrase_for_label(lab: str) -> str:
+    lab = (lab or "homemade").strip().lower() or "homemade"
     if lab == "group":
-        phrase = "group costumes"
-    elif lab.endswith("costume"):
-        phrase = lab
+        return "group"
+    if lab.endswith("costume"):
+        return lab
+    return f"{lab} costume"
+
+
+def format_visual_note(label: str | Sequence[str]) -> str:
+    """One line for the mayor. Accepts a single label or a short list."""
+    if isinstance(label, str):
+        labs = [label]
     else:
-        phrase = f"{lab} costume"
-    note = f"{NOTE_PREFIX} {phrase}."
+        labs = list(label)
+    cleaned: list[str] = []
+    for raw in labs:
+        lab = (raw or "").strip().lower()
+        if not lab or note_contains_identity(lab):
+            continue
+        if lab not in cleaned:
+            cleaned.append(lab)
+    if not cleaned:
+        cleaned = ["homemade"]
+    phrases = [_phrase_for_label(lab) for lab in cleaned]
+    # "hot dog costume, animal costume" / single "hot dog costume"
+    if len(phrases) == 1 and phrases[0] == "group":
+        body = "group costumes"
+    else:
+        body = ", ".join(phrases)
+    note = f"{NOTE_PREFIX} {body}."
     if note_contains_identity(note):
         note = f"{NOTE_PREFIX} homemade costume."
     return note
+
+
+def select_costume_labels(
+    ranked: Sequence[tuple[str, float]],
+    *,
+    min_score: float = 0.15,
+    max_labels: int = 3,
+    relative_floor: float = 0.03,
+) -> list[str]:
+    """Pick a short costume list for the mayor from CLIP rankings.
+
+    Always includes the top label (or homemade if nothing clears the floor).
+    Adds further labels that clear max(min_score*0.5, top*relative_floor),
+    skipping redundant homemade when a better label won.
+    """
+    if not ranked:
+        return ["homemade"]
+    top_lab, top_score = ranked[0]
+    if top_score < min_score or note_contains_identity(top_lab):
+        return ["homemade"]
+
+    floor = max(0.02, float(top_score) * float(relative_floor))  # keep weak seconds
+    picked: list[str] = []
+    for lab, score in ranked:
+        lab = (lab or "").strip().lower()
+        if not lab or note_contains_identity(lab):
+            continue
+        if score < floor and lab != top_lab:
+            continue
+        if lab == "homemade" and picked:
+            continue  # don't pad a real hit with homemade
+        if lab not in picked:
+            picked.append(lab)
+        if len(picked) >= max_labels:
+            break
+    return picked or ["homemade"]
 
 
 def safe_visual_note(note: str | None) -> str | None:
@@ -246,14 +302,22 @@ def classify_costume(
 
     if not ranked:
         label, score = "homemade", 0.0
+        labels_for_note = ["homemade"]
     else:
         label, score = ranked[0]
         allowed_set = set(allowed)
         if label not in allowed_set or score < min_score or note_contains_identity(label):
             homemade_score = next((s for lab, s in ranked if lab == "homemade"), score)
             label, score = "homemade", homemade_score
+            labels_for_note = ["homemade"]
+        else:
+            labels_for_note = select_costume_labels(
+                ranked, min_score=min_score, max_labels=3
+            )
+            label = labels_for_note[0]
+            score = next(s for lab, s in ranked if lab == label)
 
-    note = format_visual_note(label)
+    note = format_visual_note(labels_for_note)
     safe = safe_visual_note(note)
     if safe is None:
         label = "homemade"
