@@ -175,7 +175,6 @@ def main(argv: list[str] | None = None) -> int:
         print()
         try:
             while True:
-                print("  listening… speak, then pause")
                 metrics = TurnMetrics()
                 audio_in, metrics.record_ms = record_vad(
                     cfg["sample_rate"],
