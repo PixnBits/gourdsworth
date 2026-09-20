@@ -10,6 +10,14 @@ from time import perf_counter
 
 from gourdsworth.audio_io import list_devices, play, record_ptt, record_vad, set_devices
 from gourdsworth.config import canned_path, load_config, prompt_path
+from gourdsworth.net import (
+    DEFAULT_HOST,
+    DEFAULT_PORT,
+    CrateListener,
+    is_loopback,
+    resolve_bind,
+    serve_echo,
+)
 from gourdsworth.guardrails import (
     early_speakable,
     looks_distress,
@@ -113,23 +121,57 @@ def main(argv: list[str] | None = None) -> int:
         metavar="N",
         help="OpenCV camera index for --vision / --snap (default 0)",
     )
+    parser.add_argument(
+        "--serve-crate",
+        action="store_true",
+        help="Accept one Pi crate client; run the turn loop on remote PCM (default bind 127.0.0.1)",
+    )
+    parser.add_argument(
+        "--crate-echo",
+        action="store_true",
+        help="Protocol smoke: echo crate PCM as play + send a gesture; no models",
+    )
+    parser.add_argument(
+        "--crate-host",
+        default=None,
+        help="Override crate.host bind address",
+    )
+    parser.add_argument(
+        "--crate-port",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Override crate.port",
+    )
     args = parser.parse_args(argv)
 
     if args.list_devices:
         print(list_devices())
         return 0
 
+    if args.crate_echo:
+        return _run_crate_echo(args)
+
     if args.input is not None or args.output is not None:
-        try:
-            set_devices(args.input, args.output)
-        except OSError as exc:
-            print(f"Could not set audio devices ({exc})")
-            if not args.dry_run and not args.snap:
-                return 1
+        if args.serve_crate:
+            print("  (crate mode: desktop --input/--output unused; I/O is on the Pi)")
+        else:
+            try:
+                set_devices(args.input, args.output)
+            except OSError as exc:
+                print(f"Could not set audio devices ({exc})")
+                if not args.dry_run and not args.snap:
+                    return 1
 
     cfg = load_config(args.config)
     if args.continuous and args.dry_run:
         print("Refusing: --continuous cannot be used with --dry-run.")
+        return 2
+    if args.serve_crate and args.dry_run:
+        print(
+            "Refusing: --serve-crate cannot be used with --dry-run. "
+            "Use --crate-echo for protocol smoke without models."
+        )
         return 2
     if args.continuous:
         cfg["mode"] = "vad"
@@ -146,6 +188,13 @@ def main(argv: list[str] | None = None) -> int:
         cfg["vision"]["enabled"] = True
     if args.camera is not None:
         cfg["vision"]["camera_index"] = args.camera
+    cfg.setdefault("crate", {})
+    if args.serve_crate:
+        cfg["crate"]["enabled"] = True
+    if args.crate_host:
+        cfg["crate"]["host"] = args.crate_host
+    if args.crate_port is not None:
+        cfg["crate"]["port"] = args.crate_port
 
     if cfg["privacy"].get("save_audio") or cfg["privacy"].get("save_transcripts"):
         print("Refusing to start: save_audio / save_transcripts must stay false.")
@@ -234,6 +283,9 @@ def main(argv: list[str] | None = None) -> int:
                 f"CLIP={sidecar.model_name}  camera={sidecar.camera_index}"
             )
             print(f"  {PRIVACY_SIGN}")
+
+    if (cfg.get("crate") or {}).get("enabled"):
+        return _serve_crate(cfg, mayor, stt, speaker, sidecar, canned)
 
     history: list[dict] = []
     print()
@@ -379,11 +431,26 @@ def _speakable_remainder(full: str, spoken_prefix: str) -> str:
 
 
 def _handle_turn(
-    user_text, mayor, speaker, canned, history, cfg, metrics, typed=False, vis_future=None
+    user_text,
+    mayor,
+    speaker,
+    canned,
+    history,
+    cfg,
+    metrics,
+    typed=False,
+    vis_future=None,
+    play_fn=None,
+    gesture_fn=None,
 ):
     user_text = (user_text or "").strip()
     metrics.words_in = len(user_text.split())
     print(f"Heard: {user_text!r}" if user_text else "Heard: (silence)")
+
+    def _play(samples, rate) -> float:
+        if play_fn is not None:
+            return float(play_fn(samples, rate) or 0.0)
+        return play(samples, rate, cfg.get("_output_device"))
 
     gesture = "stamp"
     line = ""
@@ -430,7 +497,7 @@ def _handle_turn(
                     if metrics.to_first_audio_ms == 0:
                         metrics.to_first_audio_ms = (perf_counter() - t_post_stt) * 1000
                     if not typed:
-                        metrics.play_ms += play(samples, rate, cfg.get("_output_device"))
+                        metrics.play_ms += _play(samples, rate)
                     del samples
             if done:
                 break
@@ -449,7 +516,7 @@ def _handle_turn(
             if rem and speaker is not None and not typed:
                 samples, rate, tts_first, tts_total = speaker.synthesize(rem)
                 metrics.tts_total_ms += tts_total
-                metrics.play_ms += play(samples, rate, cfg.get("_output_device"))
+                metrics.play_ms += _play(samples, rate)
                 del samples
             elif rem and speaker is not None and typed:
                 samples, rate, tts_first, tts_total = speaker.synthesize(rem)
@@ -461,6 +528,11 @@ def _handle_turn(
     metrics.words_out = len(line.split())
     print(f"Mayor: {line}")
     print(f"Gesture: {gesture}")
+    if gesture_fn is not None:
+        try:
+            gesture_fn(gesture)
+        except (ConnectionError, OSError) as exc:
+            print(f"  crate gesture send failed: {exc}")
 
     # Canned / no-early path: synthesize full line once
     if speaker is not None and (metrics.used_canned or not metrics.early_flush):
@@ -473,7 +545,7 @@ def _handle_turn(
             samples, rate, metrics.tts_first_ms, metrics.tts_total_ms = speaker.synthesize(line)
             if metrics.to_first_audio_ms == 0:
                 metrics.to_first_audio_ms = (perf_counter() - t_post_stt) * 1000
-            metrics.play_ms = play(samples, rate, cfg.get("_output_device"))
+            metrics.play_ms = _play(samples, rate)
             del samples
 
     if cfg["privacy"]["session_log"] == "memory" and user_text and not metrics.used_canned:
@@ -501,6 +573,162 @@ def _handle_turn(
     print(metrics.render())
     print()
 
+
+def _crate_settings(cfg: dict) -> tuple[str, int]:
+    crate = cfg.get("crate") or {}
+    host = resolve_bind(crate.get("host") or DEFAULT_HOST, bool(crate.get("allow_lan")))
+    port = int(crate.get("port") or DEFAULT_PORT)
+    return host, port
+
+
+def _run_crate_echo(args) -> int:
+    cfg = load_config(args.config)
+    if cfg["privacy"].get("save_audio") or cfg["privacy"].get("save_transcripts"):
+        print("Refusing to start: save_audio / save_transcripts must stay false.")
+        return 2
+    crate = cfg.setdefault("crate", {})
+    if args.crate_host:
+        crate["host"] = args.crate_host
+    if args.crate_port is not None:
+        crate["port"] = args.crate_port
+    try:
+        host, port = _crate_settings(cfg)
+    except ValueError as exc:
+        print(exc)
+        return 2
+    print("Gourdsworth crate echo — no models, RAM only, nothing written")
+    if is_loopback(host):
+        print(f"  bind {host}:{port}  (localhost; children's PCM never leaves this machine)")
+    else:
+        print(f"  bind {host}:{port}  WARNING: LAN bind. PCM/JPEG reachable on this network. No TLS.")
+    print("  Ctrl+C to quit")
+    try:
+        serve_echo(host, port)
+    except KeyboardInterrupt:
+        print()
+    return 0
+
+
+def _serve_crate(cfg, mayor, stt, speaker, sidecar, canned) -> int:
+    if stt is None:
+        print(
+            "STT is required for --serve-crate "
+            "(use --crate-echo to test the protocol without models)."
+        )
+        return 1
+    try:
+        host, port = _crate_settings(cfg)
+    except ValueError as exc:
+        print(exc)
+        return 2
+    print()
+    print("Crate server. Inference stays here. The Pi is mic / speaker / camera / button only.")
+    if is_loopback(host):
+        print(f"  crate listening on {host}:{port}  (localhost only)")
+    else:
+        print(f"  crate listening on {host}:{port}  WARNING: LAN bind, no TLS, no auth")
+    if sidecar is not None:
+        print("  vision: JPEG stills from the crate (desktop camera unused)")
+    print("  Talk is the Pi button / Enter. Ctrl+C to quit.")
+    print()
+    listener = CrateListener(host, port)
+    history: list[dict] = []
+    try:
+        while True:
+            print("waiting for crate client…")
+            conn = listener.accept()
+            peer = conn.peer or ("?", 0)
+            print(f"crate connected {peer[0]}:{peer[1]}")
+            try:
+                _run_crate_session(
+                    conn, cfg, mayor, stt, speaker, sidecar, canned, history
+                )
+            except (ConnectionError, OSError) as exc:
+                print(f"crate session ended: {exc}")
+            finally:
+                conn.close()
+                print("crate disconnected")
+    except KeyboardInterrupt:
+        print()
+        line = random.choice(canned["goodnight"])
+        print(f"Mayor: {line}")
+    finally:
+        listener.close()
+    return 0
+
+
+def _run_crate_session(conn, cfg, mayor, stt, speaker, sidecar, canned, history) -> None:
+    hello = conn.handshake("desktop", timeout=10.0)
+    if hello is None:
+        raise ConnectionError("crate hello timeout")
+    opener = random.choice(canned["opener"])
+    print(f"Mayor: {opener}")
+    if speaker is not None:
+        samples, rate, _, _ = speaker.synthesize(opener)
+        print("SPEAKING")
+        conn.send({"event": "speaking"})
+        conn.play_float(samples, rate)
+        del samples
+    conn.send({"event": "ready"})
+    print("ready.")
+    while not conn.closed:
+        if not conn.wait_button("down", timeout=0.5):
+            continue
+        metrics = TurnMetrics()
+        print("LISTENING")
+        conn.send({"event": "listen"})
+        vis_future = None
+        jpeg = conn.take_jpeg()
+        if jpeg is not None and sidecar is not None:
+            vis_future = sidecar.submit_jpeg(jpeg)
+        if jpeg is not None:
+            del jpeg
+        audio_in, metrics.record_ms = conn.listen_pcm(
+            sample_rate=int(cfg["sample_rate"]),
+            limit_s=float(cfg["listen_limit_s"]),
+            mode=str(cfg.get("mode") or "ptt"),
+            silence_s=float(cfg["silence_s"]),
+            energy_threshold=float(cfg["energy_threshold"]),
+        )
+        if vis_future is None:
+            jpeg = conn.take_jpeg()
+            if jpeg is not None and sidecar is not None:
+                vis_future = sidecar.submit_jpeg(jpeg)
+            if jpeg is not None:
+                del jpeg
+        print("THINKING")
+        conn.send({"event": "thinking"})
+        user_text, metrics.stt_ms = stt.transcribe(audio_in, cfg["sample_rate"])
+        del audio_in
+        spoke = {"n": 0}
+
+        def play_fn(samples, rate, _spoke=spoke, _conn=conn):
+            if _spoke["n"] == 0:
+                print("SPEAKING")
+                _conn.send({"event": "speaking"})
+            _spoke["n"] += 1
+            return _conn.play_float(samples, rate)
+
+        def gesture_fn(name, _conn=conn):
+            _conn.send({"event": "gesture", "name": name})
+
+        _handle_turn(
+            user_text,
+            mayor,
+            speaker,
+            canned,
+            history,
+            cfg,
+            metrics,
+            typed=False,
+            vis_future=vis_future,
+            play_fn=play_fn,
+            gesture_fn=gesture_fn,
+        )
+        conn.reset_talk_latch()
+        conn.send({"event": "ready"})
+        print("ready.")
+        time.sleep(float(cfg["cooldown_s"]))
 
 
 if __name__ == "__main__":

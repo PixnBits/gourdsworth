@@ -34,9 +34,22 @@ character: mayor
 max_history_turns: 4
 cooldown_s: 0.4
 
+# Phase 2 crate (issue #33). Desktop listens; the Pi is mic/speaker/camera/button only.
+# Default bind is localhost so `python -m gourdsworth --serve-crate` is safe on a
+# laptop. Children's PCM/JPEG stay in RAM and only cross this TCP socket.
+# RISK: crate.allow_lan: true + host 0.0.0.0 (or a LAN IP) lets anyone on that
+# network read kids' audio and stills. There is no TLS and no auth. Do not
+# expose this port beyond the porch LAN.
+crate:
+  enabled: false          # --serve-crate also starts the listener
+  host: 127.0.0.1         # loopback. Do not use 0.0.0.0 unless allow_lan
+  port: 8746
+  allow_lan: false        # required to bind a LAN address or 0.0.0.0
+
 # Opt-in local CLIP still (issue #19 V0). Voice works without this.
 # pip install -e '.[vision]'  then  python -m gourdsworth --snap
 # Camera opens only on Talk / --snap. Frames stay in RAM. Nothing leaves the house.
+# With --serve-crate --vision, stills come from the Pi as RAM JPEGs (desktop camera unused).
 vision:
   enabled: false
   camera_index: 0

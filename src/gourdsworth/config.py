@@ -39,6 +39,13 @@ DEFAULTS = {
         "pretrained": "openai",
         "labels_file": None,
     },
+    # Phase 2 crate listener (issue #33). Default loopback; LAN bind is opt-in.
+    "crate": {
+        "enabled": False,
+        "host": "127.0.0.1",
+        "port": 8746,
+        "allow_lan": False,
+    },
 }
 
 
