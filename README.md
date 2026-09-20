@@ -4,7 +4,9 @@ Mayor Gourdsworth of Pumpkinville. A family-safe Halloween greeter that listens 
 
 Phase 1 is disembodied on purpose: laptop or Framework Desktop, built-in mic and speakers, no pumpkin. Use it to measure latency and watch how kids talk to a voice with no body.
 
-Nothing is sent to a cloud API. Audio is kept in RAM and discarded after each turn.
+Phase 2 is the porch **crate**: a Raspberry Pi streams mic PCM and optional JPEG stills to this same process over the LAN. Inference (STT / LLM / TTS / vision) stays on the desktop. The Pi does not run Whisper, Ollama, or CLIP.
+
+Nothing is sent to a cloud API. Audio and stills are kept in RAM and discarded after each turn. They never leave the LAN.
 
 ## Quick start
 
@@ -36,6 +38,8 @@ python -m gourdsworth --dry-run
 python -m gourdsworth --stt-model tiny.en --mode vad --input 6 --output 8
 python -m gourdsworth --snap                 # kitchen still (needs extras + webcam)
 python -m gourdsworth --vision               # Talk grabs one RAM frame in parallel
+python -m gourdsworth --serve-crate          # Phase 2: listen for one Pi crate client
+python -m gourdsworth --crate-echo           # protocol smoke (no models)
 ```
 
 `--dry-run` skips the mic and speaker playback so you can type kid-proxy lines and still see LLM (+ optional TTS synth) timing. Startup still preloads Whisper, warms Ollama (`keep_alive`), and loads Piper, printing load times.
@@ -54,6 +58,7 @@ record=…ms  stt=…ms  llm_ttft=…ms  llm=…ms  tts_first=…ms  tts=…ms  
 - Ollama is called at `127.0.0.1` only
 - History is four turns of **text**, in process memory
 - No WAV files in the project workflow (espeak / Piper-CLI fallback may use a NamedTemporaryFile that is unlinked immediately)
+- Crate TCP **defaults to `127.0.0.1`**. Binding `0.0.0.0` or a LAN IP requires `crate.allow_lan: true` in `config.yaml`. That opt-in means anyone on that network can read children's PCM and JPEG; there is no TLS and no auth. Do not port-forward this.
 
 Porch sign copy (vision, when enabled):
 
@@ -76,15 +81,56 @@ python -m gourdsworth --vision --camera 0 --dry-run
 
 Or set `vision.enabled: true` in `config.yaml`. Labels live in `src/gourdsworth/costume_labels.txt` (closed list; unsure → `homemade`). No JPEG is written. No faces, names, or ages. Neighbors' kids are the threat model.
 
-V0 is USB-on-the-Framework-Desktop only. Presence, Pi JPEG-over-LAN, and a local VLM sentence are later issues.
+V0 kitchen stills are USB-on-the-Framework-Desktop. Phase 2 (`--serve-crate --vision`) classifies JPEG stills the Pi sends over the crate socket instead of opening the desktop camera. Presence / PIR and a local VLM sentence are later issues.
 
 ## Character
 
 `prompts/mayor_system.txt` is the whole personality. `canned/lines.json` covers silence, crowds, distress, and model failure. Edit those before you edit code.
 
+## Phase 2 — crate (Pi ↔ desktop)
+
+The desktop runs the existing turn loop. When a crate client is connected, mic/speakers are remote PCM instead of local sounddevice.
+
+**Desktop** (this repo, models already working from Phase 1):
+
+```bash
+python -m gourdsworth --serve-crate
+python -m gourdsworth --serve-crate --vision     # CLIP on Pi JPEGs; voice does not wait
+```
+
+Bind is `crate.host` / `crate.port` in `config.yaml` (default `127.0.0.1:8746`). To listen on the porch LAN:
+
+```yaml
+crate:
+  host: 0.0.0.0
+  port: 8746
+  allow_lan: true   # required; PCM/JPEG then visible to the whole LAN, no TLS
+```
+
+**Protocol smoke** (no Whisper / Ollama / Piper; fake client or the Pi script):
+
+```bash
+python -m gourdsworth --crate-echo
+# other terminal, same machine:
+PYTHONPATH=src python clients/pi/crate_client.py --host 127.0.0.1 --no-camera --no-mic
+# Enter = Talk (sends silence). You should see GESTURE: stamp and a play round-trip.
+```
+
+Unit tests cover framing with an in-process loopback client (`pytest tests/test_net_framing.py`) — no hardware.
+
+**Pi** (I/O only). See `clients/pi/README.md` for apt/pip deps. Do not install the full `gourdsworth` extras on the Pi.
+
+```bash
+PYTHONPATH=src python clients/pi/crate_client.py --host 192.168.x.desktop
+PYTHONPATH=src python clients/pi/crate_client.py --host 192.168.x.desktop --no-camera
+PYTHONPATH=src python clients/pi/crate_client.py --host 192.168.x.desktop --button-pin 17
+```
+
+Uplink is 16 kHz mono signed 16-bit little-endian, 100 ms chunks (3200 bytes). Downlink is Piper float32 little-endian at the voice's native rate. JPEG is one length-prefixed still per Talk. Control is JSON lines: `{"event":"button","state":"down"}`, `{"event":"gesture","name":"stamp"}`.
+
 ## Hardware later
 
-Jaw = RMS of the outgoing samples. Body = six canned gestures the model *names*. Do not generate servo trajectories. See `ARCHITECTURE.md`.
+Jaw = RMS of the outgoing samples. Body = six canned gestures the model *names* (`GESTURE` JSON to the Pi; print now, servos later). Do not generate servo trajectories. See `ARCHITECTURE.md`.
 
 
 ## Mayor voice
