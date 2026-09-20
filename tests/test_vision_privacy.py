@@ -155,6 +155,28 @@ def test_visual_note_attaches_only_to_this_turn():
     assert format_user_message("hello", None) == "hello"
 
 
+def test_submit_jpeg_does_not_open_camera(monkeypatch):
+    """Crate stills are RAM JPEG bytes; the desktop webcam stays closed."""
+    sidecar = VisionSidecar(labels=DEFAULT_LABELS)
+    got = {}
+
+    def boom(*_a, **_k):
+        raise AssertionError("desktop camera must not open for crate JPEGs")
+
+    def fake_run_still(*, capture_fn, classify_fn, labels, **_k):
+        got["jpeg"] = capture_fn()
+        return VisionResult(label="pirate", note=format_visual_note("pirate"), score=0.8)
+
+    monkeypatch.setattr(vision_module, "capture_jpeg_ram", boom)
+    monkeypatch.setattr(vision_module, "run_still", fake_run_still)
+    fut = sidecar.submit_jpeg(b"\xff\xd8crate-still\xff\xd9")
+    assert fut is not None
+    result = fut.result(timeout=2)
+    assert got["jpeg"].startswith(b"\xff\xd8")
+    assert b"crate-still" in got["jpeg"]
+    assert result.label == "pirate"
+
+
 def test_submit_snap_skips_in_flight_turn():
     sidecar = VisionSidecar(labels=DEFAULT_LABELS)
     started = threading.Event()

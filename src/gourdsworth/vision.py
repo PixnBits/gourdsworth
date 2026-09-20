@@ -791,6 +791,50 @@ class VisionSidecar:
         self._future = future
         return future
 
+    def submit_jpeg(self, jpeg: bytes) -> Future | None:
+        """Classify a RAM JPEG from the crate. Never opens a camera. Never waits.
+
+        Same in-flight skip as submit_snap. Caller should drop ``jpeg`` after
+        this returns; the worker keeps its own copy until CLIP finishes.
+        """
+        if self.skip_reason:
+            return None
+        if self._future is not None and not self._future.done():
+            return None
+        blob = bytes(jpeg)
+        future: Future = Future()
+
+        def worker() -> None:
+            nonlocal blob
+
+            def _capture() -> bytes:
+                return blob
+
+            def _classify(frame: bytes, labels: Sequence[str]):
+                return self._classifier.classify_jpeg(frame, labels)
+
+            try:
+                future.set_result(
+                    run_still(
+                        capture_fn=_capture,
+                        classify_fn=_classify,
+                        labels=self.labels,
+                        min_score=self.min_score,
+                        person_model=self._person_model,
+                    )
+                )
+            except Exception as exc:  # pragma: no cover
+                if not future.done():
+                    future.set_result(VisionResult(skip_reason=str(exc)))
+            finally:
+                blob = b""
+
+        threading.Thread(
+            target=worker, name="gourdsworth-vision-jpeg", daemon=True
+        ).start()
+        self._future = future
+        return future
+
     def close(self) -> None:
         # Daemon worker; nothing to join. Camera is released inside capture_jpeg_ram.
         return
