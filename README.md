@@ -34,6 +34,8 @@ python -m gourdsworth --mode vad
 python -m gourdsworth --continuous --input 6 --output 8   # hands-free porch loop
 python -m gourdsworth --dry-run
 python -m gourdsworth --stt-model tiny.en --mode vad --input 6 --output 8
+python -m gourdsworth --snap                 # kitchen still (needs extras + webcam)
+python -m gourdsworth --vision               # Talk grabs one RAM frame in parallel
 ```
 
 `--dry-run` skips the mic and speaker playback so you can type kid-proxy lines and still see LLM (+ optional TTS synth) timing. Startup still preloads Whisper, warms Ollama (`keep_alive`), and loads Piper, printing load times.
@@ -52,6 +54,29 @@ record=…ms  stt=…ms  llm_ttft=…ms  llm=…ms  tts_first=…ms  tts=…ms  
 - Ollama is called at `127.0.0.1` only
 - History is four turns of **text**, in process memory
 - No WAV files in the project workflow (espeak / Piper-CLI fallback may use a NamedTemporaryFile that is unlinked immediately)
+
+Porch sign copy (vision, when enabled):
+
+*A camera looks only when someone is at the crate. No faces are saved. Nothing leaves this house.*
+
+## Vision (opt-in, V0 kitchen still)
+
+Voice stays the product. A USB webcam is spice. If the lens is unplugged or CLIP is slow, Talk → STT → LLM → TTS behaves exactly as it does without `--vision`. `first_syllable_ms` does **not** wait on a frame.
+
+Install extras only when you want the camera:
+
+```bash
+pip install -e '.[vision]'
+# first CLIP load downloads ViT-B-32 (~350 MB, OpenAI weights via open_clip). Offline after that.
+python -m gourdsworth --snap                 # grab one frame, print top 3 labels + visual_note, exit
+python -m gourdsworth --snap --dry-run       # same; prints the note, does not call the mayor
+python -m gourdsworth --vision               # on Talk: fire-and-forget still; inject note if ready in time
+python -m gourdsworth --vision --camera 0 --dry-run
+```
+
+Or set `vision.enabled: true` in `config.yaml`. Labels live in `src/gourdsworth/costume_labels.txt` (closed list; unsure → `homemade`). No JPEG is written. No faces, names, or ages. Neighbors' kids are the threat model.
+
+V0 is USB-on-the-Framework-Desktop only. Presence, Pi JPEG-over-LAN, and a local VLM sentence are later issues.
 
 ## Character
 

@@ -48,6 +48,15 @@ def _score_model(name: str) -> tuple[int, float, str]:
     return (band + instruct * 5, distance, name)
 
 
+def format_user_message(user_text: str, visual_note: str | None = None) -> str:
+    """Current-turn user content. Visual notes stay off history on purpose."""
+    user = user_text or "(silence)"
+    note = (visual_note or "").strip()
+    if not note:
+        return user
+    return f"{note}\n\n{user}"
+
+
 def pick_ollama_model(names: list[str], preferred: str | None = None) -> str:
     """Choose a usable local model. Prefer `preferred` if present; else best 7/8B instruct."""
     cleaned = [n for n in names if n]
@@ -114,11 +123,15 @@ class LocalMayor:
         r.raise_for_status()
         return (perf_counter() - t0) * 1000
 
-    def reply(self, user_text: str, history: list[dict]) -> tuple[str, float, float]:
+    def reply(
+        self, user_text: str, history: list[dict], visual_note: str | None = None
+    ) -> tuple[str, float, float]:
         t0 = perf_counter()
         chunks: list[str] = []
         ttft = None
-        for piece, piece_ttft, done in self.reply_stream(user_text, history):
+        for piece, piece_ttft, done in self.reply_stream(
+            user_text, history, visual_note=visual_note
+        ):
             if piece_ttft is not None and ttft is None:
                 ttft = piece_ttft
             if piece:
@@ -126,13 +139,17 @@ class LocalMayor:
         total = (perf_counter() - t0) * 1000
         return "".join(chunks).strip(), (ttft or total), total
 
-    def reply_stream(self, user_text: str, history: list[dict]):
+    def reply_stream(
+        self, user_text: str, history: list[dict], visual_note: str | None = None
+    ):
         """Yield (piece, ttft_ms_or_None, done). ttft set on first non-empty piece only."""
         import json
 
         messages = [{"role": "system", "content": self.system}]
         messages.extend(history)
-        messages.append({"role": "user", "content": user_text or "(silence)"})
+        messages.append(
+            {"role": "user", "content": format_user_message(user_text, visual_note)}
+        )
         t0 = perf_counter()
         ttft_sent = False
         with requests.post(

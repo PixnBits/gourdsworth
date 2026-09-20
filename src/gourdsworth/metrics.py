@@ -20,6 +20,10 @@ class TurnMetrics:
     words_out: int = 0
     used_canned: bool = False
     early_flush: bool = False
+    vision_ms: float = 0.0
+    vision_label: str = ""
+    vision_score: float = 0.0
+    vision_used: bool = False
 
     def end_to_end_ms(self) -> float:
         return (perf_counter() - self.t0) * 1000
@@ -42,4 +46,14 @@ class TurnMetrics:
             f"turn={self.end_to_end_ms():.0f}ms"
             + ("  [early-tts]" if self.early_flush else "")
             + ("  [canned]" if self.used_canned else "")
+            + (
+                (
+                    f"  vision={self.vision_ms:.0f}ms"
+                    f"  vision_label={self.vision_label or '-'}"
+                    f"  vision_score={self.vision_score:.2f}"
+                    f"  vision_used={int(self.vision_used)}"
+                )
+                if (self.vision_ms or self.vision_label or self.vision_used)
+                else ""
+            )
         )

@@ -33,3 +33,17 @@ privacy:
 character: mayor
 max_history_turns: 4
 cooldown_s: 0.4
+
+# Opt-in local CLIP still (issue #19 V0). Voice works without this.
+# pip install -e '.[vision]'  then  python -m gourdsworth --snap
+# Camera opens only on Talk / --snap. Frames stay in RAM. Nothing leaves the house.
+vision:
+  enabled: false
+  camera_index: 0
+  width: 640
+  height: 480
+  min_score: 0.15          # below this, label is homemade
+  model: ViT-B-32
+  pretrained: openai       # first load downloads ~350MB CLIP weights
+  # labels_file: src/gourdsworth/costume_labels.txt
+  # labels: [princess, prince, astronaut, dinosaur, firefighter, police, witch, wizard, ghost, superhero, ninja, pirate, animal, sports, robot, homemade, group]

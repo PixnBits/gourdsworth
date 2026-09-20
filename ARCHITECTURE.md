@@ -30,6 +30,22 @@ Phase 2: crate Pi streams PCM to this process over the LAN. Inference stays here
 
 Native S2S is faster at barge-in. It is also how audio leaves the house. This project refuses that trade. A streamed cascade on a 128 GB Strix Halo box should land first Mayor syllable around 0.5–1.5 s after they stop talking. The metrics line after every turn tells you whether that is true on *this* machine.
 
+## Vision sidecar (V0)
+
+Opt-in, local, never on the voice path.
+
+```
+Talk / --snap ──► daemon thread: USB frame → JPEG bytes in RAM → CLIP vs closed labels
+                         │
+                         ├─ ready before LLM request: one Visual note line on this turn only
+                         └─ late / missing camera / missing extras: omit the note; voice unchanged
+```
+
+- Camera opens only for that still, then releases. No ring buffer, no file, no cloud vision API.
+- Closed costume list (`costume_labels.txt`). Unsure → `homemade`. No names, ages, faces.
+- Metrics (text only): `vision_ms`, `vision_label`, `vision_score`, `vision_used`.
+- V1+ (not here): presence / person count, Pi JPEG over LAN, optional local VLM sentence.
+
 ## What is deliberately missing in 0.1
 
 - Servo / LED / arcade button GPIO
@@ -37,5 +53,6 @@ Native S2S is faster at barge-in. It is also how audio leaves the house. This pr
 - Kokoro TTS
 - Multi-talker diarization
 - Cloud failover
+- Presence, YOLO person count, Pi frame-grabber, local VLM (vision V1–V3)
 
 Those belong in later milestones. See `GROK_BUILD_PROMPT.md`.

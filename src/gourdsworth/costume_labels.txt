@@ -1,0 +1,19 @@
+# Closed costume list for local CLIP / SigLIP. Edit here, not in code.
+# Never add names, ages, or identity guesses. Unsure → homemade.
+princess
+prince
+astronaut
+dinosaur
+firefighter
+police
+witch
+wizard
+ghost
+superhero
+ninja
+pirate
+animal
+sports
+robot
+homemade
+group
