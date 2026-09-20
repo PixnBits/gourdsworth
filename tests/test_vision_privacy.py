@@ -191,3 +191,37 @@ def test_help_lists_snap_and_vision(capsys):
     assert "--snap" in out
     assert "--vision" in out
     assert "--camera" in out
+
+
+def test_format_visual_note_list():
+    from gourdsworth.vision import format_visual_note
+
+    note = format_visual_note(["hot dog", "animal"])
+    assert "hot dog costume" in note
+    assert "animal costume" in note
+    assert note.startswith("Visual note")
+
+
+def test_select_costume_labels_multi():
+    from gourdsworth.vision import select_costume_labels
+
+    ranked = [
+        ("hot dog", 0.85),
+        ("animal", 0.12),
+        ("group", 0.08),
+        ("homemade", 0.02),
+    ]
+    picked = select_costume_labels(ranked, min_score=0.15)
+    assert picked[0] == "hot dog"
+    assert "animal" in picked
+    assert "homemade" not in picked
+
+
+def test_select_keeps_weak_second():
+    from gourdsworth.vision import select_costume_labels, format_visual_note
+
+    ranked = [("hot dog", 0.85), ("animal", 0.03), ("group", 0.02)]
+    picked = select_costume_labels(ranked, min_score=0.15)
+    assert picked[:2] == ["hot dog", "animal"]
+    note = format_visual_note(picked)
+    assert "hot dog costume" in note and "animal costume" in note
