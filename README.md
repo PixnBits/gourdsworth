@@ -77,3 +77,10 @@ Measured on Framework Desktop (AMD Ryzen AI Max / Strix Halo), pipewire I/O, Pip
 | M1 · early TTS + tiny.en · llama3.1:8b | **~655–821 ms** | live VAD, pipewire I/O |
 
 `first_syllable ≈ stt + time_to_first_audio` after the kid stops talking.
+
+
+## STT accuracy
+
+Default is `base.en` (clearer on a noisy porch). `tiny.en` is faster but mangled live lines like "trick or treat" → "check our tree".
+
+Porch bias: Whisper gets an `initial_prompt` / hotwords for candy/costume/pumpkin phrases, plus a light corrector for short near-misses. See issue #4.
