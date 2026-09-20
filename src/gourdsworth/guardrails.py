@@ -87,7 +87,9 @@ def _extract_gesture(raw: str) -> tuple[str, str]:
 
 _DANGLING = frozenset(
     {
-        "a", "an", "the", "to", "of", "and", "or", "but", "for", "with",
+        # Note: "with" is intentionally NOT here — distress must keep
+        # "Tell a grown-up you came with."
+        "a", "an", "the", "to", "of", "and", "or", "but", "for",
         "your", "my", "our", "in", "on", "at", "as", "by", "from", "into",
         "uh", "um", "where", "when", "who", "whom", "whose", "which", "that",
         "this", "these", "those", "so", "if", "than", "then", "very",
