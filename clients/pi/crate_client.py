@@ -52,38 +52,109 @@ def _stdin_ready(timeout: float) -> bool:
         return False
 
 
-def _grab_jpeg(index: int, width: int, height: int) -> bytes | None:
+# Adaptive still ladder (long edge). 0 = native camera frame, no downscale.
+_STILL_LADDER = (0, 1920, 1280, 960, 640)
+
+
+def _grab_jpeg(
+    index: int,
+    *,
+    max_edge: int = 0,
+    quality: int = 90,
+) -> tuple[bytes | None, tuple[int, int] | None]:
+    """Grab one still. max_edge 0 = full native resolution; else fit inside max_edge.
+
+    Returns (jpeg_bytes, (width, height)) or (None, None).
+    """
     try:
         import cv2
     except ImportError:
         print("  camera skipped: OpenCV not installed")
-        return None
+        return None, None
     cap = cv2.VideoCapture(int(index))
     frame = None
     try:
         if not cap.isOpened():
             print(f"  camera {index} could not be opened")
-            return None
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, int(width))
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(height))
+            return None, None
+        # Ask for a high mode; driver may still deliver native/sensor size.
+        if max_edge <= 0:
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 3840)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 2160)
+        else:
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, int(max_edge))
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(max_edge))
         try:
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         except Exception:
             pass
         ok = False
-        for _ in range(3):
+        for _ in range(4):
             ok, frame = cap.read()
         if not ok or frame is None:
             print(f"  camera {index} produced no frame")
-            return None
-        ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+            return None, None
+        h, w = frame.shape[:2]
+        if max_edge > 0 and max(h, w) > max_edge:
+            scale = float(max_edge) / float(max(h, w))
+            nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
+            frame = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_AREA)
+            h, w = frame.shape[:2]
+        ok, buf = cv2.imencode(
+            ".jpg",
+            frame,
+            [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)],
+        )
         if not ok:
             print("  jpeg encode failed")
-            return None
-        return bytes(buf)
+            return None, None
+        return bytes(buf), (int(w), int(h))
     finally:
         cap.release()
         del frame
+
+
+class _StillAdaptive:
+    """Start at full res; step down the long-edge ladder if a send is slow."""
+
+    def __init__(self, *, start_edge: int = 0, slow_ms: float = 800.0):
+        self.edge = int(start_edge)
+        self.slow_ms = float(slow_ms)
+        self.quality = 90
+        try:
+            self._idx = _STILL_LADDER.index(self.edge)
+        except ValueError:
+            # Custom edge — treat as current rung; next step goes to nearest lower ladder
+            self._idx = 0
+            for i, e in enumerate(_STILL_LADDER):
+                if e == 0:
+                    continue
+                if self.edge == 0 or self.edge >= e:
+                    self._idx = i
+                    break
+
+    def note_send(self, nbytes: int, elapsed_ms: float) -> None:
+        if nbytes <= 0:
+            return
+        # Slow absolute send, or sluggish effective rate on larger frames
+        mbps = (nbytes * 8.0 / 1_000_000.0) / max(elapsed_ms / 1000.0, 0.001)
+        if elapsed_ms < self.slow_ms and mbps >= 8.0:
+            return
+        if self._idx >= len(_STILL_LADDER) - 1 and self.quality <= 70:
+            return
+        if self._idx < len(_STILL_LADDER) - 1:
+            self._idx += 1
+            self.edge = int(_STILL_LADDER[self._idx])
+            label = "native" if self.edge <= 0 else f"max-edge {self.edge}"
+            print(
+                f"  still adaptive: send {elapsed_ms:.0f}ms / {nbytes // 1024}KiB "
+                f"→ next still {label}"
+            )
+        elif self.quality > 70:
+            self.quality = max(70, self.quality - 10)
+            print(
+                f"  still adaptive: send {elapsed_ms:.0f}ms → JPEG quality {self.quality}"
+            )
 
 
 def _play_tts(header: dict, payload: bytes | None) -> None:
@@ -258,8 +329,7 @@ def _talk(
     gpio,
     camera: bool,
     camera_index: int,
-    width: int,
-    height: int,
+    still: _StillAdaptive | None,
     no_mic: bool,
     limit_s: float,
     end_talk: threading.Event,
@@ -267,9 +337,22 @@ def _talk(
 ) -> None:
     end_talk.clear()
     if camera:
-        jpeg = _grab_jpeg(camera_index, width, height)
+        assert still is not None
+        t_jpg = time.monotonic()
+        jpeg, wh = _grab_jpeg(
+            camera_index, max_edge=still.edge, quality=still.quality
+        )
         if jpeg:
+            encode_ms = (time.monotonic() - t_jpg) * 1000
+            t_send = time.monotonic()
             conn.send({"event": "jpeg"}, jpeg)
+            send_ms = (time.monotonic() - t_send) * 1000
+            still.note_send(len(jpeg), send_ms)
+            if wh:
+                print(
+                    f"  still {wh[0]}x{wh[1]}  {len(jpeg) // 1024}KiB  "
+                    f"encode {encode_ms:.0f}ms  send {send_ms:.0f}ms"
+                )
             del jpeg
         else:
             conn.send({"event": "still"})
@@ -409,16 +492,17 @@ def main(argv: list[str] | None = None) -> int:
         help="Hands-free porch loop: after each reply, listen again (Ctrl+C / q to quit)",
     )
     parser.add_argument(
-        "--width",
+        "--max-edge",
         type=int,
-        default=_env_int("CRATE_WIDTH") or 1280,
-        help="JPEG still width (env CRATE_WIDTH / local.env; default 1280)",
+        default=_env_int("CRATE_MAX_EDGE") if _env_int("CRATE_MAX_EDGE") is not None else 0,
+        metavar="PX",
+        help="Max JPEG long edge (0=full native; env CRATE_MAX_EDGE). Adaptive may step down if sends are slow.",
     )
     parser.add_argument(
-        "--height",
-        type=int,
-        default=_env_int("CRATE_HEIGHT") or 720,
-        help="JPEG still height (env CRATE_HEIGHT / local.env; default 720)",
+        "--still-slow-ms",
+        type=float,
+        default=float(_env_int("CRATE_STILL_SLOW_MS") or 800),
+        help="If encode+send exceeds this, step down still size next turn (default 800)",
     )
     parser.add_argument(
         "--list-devices",
@@ -474,13 +558,22 @@ def main(argv: list[str] | None = None) -> int:
         if not ready.wait(timeout=20):
             print("No ready from desktop (is --serve-crate / --crate-echo running?)")
             return 1
+        still_adapt = _StillAdaptive(
+            start_edge=int(args.max_edge),
+            slow_ms=float(args.still_slow_ms),
+        )
+        if not args.no_camera:
+            edge = int(args.max_edge)
+            print(
+                "  stills: full native (adaptive downscale if sends are slow)"
+                if edge <= 0
+                else f"  stills: max long-edge {edge}px (adaptive)"
+            )
         if args.continuous:
             print(
                 "Continuous porch mode. Speak, pause — he answers — then listens again."
             )
             print("  Ctrl+C or q = quit")
-            if not args.no_camera:
-                print(f"  stills {args.width}x{args.height}")
 
         while True:
             ready.clear()
@@ -511,8 +604,7 @@ def main(argv: list[str] | None = None) -> int:
                 gpio=gpio,
                 camera=not args.no_camera,
                 camera_index=args.camera,
-                width=int(args.width),
-                height=int(args.height),
+                still=still_adapt,
                 no_mic=args.no_mic,
                 limit_s=float(args.listen_s),
                 end_talk=end_talk,
