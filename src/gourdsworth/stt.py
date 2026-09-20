@@ -23,6 +23,7 @@ _PORCH_PHRASES = (
     "do you have candy",
     "where is the candy",
     "peter peter pumpkin eater",
+    "i don't have a paper",
 )
 
 
@@ -56,6 +57,11 @@ def porch_correct(text: str) -> str:
         "peter peter pumpkin ear": "peter peter pumpkin eater",
         "peter peter pumped in either": "peter peter pumpkin eater",
         "theater theater pump and theater": "peter peter pumpkin eater",
+        # Negation drops (base/tiny often lose "I don't")
+        "have a paper": "i don't have a paper",
+        "have paper": "i don't have a paper",
+        "have a papers": "i don't have a paper",
+        "i have a paper": "i don't have a paper",  # rare flip; porch context = refusing papers
     }
     if n in aliases:
         fixed = aliases[n]
@@ -63,6 +69,8 @@ def porch_correct(text: str) -> str:
             return "Trick or treat."
         if fixed == "peter peter pumpkin eater":
             return "Peter Peter pumpkin eater."
+        if fixed == "i don't have a paper":
+            return "I don't have a paper."
         return fixed
 
     best = None
