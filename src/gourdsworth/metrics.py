@@ -24,6 +24,7 @@ class TurnMetrics:
     vision_label: str = ""
     vision_score: float = 0.0
     vision_used: bool = False
+    person_count: int | None = None
 
     def end_to_end_ms(self) -> float:
         return (perf_counter() - self.t0) * 1000
@@ -51,7 +52,7 @@ class TurnMetrics:
                     f"  vision={self.vision_ms:.0f}ms"
                     f"  vision_label={self.vision_label or '-'}"
                     f"  vision_score={self.vision_score:.2f}"
-                    f"  vision_used={int(self.vision_used)}"
+                    f"  vision_used={int(self.vision_used)}" + (f"  persons={self.person_count}" if self.person_count is not None else "")
                 )
                 if (self.vision_ms or self.vision_label or self.vision_used)
                 else ""

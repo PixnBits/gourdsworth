@@ -64,7 +64,7 @@ def _kitchen_still(cfg: dict, dry_run: bool = False) -> int:
         f"  vision_ms={result.vision_ms:.0f}  "
         f"vision_label={result.label}  "
         f"vision_score={result.score:.2f}  "
-        f"vision_used=0"
+        f"vision_used=0" + (f"  persons={result.person_count}" if result.person_count is not None else "")
     )
     print(result.note)
     if dry_run:
@@ -488,6 +488,7 @@ def _handle_turn(
         metrics.vision_ms = vis.vision_ms
         metrics.vision_label = vis.label if not vis.skip_reason else ""
         metrics.vision_score = vis.score
+        metrics.person_count = vis.person_count
         if vis.skip_reason:
             print(f"  vision skipped: {vis.skip_reason}")
         elif vis.top3:
