@@ -27,21 +27,19 @@ JSON lines + length-prefixed binary (`n` then raw bytes). See
 ```bash
 sudo apt update
 sudo apt install -y python3-pip python3-venv python3-numpy libportaudio2
-# optional stills
-sudo apt install -y python3-opencv
 # optional arcade button (BCM pin)
 sudo apt install -y python3-gpiozero
 ```
 
-From a clone of this repo on the Pi (no package install):
+From a clone of this repo on the Pi (no full gourdsworth package install):
 
 ```bash
 python3 -m venv .venv-crate
 source .venv-crate/bin/activate
-pip install numpy sounddevice
-# optional, if apt opencv is missing:
-# pip install opencv-python-headless
+pip install -r clients/pi/requirements.txt   # includes opencv-python-headless for stills
 ```
+
+Apt `python3-opencv` alone is not enough — the venv will not see it unless you pass `--system-site-packages`. Prefer the pip wheel in the venv.
 
 `clients/pi/requirements.txt` is the pip set.
 
