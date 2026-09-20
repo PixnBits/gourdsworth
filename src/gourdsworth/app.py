@@ -22,10 +22,54 @@ from gourdsworth.llm import LocalMayor
 from gourdsworth.metrics import TurnMetrics
 from gourdsworth.stt import SpeechToText
 from gourdsworth.tts import Speaker
+from gourdsworth.vision import (
+    PRIVACY_SIGN,
+    VisionSidecar,
+    format_top3,
+    take_ready,
+)
 
 
 def _load_canned() -> dict:
     return json.loads(canned_path().read_text())
+
+
+def _kick_vision(sidecar: VisionSidecar | None):
+    """Start a still; never wait. None if vision is off or the previous still is still running."""
+    if sidecar is None:
+        return None
+    return sidecar.submit_snap()
+
+
+def _kitchen_still(cfg: dict, dry_run: bool = False) -> int:
+    print("Gourdsworth vision V0 — kitchen still (RAM only, local CLIP)")
+    print(PRIVACY_SIGN)
+    sidecar = VisionSidecar.from_config(cfg)
+    ok, reason = sidecar.prepare()
+    if not ok:
+        print(f"vision skipped: {reason}")
+        sidecar.close()
+        return 1
+    print(
+        f"  CLIP {sidecar.model_name} ({sidecar.pretrained})  "
+        f"load={sidecar.load_ms:.0f}ms  camera={sidecar.camera_index}"
+    )
+    result = sidecar.snap()
+    sidecar.close()
+    if result.skip_reason:
+        print(f"vision skipped: {result.skip_reason}")
+        return 1
+    print(f"  top: {format_top3(result.top3)}")
+    print(
+        f"  vision_ms={result.vision_ms:.0f}  "
+        f"vision_label={result.label}  "
+        f"vision_score={result.score:.2f}  "
+        f"vision_used=0"
+    )
+    print(result.note)
+    if dry_run:
+        print("  (dry-run: note not sent to the mayor)")
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -52,6 +96,23 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--input", type=int, default=None, metavar="N", help="Input device id")
     parser.add_argument("--output", type=int, default=None, metavar="N", help="Output device id")
+    parser.add_argument(
+        "--vision",
+        action="store_true",
+        help="Opt in to one RAM still + local CLIP costume note on Talk (never blocks voice)",
+    )
+    parser.add_argument(
+        "--snap",
+        action="store_true",
+        help="Kitchen still: grab one webcam frame, classify costume, print top-3, exit",
+    )
+    parser.add_argument(
+        "--camera",
+        type=int,
+        default=None,
+        metavar="N",
+        help="OpenCV camera index for --vision / --snap (default 0)",
+    )
     args = parser.parse_args(argv)
 
     if args.list_devices:
@@ -63,7 +124,7 @@ def main(argv: list[str] | None = None) -> int:
             set_devices(args.input, args.output)
         except OSError as exc:
             print(f"Could not set audio devices ({exc})")
-            if not args.dry_run:
+            if not args.dry_run and not args.snap:
                 return 1
 
     cfg = load_config(args.config)
@@ -80,10 +141,18 @@ def main(argv: list[str] | None = None) -> int:
         cfg["stt"]["model"] = args.stt_model
     cfg["_input_device"] = args.input
     cfg["_output_device"] = args.output
+    cfg.setdefault("vision", {})
+    if args.vision or args.snap:
+        cfg["vision"]["enabled"] = True
+    if args.camera is not None:
+        cfg["vision"]["camera_index"] = args.camera
 
     if cfg["privacy"].get("save_audio") or cfg["privacy"].get("save_transcripts"):
         print("Refusing to start: save_audio / save_transcripts must stay false.")
         return 2
+
+    if args.snap:
+        return _kitchen_still(cfg, dry_run=args.dry_run)
 
     system = prompt_path().read_text()
     canned = _load_canned()
@@ -150,6 +219,22 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"  TTS failed: {exc2}")
                 return 1
 
+    sidecar = None
+    if (cfg.get("vision") or {}).get("enabled"):
+        print("  loading vision…")
+        sidecar = VisionSidecar.from_config(cfg)
+        ok, reason = sidecar.prepare()
+        if not ok:
+            print(f"  vision skipped: {reason}")
+            sidecar.close()
+            sidecar = None
+        else:
+            print(
+                f"  vision load={sidecar.load_ms:.0f}ms  "
+                f"CLIP={sidecar.model_name}  camera={sidecar.camera_index}"
+            )
+            print(f"  {PRIVACY_SIGN}")
+
     history: list[dict] = []
     print()
     print("Disembodied test loop. Kids hear a voice with no pumpkin yet — that is the point.")
@@ -176,6 +261,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             while True:
                 metrics = TurnMetrics()
+                vis_future = _kick_vision(sidecar)
                 audio_in, metrics.record_ms = record_vad(
                     cfg["sample_rate"],
                     cfg["listen_limit_s"],
@@ -192,7 +278,15 @@ def main(argv: list[str] | None = None) -> int:
                     time.sleep(float(cfg["cooldown_s"]))
                     continue
                 _handle_turn(
-                    user_text, mayor, speaker, canned, history, cfg, metrics, typed=False
+                    user_text,
+                    mayor,
+                    speaker,
+                    canned,
+                    history,
+                    cfg,
+                    metrics,
+                    typed=False,
+                    vis_future=vis_future,
                 )
                 time.sleep(float(cfg["cooldown_s"]))
         except KeyboardInterrupt:
@@ -219,12 +313,22 @@ def main(argv: list[str] | None = None) -> int:
             # Typed kid-proxy line: still run TTS/speakers (only --dry-run sets typed=True)
             user_text = cmd
             metrics = TurnMetrics()
+            vis_future = _kick_vision(sidecar)
             _handle_turn(
-                user_text, mayor, speaker, canned, history, cfg, metrics, typed=args.dry_run
+                user_text,
+                mayor,
+                speaker,
+                canned,
+                history,
+                cfg,
+                metrics,
+                typed=args.dry_run,
+                vis_future=vis_future,
             )
             continue
 
         metrics = TurnMetrics()
+        vis_future = _kick_vision(sidecar)
         if args.dry_run:
             user_text = input("type the kid> ").strip()
             metrics.record_ms = 0.0
@@ -247,7 +351,17 @@ def main(argv: list[str] | None = None) -> int:
             user_text, metrics.stt_ms = stt.transcribe(audio_in, cfg["sample_rate"])
             del audio_in
 
-        _handle_turn(user_text, mayor, speaker, canned, history, cfg, metrics, typed=args.dry_run)
+        _handle_turn(
+            user_text,
+            mayor,
+            speaker,
+            canned,
+            history,
+            cfg,
+            metrics,
+            typed=args.dry_run,
+            vis_future=vis_future,
+        )
         time.sleep(float(cfg["cooldown_s"]))
 
     return 0
@@ -264,7 +378,9 @@ def _speakable_remainder(full: str, spoken_prefix: str) -> str:
     return rem
 
 
-def _handle_turn(user_text, mayor, speaker, canned, history, cfg, metrics, typed=False):
+def _handle_turn(
+    user_text, mayor, speaker, canned, history, cfg, metrics, typed=False, vis_future=None
+):
     user_text = (user_text or "").strip()
     metrics.words_in = len(user_text.split())
     print(f"Heard: {user_text!r}" if user_text else "Heard: (silence)")
@@ -272,6 +388,8 @@ def _handle_turn(user_text, mayor, speaker, canned, history, cfg, metrics, typed
     gesture = "stamp"
     line = ""
     t_post_stt = perf_counter()
+    vis = take_ready(vis_future)
+    visual_note = vis.note if vis is not None and vis.ok else None
 
     if looks_distress(user_text):
         line = canned["distress"][0]
@@ -292,7 +410,9 @@ def _handle_turn(user_text, mayor, speaker, canned, history, cfg, metrics, typed
         early: str | None = None
         ttft = None
         t_llm0 = perf_counter()
-        for piece, piece_ttft, done in mayor.reply_stream(user_text, history):
+        for piece, piece_ttft, done in mayor.reply_stream(
+            user_text, history, visual_note=visual_note
+        ):
             if piece_ttft is not None and ttft is None:
                 ttft = piece_ttft
                 metrics.llm_ttft_ms = ttft
@@ -315,6 +435,7 @@ def _handle_turn(user_text, mayor, speaker, canned, history, cfg, metrics, typed
             if done:
                 break
         metrics.llm_total_ms = (perf_counter() - t_llm0) * 1000
+        metrics.vision_used = bool(visual_note)
         raw = "".join(parts).strip()
         line, gesture = parse_reply(raw)
         if not line or model_went_dark(line):
@@ -360,6 +481,21 @@ def _handle_turn(user_text, mayor, speaker, canned, history, cfg, metrics, typed
         history.append({"role": "assistant", "content": line})
         cap = int(cfg["max_history_turns"]) * 2
         del history[:-cap]
+
+    if vis is None:
+        vis = take_ready(vis_future)
+    if vis is not None:
+        metrics.vision_ms = vis.vision_ms
+        metrics.vision_label = vis.label if not vis.skip_reason else ""
+        metrics.vision_score = vis.score
+        if vis.skip_reason:
+            print(f"  vision skipped: {vis.skip_reason}")
+        elif vis.top3:
+            print(f"  vision top: {format_top3(vis.top3)}")
+            if metrics.vision_used and visual_note:
+                print(f"  {visual_note}")
+            elif vis.note and not metrics.used_canned:
+                print("  vision ready too late; note not used this turn")
 
     print(metrics.render())
     print()
