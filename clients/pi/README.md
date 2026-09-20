@@ -114,3 +114,9 @@ PYTHONPATH=src python clients/pi/crate_client.py --continuous
 Stills default to **full native camera resolution**. If encode+send is slow, the client
 adaptively steps the long edge down (1920 → 1280 → 960 → 640) and may ease JPEG quality.
 Cap with `--max-edge N` or `CRATE_MAX_EDGE` in `local.env` (0 = full native).
+
+
+## USB DAC / odd sample rates
+
+Piper often synthesizes at 22050 Hz. Many USB dongles reject that rate. The client
+resamples TTS to the output device default rate (usually 44100/48000) before play.

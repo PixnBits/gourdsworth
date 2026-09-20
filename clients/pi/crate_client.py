@@ -157,6 +157,19 @@ class _StillAdaptive:
             )
 
 
+def _resample_f32(samples, src_rate: int, dst_rate: int):
+    """Cheap linear resample — USB DACs often reject Piper's 22050 Hz."""
+    import numpy as np
+
+    if src_rate <= 0 or dst_rate <= 0 or src_rate == dst_rate or samples.size == 0:
+        return samples, src_rate
+    n_dst = max(1, int(round(samples.size * float(dst_rate) / float(src_rate))))
+    x_old = np.linspace(0.0, 1.0, num=samples.size, endpoint=False)
+    x_new = np.linspace(0.0, 1.0, num=n_dst, endpoint=False)
+    out = np.interp(x_new, x_old, samples.astype(np.float64)).astype(np.float32)
+    return out, dst_rate
+
+
 def _play_tts(header: dict, payload: bytes | None) -> None:
     if not payload:
         return
@@ -172,14 +185,43 @@ def _play_tts(header: dict, payload: bytes | None) -> None:
         samples = np.frombuffer(payload, dtype="<i2").astype(np.float32) / 32768.0
     else:
         samples = np.frombuffer(payload, dtype="<f4")
-    duration = float(samples.size) / float(rate) if rate else 0.0
+
+    # Prefer the selected output device's default rate (USB DACs dislike 22050).
+    play_rate = rate
+    try:
+        out_id = sd.default.device[1] if isinstance(sd.default.device, (list, tuple)) else sd.default.device
+        dev = sd.query_devices(out_id)
+        native = int(float(dev.get("default_samplerate") or 0)) or 48000
+        if native != rate:
+            samples, play_rate = _resample_f32(samples, rate, native)
+    except Exception:
+        play_rate = rate
+
+    duration = float(samples.size) / float(play_rate) if play_rate else 0.0
     done = threading.Event()
+    err: list[str] = []
 
     def _run() -> None:
         try:
-            sd.play(samples, rate)
-            sd.wait()
+            try:
+                sd.play(samples, play_rate)
+                sd.wait()
+            except Exception:
+                # Last-chance fallback rates some dongles accept
+                for fallback in (48000, 44100, 32000, 16000):
+                    if fallback == play_rate:
+                        continue
+                    try:
+                        alt, alt_rate = _resample_f32(samples, play_rate, fallback)
+                        sd.play(alt, alt_rate)
+                        sd.wait()
+                        del alt
+                        return
+                    except Exception:
+                        continue
+                raise
         except Exception as exc:
+            err.append(str(exc))
             print(f"  (playback failed: {exc})")
         finally:
             done.set()
