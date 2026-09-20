@@ -1,5 +1,8 @@
 # Closed costume list for local CLIP / SigLIP. Edit here, not in code.
 # Never add names, ages, or identity guesses. Unsure → homemade.
+# Keep DEFAULT_LABELS in vision.py identical and in this order.
+# Prefer silhouette-distinct generics. IP character names collapse
+# into princess / superhero / animal / pop star and split CLIP softmax.
 princess
 prince
 astronaut
@@ -19,5 +22,17 @@ robot
 food
 hot dog
 pumpkin
+vampire
+skeleton
+mummy
+fairy
+unicorn
+mermaid
+dragon
+knight
+cat
+cowboy
+pop star
+minecraft
 homemade
 group
