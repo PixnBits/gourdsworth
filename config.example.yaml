@@ -1,1 +1,35 @@
-# Copy to config.yaml. Audio never written to disk.\n\nmode: ptt          # ptt (spacebar) | vad (energy silence detect)\nsample_rate: 16000\nlisten_limit_s: 8.0\nsilence_s: 0.55  # was 0.85; snappier end-of-utterance\nenergy_threshold: 0.012\n\nollama:\n  host: http://127.0.0.1:11434\n  # Prefer a pulled 7B–8B instruct. If missing, startup auto-picks the best local match\n  # (14B instruct is OK when that is the smallest available).\n  model: llama3.1:8b\n  num_predict: 40\n  temperature: 0.6\n\nstt:\n  model: base.en        # prefer base.en on porch; tiny.en for lower latency\n  device: auto          # auto | cpu | cuda\n  compute_type: int8\n\ntts:\n  engine: piper         # piper | espeak\n  voice: en_US-danny-low  # elected; lessac-medium is a fine fallback\n  speaker_id: 0\n\nprivacy:\n  bind_host: 127.0.0.1\n  save_audio: false\n  save_transcripts: false\n  session_log: memory   # memory | none  (never disk)\n\ncharacter: mayor\nmax_history_turns: 4\ncooldown_s: 0.4\n
+# Copy to config.yaml. Audio never written to disk.
+
+mode: ptt          # ptt (spacebar) | vad (energy silence detect)
+sample_rate: 16000
+listen_limit_s: 8.0
+silence_s: 0.55  # was 0.85; snappier end-of-utterance
+energy_threshold: 0.012
+
+ollama:
+  host: http://127.0.0.1:11434
+  # Prefer a pulled 7B–8B instruct. If missing, startup auto-picks the best local match
+  # (14B instruct is OK when that is the smallest available).
+  model: llama3.1:8b
+  num_predict: 40
+  temperature: 0.6
+
+stt:
+  model: base.en        # prefer base.en on porch; tiny.en for lower latency
+  device: auto          # auto | cpu | cuda
+  compute_type: int8
+
+tts:
+  engine: piper         # piper | espeak
+  voice: en_US-danny-low  # elected; lessac-medium is a fine fallback
+  speaker_id: 0
+
+privacy:
+  bind_host: 127.0.0.1
+  save_audio: false
+  save_transcripts: false
+  session_log: memory   # memory | none  (never disk)
+
+character: mayor
+max_history_turns: 4
+cooldown_s: 0.4
