@@ -23,15 +23,21 @@ _GOURD_GEOUS = re.compile(r"\b[Gg]ourd[-\s]*geous\b")
 
 
 def rewrite_puns_for_tts(text: str) -> str:
-    """Speak porch puns so Piper lands them (display text can stay normal)."""
+    """Speak porch puns / names so Piper lands them (display text can stay normal)."""
     def repl(m: re.Match[str]) -> str:
         raw = m.group(0)
-        # Preserve leading capital if the model wrote Gourd-geous
         if raw[0].isupper():
             return "Gourd----geous"
         return "gourd----geous"
 
-    return _GOURD_GEOUS.sub(repl, text or "")
+    text = _GOURD_GEOUS.sub(repl, text or "")
+    # Help "Gourdsworth" not become "goats worth"
+    text = re.sub(r"\bGourdsworth\b", "Gourdsworth", text)
+    text = re.sub(r"\bgourdsworth\b", "gourdsworth", text)
+    # Slight stretch on the "Gourd" syllable for the name
+    text = re.sub(r"\bGourdsworth\b", "Gourrdsworth", text)
+    text = re.sub(r"\bgourdsworth\b", "gourrdsworth", text)
+    return text
 
 
 def split_bang_ending(text: str) -> str:

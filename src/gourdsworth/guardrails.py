@@ -144,6 +144,18 @@ def clip_spoken(line: str, max_words: int = 20) -> str:
 _GESTURE_WORDS = frozenset({"stamp", "wave", "think", "laugh", "bow", "listen"})
 
 
+
+def finish_spoken(line: str) -> str:
+    """Avoid hanging mid-thought endings like '...License:'."""
+    line = (line or "").strip()
+    if not line:
+        return line
+    line = line.rstrip(" :;—–-")
+    if line and line[-1] not in ".!?":
+        line = line + "."
+    return line
+
+
 def sanitize_spoken(line: str) -> str:
     """Remove leaked gesture words and calm ALL CAPS yelling."""
     line = (line or "").strip()
@@ -181,6 +193,7 @@ def parse_reply(raw: str) -> tuple[str, str]:
     line = strip_markdown(line)
     line = clip_spoken(line, max_words=20)
     line = sanitize_spoken(line)
+    line = finish_spoken(line)
     # If the model only emitted a gesture tag, don't speak "Wave: wave"
     if not line:
         line = "Stamp applied. Candy awaits."
