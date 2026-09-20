@@ -16,6 +16,12 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
+vision = [
+  "opencv-python-headless>=4.10.0",
+  "open-clip-torch>=2.24.0",
+  "torch>=2.2.0",
+  "pillow>=10.0.0",
+]
 
 [project.scripts]
 gourdsworth = "gourdsworth.app:main"
@@ -26,3 +32,6 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+gourdsworth = ["costume_labels.txt"]

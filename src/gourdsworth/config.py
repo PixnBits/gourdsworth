@@ -29,6 +29,16 @@ DEFAULTS = {
     "character": "mayor",
     "max_history_turns": 4,
     "cooldown_s": 0.4,
+    "vision": {
+        "enabled": False,
+        "camera_index": 0,
+        "width": 640,
+        "height": 480,
+        "min_score": 0.15,
+        "model": "ViT-B-32",
+        "pretrained": "openai",
+        "labels_file": None,
+    },
 }
 
 
