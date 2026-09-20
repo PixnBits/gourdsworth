@@ -18,3 +18,8 @@ def test_preserves_capital():
 
 def test_leaves_other_words():
     assert rewrite_puns_for_tts("gorgeous sunset") == "gorgeous sunset"
+
+
+def test_gourdsworth_becomes_gorrdsworth():
+    assert "Gorrdsworth" in rewrite_puns_for_tts("Mayor Gourdsworth of Pumpkinville.")
+    assert "gorrdsworth" in rewrite_puns_for_tts("mayor gourdsworth says hi")
