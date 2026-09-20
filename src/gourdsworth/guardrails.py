@@ -157,31 +157,45 @@ def finish_spoken(line: str) -> str:
 
 
 def sanitize_spoken(line: str) -> str:
-    """Remove leaked gesture words and calm ALL CAPS yelling."""
+    """Strip leaked gesture *tags*, not English verbs like "stamp" / "wave".
+
+    Keep mid-sentence words ("I'll stamp your license"). Only drop:
+    - leading Gesture:/Wave:/Stamp: prefixes
+    - a gesture word dangling after sentence-end punctuation
+    - a lone ALL-CAPS gesture token, or a whole utterance that is just one
+    """
     line = (line or "").strip()
     if not line:
         return line
-    # Leading "Wave." / "Stamp:" leftovers
     line = re.sub(
         r"^(?:GESTURE|Gesture|Wave|Stamp|Think|Laugh|Bow|Listen)\s*[:.]\s*",
         "",
         line,
         flags=re.I,
-    )
+    ).strip()
+    # "...for you. stamp" / "...candy. Wave" — leaked tag after a sentence
+    line = re.sub(
+        r"(?<=[.!?])\s+(?:stamp|wave|think|laugh|bow|listen)\s*[.!?]?\s*$",
+        "",
+        line,
+        flags=re.I,
+    ).strip()
     words = line.split()
     cleaned: list[str] = []
     for w in words:
-        core = w.strip(".,!?;:\"'").lower()
-        if core in _GESTURE_WORDS:
+        core = w.strip(".,!?;:\"'")
+        low = core.lower()
+        if low in _GESTURE_WORDS and core.isupper() and len(core) > 1:
             continue
         cleaned.append(w)
     line = " ".join(cleaned).strip()
-    # If most letters are uppercase and longer than a short acronym, title-case it
+    cores = [w.strip(".,!?;:\"'").lower() for w in line.split()]
+    if len(cores) == 1 and cores[0] in _GESTURE_WORDS:
+        line = ""
     letters = [c for c in line if c.isalpha()]
     if letters and sum(1 for c in letters if c.isupper()) / len(letters) > 0.7 and len(letters) > 4:
         line = line.title()
     return strip_markdown(line)
-
 
 def parse_reply(raw: str) -> tuple[str, str]:
     cleaned, gesture = _extract_gesture(raw)
