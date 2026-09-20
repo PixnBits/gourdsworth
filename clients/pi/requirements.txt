@@ -1,0 +1,7 @@
+# Pi crate client only — do not install the full gourdsworth extras here.
+numpy>=1.24
+sounddevice>=0.5.1
+# optional stills (or: sudo apt install python3-opencv)
+# opencv-python-headless>=4.8
+# optional Talk button
+# gpiozero
