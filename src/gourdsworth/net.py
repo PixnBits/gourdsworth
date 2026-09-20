@@ -310,8 +310,9 @@ class CrateConnection:
     ):
         """Collect uplink PCM until button-up, VAD silence, or ``limit_s``.
 
-        Returns ``(float32 ndarray, record_ms)``. Drops the s16le chunks as
-        they are converted. Caller should ``del`` the ndarray after STT.
+        Returns ``(float32 ndarray, record_ms, uplink_first_ms, uplink_jitter_ms)``.
+        Drops the s16le chunks as they are converted. Caller should ``del``
+        the ndarray after STT.
         """
         import numpy as np
 
@@ -320,6 +321,9 @@ class CrateConnection:
         voiced = False
         silent_run = 0.0
         block_s = UPLINK_CHUNK_MS / 1000.0
+        uplink_first_ms = 0.0
+        uplink_jitter_ms = 0.0
+        last_chunk_t: float | None = None
         while (time.perf_counter() - t0) < limit_s:
             if self._closed.is_set():
                 break
@@ -331,6 +335,14 @@ class CrateConnection:
                 if (not self._listening) and self._pcm.empty():
                     break
                 continue
+            now = time.perf_counter()
+            if uplink_first_ms <= 0:
+                uplink_first_ms = (now - t0) * 1000.0
+            if last_chunk_t is not None:
+                gap_ms = (now - last_chunk_t) * 1000.0
+                if gap_ms > uplink_jitter_ms:
+                    uplink_jitter_ms = gap_ms
+            last_chunk_t = now
             chunk = s16le_to_f32(payload)
             del payload
             chunks.append(chunk)
@@ -351,7 +363,8 @@ class CrateConnection:
         else:
             audio = np.zeros(1, dtype=np.float32)
         del chunks
-        return audio, (time.perf_counter() - t0) * 1000.0
+        record_ms = (time.perf_counter() - t0) * 1000.0
+        return audio, record_ms, uplink_first_ms, uplink_jitter_ms
 
     def play_float(self, samples, rate: int) -> float:
         """Send one TTS buffer as f32le and wait for play_done (or duration)."""
@@ -482,7 +495,7 @@ def run_echo_session(conn: CrateConnection, *, gesture: str = "stamp") -> None:
         if not conn.wait_button("down", timeout=0.5):
             continue
         conn.send({"event": "listen"})
-        audio, _ms = conn.listen_pcm(limit_s=4.0, mode="ptt")
+        audio, _ms, _uf, _uj = conn.listen_pcm(limit_s=4.0, mode="ptt")
         jpeg = conn.take_jpeg()
         if jpeg:
             del jpeg

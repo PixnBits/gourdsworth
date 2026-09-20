@@ -191,6 +191,9 @@ def main(argv: list[str] | None = None) -> int:
     cfg.setdefault("crate", {})
     if args.serve_crate:
         cfg["crate"]["enabled"] = True
+        # Crate continuous clients stream until silence; PTT waits the full listen_limit.
+        if args.mode is None:
+            cfg["mode"] = "vad"
     if args.crate_host:
         cfg["crate"]["host"] = args.crate_host
     if args.crate_port is not None:
@@ -623,6 +626,10 @@ def _serve_crate(cfg, mayor, stt, speaker, sidecar, canned) -> int:
         return 2
     print()
     print("Crate server. Inference stays here. The Pi is mic / speaker / camera / button only.")
+    print(
+        f"  listen mode={cfg.get('mode')}  "
+        f"(vad ends on pause; ptt waits for button-up / full listen_limit)"
+    )
     if is_loopback(host):
         print(f"  crate listening on {host}:{port}  (localhost only)")
     else:
@@ -683,12 +690,14 @@ def _run_crate_session(conn, cfg, mayor, stt, speaker, sidecar, canned, history)
             vis_future = sidecar.submit_jpeg(jpeg)
         if jpeg is not None:
             del jpeg
-        audio_in, metrics.record_ms = conn.listen_pcm(
-            sample_rate=int(cfg["sample_rate"]),
-            limit_s=float(cfg["listen_limit_s"]),
-            mode=str(cfg.get("mode") or "ptt"),
-            silence_s=float(cfg["silence_s"]),
-            energy_threshold=float(cfg["energy_threshold"]),
+        audio_in, metrics.record_ms, metrics.uplink_first_ms, metrics.uplink_jitter_ms = (
+            conn.listen_pcm(
+                sample_rate=int(cfg["sample_rate"]),
+                limit_s=float(cfg["listen_limit_s"]),
+                mode=str(cfg.get("mode") or "vad"),
+                silence_s=float(cfg["silence_s"]),
+                energy_threshold=float(cfg["energy_threshold"]),
+            )
         )
         if vis_future is None:
             jpeg = conn.take_jpeg()

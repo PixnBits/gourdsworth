@@ -8,6 +8,8 @@ from time import perf_counter
 class TurnMetrics:
     t0: float = field(default_factory=perf_counter)
     record_ms: float = 0.0
+    uplink_first_ms: float = 0.0  # button-down → first PCM chunk from Pi
+    uplink_jitter_ms: float = 0.0  # max inter-chunk gap while listening
     stt_ms: float = 0.0
     llm_ttft_ms: float = 0.0
     llm_total_ms: float = 0.0
@@ -37,7 +39,9 @@ class TurnMetrics:
     def render(self) -> str:
         return (
             f"record={self.record_ms:.0f}ms  "
-            f"stt={self.stt_ms:.0f}ms  "
+            + (f"uplink_first={self.uplink_first_ms:.0f}ms  " if self.uplink_first_ms else "")
+            + (f"uplink_jitter={self.uplink_jitter_ms:.0f}ms  " if self.uplink_jitter_ms else "")
+            + f"stt={self.stt_ms:.0f}ms  "
             f"llm_ttft={self.llm_ttft_ms:.0f}ms  "
             f"llm={self.llm_total_ms:.0f}ms  "
             f"tts_first={self.tts_first_ms:.0f}ms  "
