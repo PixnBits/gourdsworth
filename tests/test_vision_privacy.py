@@ -235,3 +235,42 @@ def test_select_caps_by_person_count():
     note = format_visual_note(picked, person_count=2)
     assert "about 2 citizens" in note
     assert "hot dog costume" in note
+
+
+def test_per_person_unifies_count_and_costumes(monkeypatch):
+    """Two boxes → two costume labels even if full-frame CLIP only sees one."""
+    from gourdsworth import vision as v
+
+    jpeg = b"fake-jpeg"
+
+    def fake_boxes(j, *, model=None, conf=0.35):
+        return [(0, 0, 10, 20), (20, 0, 30, 20)]
+
+    def fake_crop(j, box, *, pad=0.12):
+        return b"crop-" + str(box[0]).encode()
+
+    calls = {"n": 0}
+
+    def fake_classify(j, labels):
+        calls["n"] += 1
+        if j == b"crop-0":
+            return [("hot dog", 0.9), ("homemade", 0.05)]
+        if j == b"crop-20":
+            return [("bear", 0.8), ("homemade", 0.1)]
+        # full-frame distractor
+        return [("hot dog", 0.95), ("bear", 0.02)]
+
+    monkeypatch.setattr(v, "detect_person_boxes", fake_boxes)
+    monkeypatch.setattr(v, "_crop_jpeg", fake_crop)
+
+    result = v.classify_persons_then_frame(
+        jpeg,
+        ["hot dog", "bear", "homemade"],
+        classify_fn=fake_classify,
+        min_score=0.15,
+        person_model=object(),
+    )
+    assert result.person_count == 2
+    assert "hot dog costume" in result.note
+    assert "bear costume" in result.note
+    assert "about 2 citizens" in result.note
