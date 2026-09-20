@@ -215,6 +215,8 @@ def format_top3(top3: Sequence[tuple[str, float]]) -> str:
 
 
 def missing_vision_deps() -> str | None:
+    # Set offline *before* importing open_clip / huggingface_hub.
+    _prefer_local_hub()
     missing: list[str] = []
     try:
         import cv2  # noqa: F401
@@ -242,14 +244,18 @@ def missing_vision_deps() -> str | None:
 
 
 def _clip_weights_cached() -> bool:
-    """True when the OpenAI ViT-B-32 open_clip weights already live under ~/.cache."""
+    """True when open_clip / CLIP weights already live under ~/.cache."""
     hub = Path.home() / ".cache" / "huggingface" / "hub"
     if not hub.is_dir():
         return False
-    return any(
-        "vit_base_patch32_clip" in p.name.lower() or "open_clip" in p.name.lower()
-        for p in hub.iterdir()
-    )
+    keys = ("vit_base_patch32_clip", "open_clip", "clip_224", "openai")
+    for p in hub.iterdir():
+        name = p.name.lower()
+        if any(k in name for k in keys) and p.is_dir():
+            # Require an actual weights file, not an empty stub
+            if any(p.rglob("*.safetensors")) or any(p.rglob("*.bin")):
+                return True
+    return False
 
 
 def _prefer_local_hub() -> None:
@@ -591,6 +597,7 @@ class OpenClipClassifier:
         self._cached_text = None
 
     def load(self) -> float:
+        _prefer_local_hub()
         missing = missing_vision_deps()
         if missing:
             raise RuntimeError(missing)
@@ -598,7 +605,6 @@ class OpenClipClassifier:
         import torch
 
         _limit_vision_cpu()
-        _prefer_local_hub()
         t0 = perf_counter()
         self._device = "cuda" if torch.cuda.is_available() else "cpu"
         try:
