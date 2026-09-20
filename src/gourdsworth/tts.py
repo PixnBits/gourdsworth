@@ -31,12 +31,9 @@ def rewrite_puns_for_tts(text: str) -> str:
         return "gourd----geous"
 
     text = _GOURD_GEOUS.sub(repl, text or "")
-    # Help "Gourdsworth" not become "goats worth"
-    text = re.sub(r"\bGourdsworth\b", "Gourdsworth", text)
-    text = re.sub(r"\bgourdsworth\b", "gourdsworth", text)
-    # Slight stretch on the "Gourd" syllable for the name
-    text = re.sub(r"\bGourdsworth\b", "Gourrdsworth", text)
-    text = re.sub(r"\bgourdsworth\b", "gourrdsworth", text)
+    # Help "Gourdsworth" land as GORRD-sworth (not "goats worth")
+    text = re.sub(r"\bGourdsworth\b", "Gorrdsworth", text)
+    text = re.sub(r"\bgourdsworth\b", "gorrdsworth", text)
     return text
 
 
