@@ -137,7 +137,15 @@ def _send_silence(conn: CrateConnection, seconds: float = 0.8) -> None:
         time.sleep(0.1)
 
 
-def _stream_mic(conn: CrateConnection, should_stop, limit_s: float) -> None:
+def _stream_mic(
+    conn: CrateConnection,
+    should_stop,
+    limit_s: float,
+    *,
+    vad: bool = False,
+    energy: float = 0.012,
+    silence_s: float = 0.55,
+) -> None:
     try:
         import numpy as np
         import sounddevice as sd
@@ -151,6 +159,10 @@ def _stream_mic(conn: CrateConnection, should_stop, limit_s: float) -> None:
         "channels": 1,
         "format": UPLINK_FORMAT,
     }
+    chunk_s = float(UPLINK_CHUNK_SAMPLES) / float(UPLINK_RATE)
+    need_silent = max(1, int(silence_s / chunk_s))
+    silent = 0
+    heard = False
     t0 = time.monotonic()
     while time.monotonic() - t0 < limit_s and not should_stop():
         frame = sd.rec(
@@ -160,7 +172,20 @@ def _stream_mic(conn: CrateConnection, should_stop, limit_s: float) -> None:
             dtype="int16",
         )
         sd.wait()
-        payload = np.asarray(frame, dtype="<i2").reshape(-1).tobytes()
+        arr = np.asarray(frame, dtype="<i2").reshape(-1)
+        if vad:
+            peak = float(np.max(np.abs(arr.astype(np.float32)))) / 32768.0
+            if peak >= energy:
+                heard = True
+                silent = 0
+            elif heard:
+                silent += 1
+                if silent >= need_silent:
+                    payload = arr.tobytes()
+                    conn.send(header, payload)
+                    del payload
+                    break
+        payload = arr.tobytes()
         conn.send(header, payload)
         del payload
         del frame
@@ -233,29 +258,39 @@ def _talk(
     gpio,
     camera: bool,
     camera_index: int,
+    width: int,
+    height: int,
     no_mic: bool,
     limit_s: float,
     end_talk: threading.Event,
+    continuous: bool = False,
 ) -> None:
     end_talk.clear()
     if camera:
-        jpeg = _grab_jpeg(camera_index, 640, 480)
+        jpeg = _grab_jpeg(camera_index, width, height)
         if jpeg:
             conn.send({"event": "jpeg"}, jpeg)
             del jpeg
         else:
             conn.send({"event": "still"})
     conn.send({"event": "button", "state": "down"})
-    print("TALK — Enter again to stop (or release the button / wait)")
+    if continuous:
+        print("TALK — listening (pause when done; q aborts)")
+    else:
+        print("TALK — Enter again to stop (or release the button / wait)")
 
     def should_stop() -> bool:
         if end_talk.is_set():
             return True
         if trigger == "gpio" and gpio is not None and not gpio.is_pressed:
             return True
-        if trigger == "enter" and _stdin_ready(0):
+        if (not continuous) and trigger == "enter" and _stdin_ready(0):
             sys.stdin.readline()
             return True
+        if continuous and _stdin_ready(0):
+            line = sys.stdin.readline()
+            if line and line.strip().lower() in {"q", "quit", "exit"}:
+                return True
         return False
 
     if no_mic:
@@ -265,7 +300,7 @@ def _talk(
         while time.monotonic() - t0 < 0.2 and not should_stop():
             time.sleep(0.05)
     else:
-        _stream_mic(conn, should_stop, limit_s)
+        _stream_mic(conn, should_stop, limit_s, vad=continuous)
     try:
         conn.send({"event": "button", "state": "up"})
     except (ConnectionError, OSError):
@@ -369,6 +404,23 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--listen-s", type=float, default=8.0, help="Talk cap in seconds")
     parser.add_argument(
+        "--continuous",
+        action="store_true",
+        help="Hands-free porch loop: after each reply, listen again (Ctrl+C / q to quit)",
+    )
+    parser.add_argument(
+        "--width",
+        type=int,
+        default=_env_int("CRATE_WIDTH") or 1280,
+        help="JPEG still width (env CRATE_WIDTH / local.env; default 1280)",
+    )
+    parser.add_argument(
+        "--height",
+        type=int,
+        default=_env_int("CRATE_HEIGHT") or 720,
+        help="JPEG still height (env CRATE_HEIGHT / local.env; default 720)",
+    )
+    parser.add_argument(
         "--list-devices",
         action="store_true",
         help="Print sounddevice input/output ids and exit",
@@ -422,24 +474,49 @@ def main(argv: list[str] | None = None) -> int:
         if not ready.wait(timeout=20):
             print("No ready from desktop (is --serve-crate / --crate-echo running?)")
             return 1
+        if args.continuous:
+            print(
+                "Continuous porch mode. Speak, pause — he answers — then listens again."
+            )
+            print("  Ctrl+C or q = quit")
+            if not args.no_camera:
+                print(f"  stills {args.width}x{args.height}")
+
         while True:
             ready.clear()
-            trig = _wait_trigger(gpio, stop)
-            if trig == "quit":
-                try:
-                    conn.send({"event": "bye"})
-                except (ConnectionError, OSError):
-                    pass
-                break
+            if args.continuous:
+                # Allow q between turns without blocking forever on Enter
+                if _stdin_ready(0.05):
+                    line = sys.stdin.readline()
+                    if not line or line.strip().lower() in {"q", "quit", "exit"}:
+                        try:
+                            conn.send({"event": "bye"})
+                        except (ConnectionError, OSError):
+                            pass
+                        break
+                trig = "gpio" if gpio is not None else "enter"
+                # Brief beat so SPEAKING finishes before we open the mic again
+                time.sleep(0.35)
+            else:
+                trig = _wait_trigger(gpio, stop)
+                if trig == "quit":
+                    try:
+                        conn.send({"event": "bye"})
+                    except (ConnectionError, OSError):
+                        pass
+                    break
             _talk(
                 conn,
                 trigger=trig,
                 gpio=gpio,
                 camera=not args.no_camera,
                 camera_index=args.camera,
+                width=int(args.width),
+                height=int(args.height),
                 no_mic=args.no_mic,
                 limit_s=float(args.listen_s),
                 end_talk=end_talk,
+                continuous=bool(args.continuous),
             )
             if not ready.wait(timeout=float(args.listen_s) + 15):
                 print("  (timed out waiting for desktop ready)")
