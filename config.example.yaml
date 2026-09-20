@@ -53,8 +53,8 @@ crate:
 vision:
   enabled: false
   camera_index: 0
-  width: 640
-  height: 480
+  width: 1280
+  height: 720  # crate stills; desktop --snap uses same defaults
   min_score: 0.15          # below this, label is homemade
   model: ViT-B-32
   pretrained: openai       # first load downloads ~350MB CLIP weights

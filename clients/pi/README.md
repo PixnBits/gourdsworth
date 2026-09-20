@@ -101,3 +101,14 @@ PYTHONPATH=src python clients/pi/crate_client.py --list-devices
 ```
 
 Put the ids in `local.env` as `CRATE_INPUT=` / `CRATE_OUTPUT=` (gitignored), or pass `--input N --output N`.
+
+
+## Continuous porch mode
+
+Hands-free after the opener — auto-listens again when the Mayor finishes:
+
+```bash
+PYTHONPATH=src python clients/pi/crate_client.py --continuous
+```
+
+Stills default to **1280×720** (was 640×480). Override with `--width` / `--height` or `CRATE_WIDTH` / `CRATE_HEIGHT` in `local.env`.
