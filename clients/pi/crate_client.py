@@ -272,12 +272,54 @@ def _talk(
         return
 
 
+
+def _load_local_env() -> dict[str, str]:
+    """Optional clients/pi/local.env — never commit; keeps LAN hosts out of git."""
+    path = Path(__file__).resolve().parent / "local.env"
+    out: dict[str, str] = {}
+    if not path.is_file():
+        return out
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        out[k.strip()] = v.strip().strip('"').strip("'")
+    return out
+
+
+def _env_host() -> str:
+    import os
+
+    local = _load_local_env()
+    return os.environ.get("CRATE_HOST") or local.get("CRATE_HOST") or "127.0.0.1"
+
+
+def _env_port() -> int:
+    import os
+
+    local = _load_local_env()
+    raw = os.environ.get("CRATE_PORT") or local.get("CRATE_PORT")
+    if raw:
+        return int(raw)
+    return int(DEFAULT_PORT)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Gourdsworth Pi crate client — I/O only (no Whisper/Ollama/CLIP)"
     )
-    parser.add_argument("--host", default="127.0.0.1", help="Desktop crate bind (default 127.0.0.1)")
-    parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser.add_argument(
+        "--host",
+        default=_env_host(),
+        help="Desktop crate host (env CRATE_HOST, or clients/pi/local.env; default 127.0.0.1)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=_env_port(),
+        help="Desktop crate port (env CRATE_PORT / local.env; default from protocol)",
+    )
     parser.add_argument("--no-camera", action="store_true", help="Voice-only; do not grab a JPEG")
     parser.add_argument("--no-mic", action="store_true", help="Send silence instead of capturing a mic")
     parser.add_argument("--camera", type=int, default=0, metavar="N", help="OpenCV camera index")

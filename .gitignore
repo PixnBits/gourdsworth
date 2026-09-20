@@ -22,3 +22,8 @@ build/
 
 yolov8n.pt
 *.pt
+
+# Private local config (hosts, LAN bind) — never commit
+clients/pi/local.env
+clients/pi/.host
+*.local.yaml
