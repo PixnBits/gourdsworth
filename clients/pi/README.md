@@ -111,4 +111,6 @@ Hands-free after the opener — auto-listens again when the Mayor finishes:
 PYTHONPATH=src python clients/pi/crate_client.py --continuous
 ```
 
-Stills default to **1280×720** (was 640×480). Override with `--width` / `--height` or `CRATE_WIDTH` / `CRATE_HEIGHT` in `local.env`.
+Stills default to **full native camera resolution**. If encode+send is slow, the client
+adaptively steps the long edge down (1920 → 1280 → 960 → 640) and may ease JPEG quality.
+Cap with `--max-edge N` or `CRATE_MAX_EDGE` in `local.env` (0 = full native).
