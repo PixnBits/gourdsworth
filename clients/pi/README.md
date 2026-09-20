@@ -68,6 +68,8 @@ PYTHONPATH=src python clients/pi/crate_client.py --host 127.0.0.1 --no-camera
 PYTHONPATH=src python clients/pi/crate_client.py --host 127.0.0.1 --no-camera --no-mic
 ```
 
+Prefer `clients/pi/local.env` (gitignored) or env `CRATE_HOST` / `CRATE_PORT` so LAN addresses never land in git. Copy from `local.env.example`.
+
 On a real Pi on the porch LAN:
 
 ```bash
@@ -76,7 +78,7 @@ On a real Pi on the porch LAN:
 #   host: 0.0.0.0
 #   port: 8746
 #   allow_lan: true    # anyone on this LAN can read PCM/JPEG; no TLS
-PYTHONPATH=src python clients/pi/crate_client.py --host 192.168.x.desktop --button-pin 17
+PYTHONPATH=src python clients/pi/crate_client.py --button-pin 17   # host from local.env
 ```
 
 Enter starts Talk; Enter again stops (or release the GPIO button). Received
