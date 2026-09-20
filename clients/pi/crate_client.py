@@ -305,6 +305,43 @@ def _env_port() -> int:
     return int(DEFAULT_PORT)
 
 
+def _env_int(name: str) -> int | None:
+    import os
+
+    local = _load_local_env()
+    raw = os.environ.get(name) or local.get(name)
+    if raw is None or raw == "":
+        return None
+    return int(raw)
+
+
+def _list_audio_devices() -> None:
+    import sounddevice as sd
+
+    for i, d in enumerate(sd.query_devices()):
+        print(
+            f"{i}: {d['name']}  in={d['max_input_channels']} out={d['max_output_channels']}"
+        )
+
+
+def _apply_audio_devices(input_id: int | None, output_id: int | None) -> None:
+    """Pin sounddevice defaults so BRIO mic + TRS speakers stick on the Pi."""
+    try:
+        import sounddevice as sd
+    except ImportError:
+        return
+    if input_id is None and output_id is None:
+        return
+    cur_in, cur_out = sd.default.device
+    if isinstance(cur_in, (list, tuple)):
+        cur_in, cur_out = cur_in[0], cur_in[1] if len(cur_in) > 1 else cur_out
+    sd.default.device = (
+        cur_in if input_id is None else int(input_id),
+        cur_out if output_id is None else int(output_id),
+    )
+    print(f"  audio devices: input={sd.default.device[0]} output={sd.default.device[1]}")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Gourdsworth Pi crate client — I/O only (no Whisper/Ollama/CLIP)"
@@ -331,6 +368,25 @@ def main(argv: list[str] | None = None) -> int:
         help="gpiozero Talk button BCM pin (omit for Enter)",
     )
     parser.add_argument("--listen-s", type=float, default=8.0, help="Talk cap in seconds")
+    parser.add_argument(
+        "--list-devices",
+        action="store_true",
+        help="Print sounddevice input/output ids and exit",
+    )
+    parser.add_argument(
+        "--input",
+        type=int,
+        default=_env_int("CRATE_INPUT"),
+        metavar="N",
+        help="sounddevice input id (env CRATE_INPUT / local.env)",
+    )
+    parser.add_argument(
+        "--output",
+        type=int,
+        default=_env_int("CRATE_OUTPUT"),
+        metavar="N",
+        help="sounddevice output id (env CRATE_OUTPUT / local.env)",
+    )
     args = parser.parse_args(argv)
     try:
         sys.stdout.reconfigure(line_buffering=True)

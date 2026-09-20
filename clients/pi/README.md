@@ -94,3 +94,12 @@ Enter starts Talk; Enter again stops (or release the GPIO button). Received
 | No speakers / no sounddevice | Prints that TTS bytes were dropped |
 
 Jaw RMS, PIR presence, and on-Pi inference are out of scope.
+
+
+## Audio device pick
+
+```bash
+PYTHONPATH=src python clients/pi/crate_client.py --list-devices
+```
+
+Put the ids in `local.env` as `CRATE_INPUT=` / `CRATE_OUTPUT=` (gitignored), or pass `--input N --output N`.
