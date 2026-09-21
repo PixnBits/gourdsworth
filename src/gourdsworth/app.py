@@ -80,6 +80,47 @@ def _kitchen_still(cfg: dict, dry_run: bool = False) -> int:
     return 0
 
 
+def _setup_run_log(path: str | None) -> None:
+    """Tee stdout/stderr so porch runs can be pulled without copy-paste."""
+    if not path:
+        return
+    from pathlib import Path as _P
+    import sys as _sys
+    import time as _time
+
+    log_path = _P(path).expanduser()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(log_path, "a", buffering=1, encoding="utf-8")
+    fh.write(f"\n==== crate-desktop start {_time.strftime('%Y-%m-%d %H:%M:%S')} ====\n")
+    fh.flush()
+
+    class _Tee:
+        def __init__(self, stream, fileh):
+            self._stream = stream
+            self._fh = fileh
+
+        def write(self, data):
+            self._stream.write(data)
+            self._fh.write(data)
+            self._fh.flush()
+            return len(data)
+
+        def flush(self):
+            self._stream.flush()
+            self._fh.flush()
+
+        def fileno(self):
+            return self._stream.fileno()
+
+        def isatty(self):
+            return False
+
+    _sys.stdout = _Tee(_sys.stdout, fh)  # type: ignore[assignment]
+    _sys.stderr = _Tee(_sys.stderr, fh)  # type: ignore[assignment]
+    print(f"  logging to {log_path}")
+
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Mayor Gourdsworth — local voice greeter")
     parser.add_argument("--config", type=Path, default=None)
@@ -122,6 +163,11 @@ def main(argv: list[str] | None = None) -> int:
         help="OpenCV camera index for --vision / --snap (default 0)",
     )
     parser.add_argument(
+        "--log-file",
+        default=None,
+        help="Tee stdout/stderr to a file (default logs/crate-desktop.log with --serve-crate)",
+    )
+    parser.add_argument(
         "--serve-crate",
         action="store_true",
         help="Accept one Pi crate client; run the turn loop on remote PCM (default bind 127.0.0.1)",
@@ -144,6 +190,12 @@ def main(argv: list[str] | None = None) -> int:
         help="Override crate.port",
     )
     args = parser.parse_args(argv)
+    if args.log_file is None and getattr(args, "serve_crate", False):
+        from gourdsworth.config import ROOT
+        args.log_file = str(ROOT / "logs" / "crate-desktop.log")
+    if getattr(args, "log_file", None):
+        _setup_run_log(args.log_file)
+
 
     if args.list_devices:
         print(list_devices())

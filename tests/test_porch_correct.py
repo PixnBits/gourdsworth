@@ -26,3 +26,14 @@ def test_have_a_paper_negation():
 
 def test_keeps_explicit_dont_have_paper():
     assert "don't" in porch_correct("I don't have a paper.").lower()
+
+
+def test_porch_correct_clipped_trick():
+    from gourdsworth.stt import porch_correct
+
+    def norm(s: str) -> str:
+        return "".join(ch for ch in s.lower() if ch.isalnum() or ch.isspace()).split()
+
+    assert norm(porch_correct("Trick.")) == ["trick", "or", "treat"]
+    assert norm(porch_correct("trick")) == ["trick", "or", "treat"]
+    assert norm(porch_correct("trick or")) == ["trick", "or", "treat"]

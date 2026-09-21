@@ -155,3 +155,13 @@ Measured on Framework Desktop (AMD Ryzen AI Max / Strix Halo), pipewire I/O, Pip
 Default is `base.en` (clearer on a noisy porch). `tiny.en` is faster but mangled live lines like "trick or treat" → "check our tree".
 
 Porch bias: Whisper gets an `initial_prompt` / hotwords for candy/costume/pumpkin phrases, plus a light corrector for short near-misses. See issue #4.
+
+
+## Porch run logs
+
+Both sides tee to `logs/` (gitignored):
+
+- Desktop `--serve-crate`: `logs/crate-desktop.log`
+- Pi client: `logs/crate-pi.log` (override with `--log-file` / `CRATE_LOG`)
+
+Pull them from the Framework Desktop / Pi without copy-paste.
