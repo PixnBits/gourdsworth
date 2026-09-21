@@ -29,7 +29,6 @@ DEFAULT_LABELS: tuple[str, ...] = (
     "firefighter",
     "police",
     "witch",
-    "witch mask",
     "wizard",
     "ghost",
     "superhero",
