@@ -516,33 +516,41 @@ def _always_on_uplink(
             continue
         arr = np.asarray(frame, dtype="<i2").reshape(-1)
         peak = float(np.max(np.abs(arr.astype(np.float32)))) / 32768.0
-        if peak >= energy:
-            if not speech_hot and camera and still is not None:
-                # Fire-and-forget still so vision does not block the mic path
-                def _snap(_still=still):
-                    try:
-                        jpeg, wh = _grab_jpeg(
-                            camera_index, max_edge=_still.edge, quality=_still.quality
-                        )
-                        if jpeg:
-                            t_send = time.monotonic()
-                            conn.send({"event": "jpeg"}, jpeg)
-                            _still.note_send(len(jpeg), (time.monotonic() - t_send) * 1000)
-                            if wh:
-                                print(
-                                    f"  still {wh[0]}x{wh[1]}  {len(jpeg) // 1024}KiB  "
-                                    f"(speech-triggered)"
-                                )
-                            del jpeg
-                    except Exception as exc:
-                        print(f"  (still failed: {exc})")
 
-                threading.Thread(target=_snap, name="crate-still", daemon=True).start()
+        def _snap_bg(tag: str, _still=still) -> None:
+            if not camera or _still is None:
+                return
+
+            def _run() -> None:
+                try:
+                    jpeg, wh = _grab_jpeg(
+                        camera_index, max_edge=_still.edge, quality=_still.quality
+                    )
+                    if jpeg:
+                        t_send = time.monotonic()
+                        conn.send({"event": "jpeg"}, jpeg)
+                        _still.note_send(len(jpeg), (time.monotonic() - t_send) * 1000)
+                        if wh:
+                            print(
+                                f"  still {wh[0]}x{wh[1]}  {len(jpeg) // 1024}KiB  "
+                                f"({tag})"
+                            )
+                        del jpeg
+                except Exception as exc:
+                    print(f"  (still failed: {exc})")
+
+            threading.Thread(target=_run, name="crate-still", daemon=True).start()
+
+        if peak >= energy:
+            if not speech_hot:
+                # Early snap so encode overlaps the rest of the utterance
+                _snap_bg("speech-start")
             speech_hot = True
             cool = 0
         elif speech_hot:
             cool += 1
-            if cool > 20:  # ~ quiet for a bit
+            if cool > 20:  # ~ quiet — fresher frame near speech end
+                _snap_bg("speech-end")
                 speech_hot = False
         try:
             conn.send(header, arr.tobytes())

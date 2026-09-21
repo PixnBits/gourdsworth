@@ -165,3 +165,11 @@ Both sides tee to `logs/` (gitignored):
 - Pi client: `logs/crate-pi.log` (override with `--log-file` / `CRATE_LOG`)
 
 Pull them from the Framework Desktop / Pi without copy-paste.
+
+
+## Vision timing (crate continuous)
+
+Stills are fire-and-forget on the Pi (speech-start and speech-end). The desktop
+never waits on JPEG/CLIP before STT/TTS. If a note is ready when the LLM starts,
+it is attached; otherwise the still/result is carried to the next utterance
+unless a newer frame supersedes it.
