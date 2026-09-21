@@ -737,6 +737,8 @@ def _run_crate_session(conn, cfg, mayor, stt, speaker, sidecar, canned, history)
     print("ready.")
 
     armed = False
+    vis_future = None  # in-flight or unused CLIP future (carried across turns)
+    pending_jpeg: bytes | None = None  # newer still waiting for a free classify slot
     while not conn.closed:
         if continuous:
             if not armed:
@@ -753,12 +755,6 @@ def _run_crate_session(conn, cfg, mayor, stt, speaker, sidecar, canned, history)
         metrics = TurnMetrics()
         print("LISTENING")
         conn.send({"event": "listen"})
-        # Drop a stale still from a prior turn so we pair JPEG with this utterance.
-        stale = conn.take_jpeg()
-        if stale is not None:
-            print(f"  (dropped stale still {len(stale) // 1024}KiB)")
-            del stale
-        vis_future = None
         (
             audio_in,
             metrics.record_ms,
@@ -776,22 +772,52 @@ def _run_crate_session(conn, cfg, mayor, stt, speaker, sidecar, canned, history)
         )
         if str(cfg.get("mode") or "vad") == "vad" and metrics.had_voice:
             metrics.post_speech_silence_ms = float(cfg["silence_s"]) * 1000.0
-        # Pi snaps on speech start but encode is ~1.5s — wait for this turn's JPEG.
-        if metrics.had_voice and sidecar is not None:
-            jpeg = conn.wait_jpeg(timeout_s=2.5)
-            if jpeg is not None:
-                print(f"  jpeg received {len(jpeg) // 1024}KiB")
-                vis_future = sidecar.submit_jpeg(jpeg)
-                del jpeg
+
+        # Vision never blocks first audio: grab whatever JPEG is already here,
+        # kick CLIP in parallel with STT, carry unused/late results to the next turn.
+        def _ingest_jpeg(tag: str) -> None:
+            nonlocal vis_future, pending_jpeg
+            if sidecar is None:
+                return
+            jpeg = conn.take_jpeg()
+            if jpeg is None:
+                return
+            print(f"  jpeg {tag} {len(jpeg) // 1024}KiB")
+            if vis_future is None or vis_future.done():
+                kicked = sidecar.submit_jpeg(jpeg)
+                if kicked is not None:
+                    vis_future = kicked
+                    pending_jpeg = None
+                    print("  vision classify started")
+                else:
+                    pending_jpeg = jpeg
             else:
-                print("  jpeg missing (Pi still may still be encoding)")
+                # Newer frame supersedes; apply when in-flight CLIP finishes
+                pending_jpeg = jpeg
+                print("  vision busy — still queued for next slot")
+            del jpeg
+
+        def _promote_pending() -> None:
+            nonlocal vis_future, pending_jpeg
+            if pending_jpeg is None or sidecar is None:
+                return
+            if vis_future is not None and not vis_future.done():
+                return
+            kicked = sidecar.submit_jpeg(pending_jpeg)
+            if kicked is not None:
+                vis_future = kicked
+                print(f"  vision classify started (carried still {len(pending_jpeg) // 1024}KiB)")
+                pending_jpeg = None
+
+        _promote_pending()
+        if metrics.had_voice:
+            _ingest_jpeg("at-speech-end")
 
         def _rearm_quiet() -> None:
             """Stay listening — do not send ready (that ducks the Pi mic)."""
-            if vis_future is not None:
-                take_ready(vis_future)
+            _ingest_jpeg("idle")
+            _promote_pending()
             if continuous:
-                # Keep uplink hot; only SPEAKING should pause the Pi mic.
                 pass
             else:
                 conn.reset_talk_latch()
@@ -805,10 +831,12 @@ def _run_crate_session(conn, cfg, mayor, stt, speaker, sidecar, canned, history)
             _rearm_quiet()
             continue
 
-        # Transcribe before announcing THINKING — empty noise must not duck the mic.
+        # STT starts immediately — CLIP may still be running
         user_text, metrics.stt_ms = stt.transcribe(audio_in, cfg["sample_rate"])
         del audio_in
         user_text = (user_text or "").strip()
+        _ingest_jpeg("during-stt")
+        _promote_pending()
         if not user_text:
             print("Heard: (silence)")
             print("  (still listening)")
@@ -842,6 +870,17 @@ def _run_crate_session(conn, cfg, mayor, stt, speaker, sidecar, canned, history)
             play_fn=play_fn,
             gesture_fn=gesture_fn,
         )
+        # If this turn used the note, clear the future so a carried still can run next.
+        # If unused (CLIP late or skipped), keep vis_future for the next utterance.
+        if metrics.vision_used:
+            print("  vision consumed this turn")
+            vis_future = None
+        elif vis_future is not None and vis_future.done():
+            print("  vision ready but unused — carrying to next speech")
+        elif vis_future is not None:
+            print("  vision still running — carrying to next speech")
+        _ingest_jpeg("after-turn")
+        _promote_pending()
         # After Mayor speaks, ready unmutes the Pi mic.
         if continuous:
             conn.arm_listen()
