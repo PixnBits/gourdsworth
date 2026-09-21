@@ -292,6 +292,21 @@ class CrateConnection:
             self._latest_jpeg = None
             return jpeg
 
+    def peek_jpeg(self) -> bool:
+        with self._jpeg_lock:
+            return self._latest_jpeg is not None
+
+    def wait_jpeg(self, timeout_s: float = 2.0) -> bytes | None:
+        """Wait briefly for a speech-triggered still (Pi encode is ~1–2s)."""
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        while True:
+            jpeg = self.take_jpeg()
+            if jpeg is not None:
+                return jpeg
+            if time.monotonic() >= deadline or self._closed.is_set():
+                return None
+            time.sleep(0.05)
+
     def arm_listen(self, *, flush: bool = True) -> None:
         """Start accepting PCM without a fresh button-down (continuous porch)."""
         with self._gate:

@@ -753,13 +753,12 @@ def _run_crate_session(conn, cfg, mayor, stt, speaker, sidecar, canned, history)
         metrics = TurnMetrics()
         print("LISTENING")
         conn.send({"event": "listen"})
-        # Stills arrive async from the Pi (on speech); don't block the mic path.
+        # Drop a stale still from a prior turn so we pair JPEG with this utterance.
+        stale = conn.take_jpeg()
+        if stale is not None:
+            print(f"  (dropped stale still {len(stale) // 1024}KiB)")
+            del stale
         vis_future = None
-        jpeg = conn.take_jpeg()
-        if jpeg is not None and sidecar is not None:
-            vis_future = sidecar.submit_jpeg(jpeg)
-        if jpeg is not None:
-            del jpeg
         (
             audio_in,
             metrics.record_ms,
@@ -777,12 +776,15 @@ def _run_crate_session(conn, cfg, mayor, stt, speaker, sidecar, canned, history)
         )
         if str(cfg.get("mode") or "vad") == "vad" and metrics.had_voice:
             metrics.post_speech_silence_ms = float(cfg["silence_s"]) * 1000.0
-        if vis_future is None:
-            jpeg = conn.take_jpeg()
-            if jpeg is not None and sidecar is not None:
-                vis_future = sidecar.submit_jpeg(jpeg)
+        # Pi snaps on speech start but encode is ~1.5s — wait for this turn's JPEG.
+        if metrics.had_voice and sidecar is not None:
+            jpeg = conn.wait_jpeg(timeout_s=2.5)
             if jpeg is not None:
+                print(f"  jpeg received {len(jpeg) // 1024}KiB")
+                vis_future = sidecar.submit_jpeg(jpeg)
                 del jpeg
+            else:
+                print("  jpeg missing (Pi still may still be encoding)")
 
         def _rearm_quiet() -> None:
             """Stay listening — do not send ready (that ducks the Pi mic)."""
