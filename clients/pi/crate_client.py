@@ -366,7 +366,13 @@ def _try_gpio(pin: int | None):
         return None
 
 
-def _pump(conn: CrateConnection, ready: threading.Event, end_talk: threading.Event, stop: threading.Event) -> None:
+def _pump(
+    conn: CrateConnection,
+    ready: threading.Event,
+    end_talk: threading.Event,
+    stop: threading.Event,
+    pause_mic: threading.Event | None = None,
+) -> None:
     while not stop.is_set() and not conn.closed:
         item = conn.wait_any(timeout=0.2)
         if item is None:
@@ -374,6 +380,8 @@ def _pump(conn: CrateConnection, ready: threading.Event, end_talk: threading.Eve
         header, payload = item
         ev = header.get("event")
         if ev == "play":
+            if pause_mic is not None:
+                pause_mic.set()
             _play_tts(header, payload)
             try:
                 conn.send({"event": "play_done"})
@@ -382,14 +390,21 @@ def _pump(conn: CrateConnection, ready: threading.Event, end_talk: threading.Eve
         elif ev == "gesture":
             print(f"GESTURE: {header.get('name') or '?'}")
         elif ev == "ready":
-            end_talk.set()  # silence-skip / turn done — stop mic even without SPEAKING
+            end_talk.set()
+            if pause_mic is not None:
+                pause_mic.clear()  # unmute after Mayor finishes
             ready.set()
             print("ready.")
         elif ev == "listen":
             print("LISTENING")
-        elif ev in {"thinking", "speaking"}:
+        elif ev == "speaking":
             end_talk.set()
-            print(str(ev).upper())
+            if pause_mic is not None:
+                pause_mic.set()
+            print("SPEAKING")
+        elif ev == "thinking":
+            end_talk.set()
+            print("THINKING")
         elif ev == "hello":
             pass
         elif ev == "error":
@@ -408,6 +423,86 @@ def _wait_trigger(gpio, stop: threading.Event) -> str:
                 return "quit"
             return "enter"
     return "quit"
+
+
+
+def _always_on_uplink(
+    conn: CrateConnection,
+    stop: threading.Event,
+    pause_mic: threading.Event,
+    *,
+    energy: float = 0.02,
+    camera: bool,
+    camera_index: int,
+    still: _StillAdaptive | None,
+) -> None:
+    """Stream PCM forever except while pause_mic (SPEAKING). Snap still on speech start."""
+    try:
+        import numpy as np
+        import sounddevice as sd
+    except ImportError:
+        print("  (no sounddevice; always-on uplink unavailable)")
+        return
+    header = {
+        "event": "pcm",
+        "rate": UPLINK_RATE,
+        "channels": 1,
+        "format": UPLINK_FORMAT,
+    }
+    speech_hot = False
+    cool = 0
+    while not stop.is_set() and not conn.closed:
+        if pause_mic.is_set():
+            speech_hot = False
+            time.sleep(0.05)
+            continue
+        try:
+            frame = sd.rec(
+                UPLINK_CHUNK_SAMPLES,
+                samplerate=UPLINK_RATE,
+                channels=1,
+                dtype="int16",
+            )
+            sd.wait()
+        except Exception as exc:
+            print(f"  (mic error: {exc})")
+            time.sleep(0.2)
+            continue
+        arr = np.asarray(frame, dtype="<i2").reshape(-1)
+        peak = float(np.max(np.abs(arr.astype(np.float32)))) / 32768.0
+        if peak >= energy:
+            if not speech_hot and camera and still is not None:
+                # Fire-and-forget still so vision does not block the mic path
+                def _snap(_still=still):
+                    try:
+                        jpeg, wh = _grab_jpeg(
+                            camera_index, max_edge=_still.edge, quality=_still.quality
+                        )
+                        if jpeg:
+                            t_send = time.monotonic()
+                            conn.send({"event": "jpeg"}, jpeg)
+                            _still.note_send(len(jpeg), (time.monotonic() - t_send) * 1000)
+                            if wh:
+                                print(
+                                    f"  still {wh[0]}x{wh[1]}  {len(jpeg) // 1024}KiB  "
+                                    f"(speech-triggered)"
+                                )
+                            del jpeg
+                    except Exception as exc:
+                        print(f"  (still failed: {exc})")
+
+                threading.Thread(target=_snap, name="crate-still", daemon=True).start()
+            speech_hot = True
+            cool = 0
+        elif speech_hot:
+            cool += 1
+            if cool > 20:  # ~ quiet for a bit
+                speech_hot = False
+        try:
+            conn.send(header, arr.tobytes())
+        except (ConnectionError, OSError):
+            break
+        del frame
 
 
 def _talk(
@@ -640,12 +735,19 @@ def main(argv: list[str] | None = None) -> int:
     stop = threading.Event()
     ready = threading.Event()
     end_talk = threading.Event()
+    pause_mic = threading.Event()
     pump = threading.Thread(
-        target=_pump, args=(conn, ready, end_talk, stop), name="crate-pump", daemon=True
+        target=_pump,
+        args=(conn, ready, end_talk, stop, pause_mic),
+        name="crate-pump",
+        daemon=True,
     )
     pump.start()
     try:
-        conn.send({"event": "hello", "role": "crate", "proto": PROTO})
+        hello = {"event": "hello", "role": "crate", "proto": PROTO}
+        if args.continuous:
+            hello["continuous"] = True
+        conn.send(hello)
         if not ready.wait(timeout=20):
             print("No ready from desktop (is --serve-crate / --crate-echo running?)")
             return 1
@@ -662,15 +764,32 @@ def main(argv: list[str] | None = None) -> int:
             )
         if args.continuous:
             print(
-                "Continuous porch mode. Speak, pause — he answers — then listens again."
+                "Continuous porch mode — mic always on except while the Mayor speaks."
             )
-            print("  Ctrl+C or q = quit")
-
-        while True:
-            ready.clear()
-            if args.continuous:
-                # Allow q between turns without blocking forever on Enter
-                if _stdin_ready(0.05):
+            print("  Speak anytime. Ctrl+C or q = quit")
+            # Duck mic during opener playback leftovers, then open uplink
+            pause_mic.clear()
+            if args.no_mic:
+                print("  (--no-mic set; continuous needs a mic)")
+                return 2
+            conn.send({"event": "button", "state": "down"})
+            uplink = threading.Thread(
+                target=_always_on_uplink,
+                kwargs={
+                    "conn": conn,
+                    "stop": stop,
+                    "pause_mic": pause_mic,
+                    "energy": 0.02,
+                    "camera": not args.no_camera,
+                    "camera_index": int(args.camera),
+                    "still": still_adapt,
+                },
+                name="crate-uplink",
+                daemon=True,
+            )
+            uplink.start()
+            while not stop.is_set() and not conn.closed:
+                if _stdin_ready(0.25):
                     line = sys.stdin.readline()
                     if not line or line.strip().lower() in {"q", "quit", "exit"}:
                         try:
@@ -678,10 +797,10 @@ def main(argv: list[str] | None = None) -> int:
                         except (ConnectionError, OSError):
                             pass
                         break
-                trig = "gpio" if gpio is not None else "enter"
-                # Brief beat so SPEAKING finishes before we open the mic again
-                time.sleep(0.35)
-            else:
+            stop.set()
+        else:
+            while True:
+                ready.clear()
                 trig = _wait_trigger(gpio, stop)
                 if trig == "quit":
                     try:
@@ -689,28 +808,32 @@ def main(argv: list[str] | None = None) -> int:
                     except (ConnectionError, OSError):
                         pass
                     break
-            _talk(
-                conn,
-                trigger=trig,
-                gpio=gpio,
-                camera=not args.no_camera,
-                camera_index=args.camera,
-                still=still_adapt,
-                no_mic=args.no_mic,
-                limit_s=float(args.listen_s),
-                end_talk=end_talk,
-                continuous=bool(args.continuous),
-            )
-            if not ready.wait(timeout=float(args.listen_s) + 15):
-                print("  (timed out waiting for desktop ready)")
-                if conn.closed:
-                    break
+                _talk(
+                    conn,
+                    trigger=trig,
+                    gpio=gpio,
+                    camera=not args.no_camera,
+                    camera_index=args.camera,
+                    still=still_adapt,
+                    no_mic=args.no_mic,
+                    limit_s=float(args.listen_s),
+                    end_talk=end_talk,
+                    continuous=False,
+                )
+                if not ready.wait(timeout=float(args.listen_s) + 15):
+                    print("  (timed out waiting for desktop ready)")
+                    if conn.closed:
+                        break
     except (KeyboardInterrupt, ConnectionError, OSError) as exc:
         if not isinstance(exc, KeyboardInterrupt):
             print(f"disconnected: {exc}")
         print()
     finally:
         stop.set()
+        try:
+            conn.send({"event": "button", "state": "up"})
+        except Exception:
+            pass
         conn.close()
     return 0
 

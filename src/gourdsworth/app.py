@@ -670,8 +670,11 @@ def _run_crate_session(conn, cfg, mayor, stt, speaker, sidecar, canned, history)
     hello = conn.handshake("desktop", timeout=10.0)
     if hello is None:
         raise ConnectionError("crate hello timeout")
+    continuous = bool(hello.get("continuous"))
     opener = random.choice(canned["opener"])
     print(f"Mayor: {opener}")
+    if continuous:
+        print("  continuous crate: mic stays open except while SPEAKING")
     if speaker is not None:
         samples, rate, _, _ = speaker.synthesize(opener)
         print("SPEAKING")
@@ -680,12 +683,25 @@ def _run_crate_session(conn, cfg, mayor, stt, speaker, sidecar, canned, history)
         del samples
     conn.send({"event": "ready"})
     print("ready.")
+
+    armed = False
     while not conn.closed:
-        if not conn.wait_button("down", timeout=0.5):
-            continue
+        if continuous:
+            if not armed:
+                # Wait for Pi to open the always-on uplink once
+                if not conn.wait_button("down", timeout=0.5):
+                    continue
+                armed = True
+            else:
+                conn.arm_listen()
+        else:
+            if not conn.wait_button("down", timeout=0.5):
+                continue
+
         metrics = TurnMetrics()
         print("LISTENING")
         conn.send({"event": "listen"})
+        # Stills arrive async from the Pi (on speech); don't block the mic path.
         vis_future = None
         jpeg = conn.take_jpeg()
         if jpeg is not None and sidecar is not None:
@@ -704,9 +720,10 @@ def _run_crate_session(conn, cfg, mayor, stt, speaker, sidecar, canned, history)
             mode=str(cfg.get("mode") or "vad"),
             silence_s=float(cfg["silence_s"]),
             energy_threshold=float(cfg["energy_threshold"]),
+            min_voiced_s=0.35,
+            keep_listening=continuous,
         )
         if str(cfg.get("mode") or "vad") == "vad" and metrics.had_voice:
-            # Porch-perceived wait includes the silence that closed the VAD window.
             metrics.post_speech_silence_ms = float(cfg["silence_s"]) * 1000.0
         if vis_future is None:
             jpeg = conn.take_jpeg()
@@ -715,33 +732,37 @@ def _run_crate_session(conn, cfg, mayor, stt, speaker, sidecar, canned, history)
             if jpeg is not None:
                 del jpeg
 
-        if not metrics.had_voice and str(cfg.get("mode") or "vad") == "vad":
-            # Never crossed energy — no speech; skip STT/THINKING/SPEAKING.
-            print("Heard: (silence)")
-            print("  (silence — still listening)")
+        def _rearm_quiet() -> None:
+            """Stay listening — do not send ready (that ducks the Pi mic)."""
             if vis_future is not None:
                 take_ready(vis_future)
+            if continuous:
+                # Keep uplink hot; only SPEAKING should pause the Pi mic.
+                pass
+            else:
+                conn.reset_talk_latch()
+                conn.send({"event": "ready"})
+                print("ready.")
+                time.sleep(float(cfg["cooldown_s"]))
+
+        if not metrics.had_voice:
+            print("  (still listening)")
             del audio_in
-            conn.reset_talk_latch()
-            conn.send({"event": "ready"})
-            print("ready.")
-            time.sleep(float(cfg["cooldown_s"]))
+            _rearm_quiet()
             continue
-        print("THINKING")
-        conn.send({"event": "thinking"})
+
+        # Transcribe before announcing THINKING — empty noise must not duck the mic.
         user_text, metrics.stt_ms = stt.transcribe(audio_in, cfg["sample_rate"])
         del audio_in
         user_text = (user_text or "").strip()
         if not user_text:
             print("Heard: (silence)")
-            print("  (silence — still listening)")
-            if vis_future is not None:
-                take_ready(vis_future)
-            conn.reset_talk_latch()
-            conn.send({"event": "ready"})
-            print("ready.")
-            time.sleep(float(cfg["cooldown_s"]))
+            print("  (still listening)")
+            _rearm_quiet()
             continue
+
+        print("THINKING")
+        conn.send({"event": "thinking"})
         spoke = {"n": 0}
 
         def play_fn(samples, rate, _spoke=spoke, _conn=conn):
@@ -767,7 +788,11 @@ def _run_crate_session(conn, cfg, mayor, stt, speaker, sidecar, canned, history)
             play_fn=play_fn,
             gesture_fn=gesture_fn,
         )
-        conn.reset_talk_latch()
+        # After Mayor speaks, ready unmutes the Pi mic.
+        if continuous:
+            conn.arm_listen()
+        else:
+            conn.reset_talk_latch()
         conn.send({"event": "ready"})
         print("ready.")
         time.sleep(float(cfg["cooldown_s"]))
