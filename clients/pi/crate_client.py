@@ -72,6 +72,17 @@ def _grab_jpeg(
     except ImportError:
         print("  camera skipped: OpenCV not installed")
         return None, None
+    with _CAMERA_LOCK:
+        return _grab_jpeg_unlocked(cv2, index, max_edge=max_edge, quality=quality)
+
+
+def _grab_jpeg_unlocked(
+    cv2,
+    index: int,
+    *,
+    max_edge: int = 0,
+    quality: int = 90,
+) -> tuple[bytes | None, tuple[int, int] | None]:
     cap = cv2.VideoCapture(int(index))
     frame = None
     try:
@@ -162,6 +173,8 @@ class _StillAdaptive:
 # (e.g. claim 44100 but only accept 48000) and PortAudio spam stderr on each fail.
 _PLAY_RATE: int | None = None
 _AUDIO_LOCK = threading.Lock()  # PortAudio: never rec+play concurrently
+_CAMERA_LOCK = threading.Lock()  # one OpenCV open at a time
+_SNAP_BUSY = threading.Event()
 
 _LOG_FH = None
 
@@ -474,7 +487,7 @@ def _always_on_uplink(
     stop: threading.Event,
     pause_mic: threading.Event,
     *,
-    energy: float = 0.02,
+    energy: float = 0.015,
     camera: bool,
     camera_index: int,
     still: _StillAdaptive | None,
@@ -520,8 +533,12 @@ def _always_on_uplink(
         def _snap_bg(tag: str, _still=still) -> None:
             if not camera or _still is None:
                 return
+            # Prefer speech-end freshness; skip a start snap if one is already running.
+            if tag == "speech-start" and _SNAP_BUSY.is_set():
+                return
 
             def _run() -> None:
+                _SNAP_BUSY.set()
                 try:
                     jpeg, wh = _grab_jpeg(
                         camera_index, max_edge=_still.edge, quality=_still.quality
@@ -538,6 +555,8 @@ def _always_on_uplink(
                         del jpeg
                 except Exception as exc:
                     print(f"  (still failed: {exc})")
+                finally:
+                    _SNAP_BUSY.clear()
 
             threading.Thread(target=_run, name="crate-still", daemon=True).start()
 
@@ -840,7 +859,7 @@ def main(argv: list[str] | None = None) -> int:
                     "conn": conn,
                     "stop": stop,
                     "pause_mic": pause_mic,
-                    "energy": 0.02,
+                    "energy": 0.015,
                     "camera": not args.no_camera,
                     "camera_index": int(args.camera),
                     "still": still_adapt,
