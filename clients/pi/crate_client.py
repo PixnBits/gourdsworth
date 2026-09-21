@@ -14,6 +14,7 @@ keyboard Enter starts Talk; optional silence is sent if sounddevice is missing.
 from __future__ import annotations
 
 import argparse
+import os
 import select
 import socket
 import sys
@@ -157,6 +158,11 @@ class _StillAdaptive:
             )
 
 
+# Cached after a silent probe — USB DACs often lie about default_samplerate
+# (e.g. claim 44100 but only accept 48000) and PortAudio spam stderr on each fail.
+_PLAY_RATE: int | None = None
+
+
 def _resample_f32(samples, src_rate: int, dst_rate: int):
     """Cheap linear resample — USB DACs often reject Piper's 22050 Hz."""
     import numpy as np
@@ -168,6 +174,54 @@ def _resample_f32(samples, src_rate: int, dst_rate: int):
     x_new = np.linspace(0.0, 1.0, num=n_dst, endpoint=False)
     out = np.interp(x_new, x_old, samples.astype(np.float64)).astype(np.float32)
     return out, dst_rate
+
+
+def _probe_play_rate() -> int | None:
+    """Find one sample rate the current output device accepts. Mute PortAudio noise."""
+    global _PLAY_RATE
+    if _PLAY_RATE is not None:
+        return _PLAY_RATE
+    try:
+        import numpy as np
+        import sounddevice as sd
+    except ImportError:
+        return None
+
+    candidates: list[int] = []
+    try:
+        out_id = sd.default.device[1] if isinstance(sd.default.device, (list, tuple)) else sd.default.device
+        native = int(float(sd.query_devices(out_id).get("default_samplerate") or 0))
+    except Exception:
+        native = 0
+    # Prefer 48k first — many USB PnP DACs reject 44100 even when advertised.
+    for r in (48000, 44100, native, 32000, 22050, 16000):
+        if r and r not in candidates:
+            candidates.append(int(r))
+
+    # PortAudio prints paInvalidSampleRate to stderr even when we catch it.
+    devnull = open(os.devnull, "w")
+    old_err = os.dup(2)
+    try:
+        os.dup2(devnull.fileno(), 2)
+        for rate in candidates:
+            try:
+                tone = np.zeros(int(rate * 0.02), dtype=np.float32)
+                sd.play(tone, rate)
+                sd.wait()
+                _PLAY_RATE = rate
+                break
+            except Exception:
+                continue
+    finally:
+        os.dup2(old_err, 2)
+        os.close(old_err)
+        devnull.close()
+
+    if _PLAY_RATE is not None:
+        print(f"  playback sample rate: {_PLAY_RATE} Hz (probed)")
+    else:
+        print("  (warning: could not probe a working playback sample rate)")
+    return _PLAY_RATE
 
 
 def _play_tts(header: dict, payload: bytes | None) -> None:
@@ -186,42 +240,18 @@ def _play_tts(header: dict, payload: bytes | None) -> None:
     else:
         samples = np.frombuffer(payload, dtype="<f4")
 
-    # Prefer the selected output device's default rate (USB DACs dislike 22050).
-    play_rate = rate
-    try:
-        out_id = sd.default.device[1] if isinstance(sd.default.device, (list, tuple)) else sd.default.device
-        dev = sd.query_devices(out_id)
-        native = int(float(dev.get("default_samplerate") or 0)) or 48000
-        if native != rate:
-            samples, play_rate = _resample_f32(samples, rate, native)
-    except Exception:
-        play_rate = rate
+    play_rate = _probe_play_rate() or 48000
+    if play_rate != rate:
+        samples, play_rate = _resample_f32(samples, rate, play_rate)
 
     duration = float(samples.size) / float(play_rate) if play_rate else 0.0
     done = threading.Event()
-    err: list[str] = []
 
     def _run() -> None:
         try:
-            try:
-                sd.play(samples, play_rate)
-                sd.wait()
-            except Exception:
-                # Last-chance fallback rates some dongles accept
-                for fallback in (48000, 44100, 32000, 16000):
-                    if fallback == play_rate:
-                        continue
-                    try:
-                        alt, alt_rate = _resample_f32(samples, play_rate, fallback)
-                        sd.play(alt, alt_rate)
-                        sd.wait()
-                        del alt
-                        return
-                    except Exception:
-                        continue
-                raise
+            sd.play(samples, play_rate)
+            sd.wait()
         except Exception as exc:
-            err.append(str(exc))
             print(f"  (playback failed: {exc})")
         finally:
             done.set()
@@ -486,6 +516,7 @@ def _list_audio_devices() -> None:
 
 def _apply_audio_devices(input_id: int | None, output_id: int | None) -> None:
     """Pin sounddevice defaults so BRIO mic + TRS speakers stick on the Pi."""
+    global _PLAY_RATE
     try:
         import sounddevice as sd
     except ImportError:
@@ -500,6 +531,8 @@ def _apply_audio_devices(input_id: int | None, output_id: int | None) -> None:
         cur_out if output_id is None else int(output_id),
     )
     print(f"  audio devices: input={sd.default.device[0]} output={sd.default.device[1]}")
+    _PLAY_RATE = None  # device changed — re-probe
+    _probe_play_rate()
 
 
 def main(argv: list[str] | None = None) -> int:
