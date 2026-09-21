@@ -53,11 +53,7 @@ def porch_correct(text: str) -> str:
         "dreaming trick": "trick or treat",
         "trick boards read": "trick or treat",
         "contour": "trick or treat",
-        # Continuous VAD sometimes clips the phrase to the first word
-        "trick": "trick or treat",
-        "trick.": "trick or treat",
-        "tricks": "trick or treat",
-        "trick or": "trick or treat",
+        # Full-phrase mishears only — never invent "trick or treat" from a lone "trick"
         "trick or tree": "trick or treat",
         "trick or trees": "trick or treat",
         "peter peter punk and peter": "peter peter pumpkin eater",
