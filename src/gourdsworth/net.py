@@ -292,6 +292,15 @@ class CrateConnection:
             self._latest_jpeg = None
             return jpeg
 
+    def arm_listen(self, *, flush: bool = True) -> None:
+        """Start accepting PCM without a fresh button-down (continuous porch)."""
+        with self._gate:
+            if flush:
+                self._flush_pcm_unlocked()
+            self._listening = True
+            self._button_up.clear()
+            self._button_down.set()
+
     def reset_talk_latch(self) -> None:
         self._button_down.clear()
         self._button_up.clear()
@@ -307,19 +316,25 @@ class CrateConnection:
         mode: str = "ptt",
         silence_s: float = 0.55,
         energy_threshold: float = 0.012,
+        min_voiced_s: float = 0.35,
+        keep_listening: bool = False,
     ):
         """Collect uplink PCM until button-up, VAD silence, or ``limit_s``.
 
         Returns ``(float32 ndarray, record_ms, uplink_first_ms, uplink_jitter_ms, had_voice)``.
-        Drops the s16le chunks as they are converted. Caller should ``del``
-        the ndarray after STT.
+        ``had_voice`` is true only if sustained energy lasted at least ``min_voiced_s``
+        (filters mic noise blips). Drops s16le chunks as converted; caller ``del``s audio.
         """
         import numpy as np
 
+        with self._gate:
+            # Do not flush here — button-down / arm_listen already did; PCM may be queued.
+            self._listening = True
         t0 = time.perf_counter()
         speech_t0 = t0
         chunks: list = []
         voiced = False
+        voiced_s = 0.0
         silent_run = 0.0
         block_s = UPLINK_CHUNK_MS / 1000.0
         uplink_first_ms = 0.0
@@ -359,21 +374,25 @@ class CrateConnection:
                     if not voiced:
                         speech_t0 = now
                     voiced = True
+                    voiced_s += block_s
                     silent_run = 0.0
                 elif voiced:
                     silent_run += block_s
                     if silent_run >= silence_s:
                         break
         with self._gate:
-            self._listening = False
-            self._flush_pcm_unlocked()
+            if not keep_listening:
+                self._listening = False
+                self._flush_pcm_unlocked()
+            # else: stay armed so continuous porch keeps buffering during STT/LLM
         if chunks:
             audio = np.concatenate(chunks)
         else:
             audio = np.zeros(1, dtype=np.float32)
         del chunks
         record_ms = (time.perf_counter() - t0) * 1000.0
-        return audio, record_ms, uplink_first_ms, uplink_jitter_ms, bool(voiced)
+        real_voice = bool(voiced) and (voiced_s >= float(min_voiced_s))
+        return audio, record_ms, uplink_first_ms, uplink_jitter_ms, real_voice
 
     def play_float(self, samples, rate: int) -> float:
         """Send one TTS buffer as f32le and wait for play_done (or duration)."""
