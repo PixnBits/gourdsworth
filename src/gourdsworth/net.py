@@ -310,13 +310,14 @@ class CrateConnection:
     ):
         """Collect uplink PCM until button-up, VAD silence, or ``limit_s``.
 
-        Returns ``(float32 ndarray, record_ms, uplink_first_ms, uplink_jitter_ms)``.
+        Returns ``(float32 ndarray, record_ms, uplink_first_ms, uplink_jitter_ms, had_voice)``.
         Drops the s16le chunks as they are converted. Caller should ``del``
         the ndarray after STT.
         """
         import numpy as np
 
         t0 = time.perf_counter()
+        speech_t0 = t0
         chunks: list = []
         voiced = False
         silent_run = 0.0
@@ -324,8 +325,14 @@ class CrateConnection:
         uplink_first_ms = 0.0
         uplink_jitter_ms = 0.0
         last_chunk_t: float | None = None
-        while (time.perf_counter() - t0) < limit_s:
+        while True:
             if self._closed.is_set():
+                break
+            # PTT / one-shot: hard cap from button-down. VAD: wait forever for first
+            # voice (porch continuous), then cap speech length from first voice.
+            if mode != "vad" and (time.perf_counter() - t0) >= limit_s:
+                break
+            if mode == "vad" and voiced and (time.perf_counter() - speech_t0) >= limit_s:
                 break
             try:
                 payload = self._pcm.get(timeout=0.05)
@@ -349,6 +356,8 @@ class CrateConnection:
             if mode == "vad":
                 level = _rms(chunk)
                 if level >= energy_threshold:
+                    if not voiced:
+                        speech_t0 = now
                     voiced = True
                     silent_run = 0.0
                 elif voiced:
@@ -364,7 +373,7 @@ class CrateConnection:
             audio = np.zeros(1, dtype=np.float32)
         del chunks
         record_ms = (time.perf_counter() - t0) * 1000.0
-        return audio, record_ms, uplink_first_ms, uplink_jitter_ms
+        return audio, record_ms, uplink_first_ms, uplink_jitter_ms, bool(voiced)
 
     def play_float(self, samples, rate: int) -> float:
         """Send one TTS buffer as f32le and wait for play_done (or duration)."""
@@ -495,7 +504,7 @@ def run_echo_session(conn: CrateConnection, *, gesture: str = "stamp") -> None:
         if not conn.wait_button("down", timeout=0.5):
             continue
         conn.send({"event": "listen"})
-        audio, _ms, _uf, _uj = conn.listen_pcm(limit_s=4.0, mode="ptt")
+        audio, _ms, _uf, _uj, _voiced = conn.listen_pcm(limit_s=4.0, mode="ptt")
         jpeg = conn.take_jpeg()
         if jpeg:
             del jpeg

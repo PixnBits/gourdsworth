@@ -27,14 +27,25 @@ class TurnMetrics:
     vision_score: float = 0.0
     vision_used: bool = False
     person_count: int | None = None
+    # VAD tail after last voiced frame (porch-perceived wait includes this)
+    post_speech_silence_ms: float = 0.0
+    had_voice: bool = False
 
     def end_to_end_ms(self) -> float:
         return (perf_counter() - self.t0) * 1000
 
     def first_audio_from_silence_ms(self) -> float:
+        """Approx porch wait from end of user speech → first Mayor audio.
+
+        Includes the VAD silence tail (often ~0.85s) that happens after the kid
+        stops talking but before we close the listen window — without it the
+        number looks ~1s while the porch feels ~2s.
+        """
         if self.to_first_audio_ms > 0:
-            return self.stt_ms + self.to_first_audio_ms
-        return self.stt_ms + self.llm_ttft_ms + self.tts_first_ms
+            base = self.stt_ms + self.to_first_audio_ms
+        else:
+            base = self.stt_ms + self.llm_ttft_ms + self.tts_first_ms
+        return base + self.post_speech_silence_ms
 
     def render(self) -> str:
         return (
