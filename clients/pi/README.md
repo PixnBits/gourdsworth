@@ -103,7 +103,7 @@ PYTHONPATH=src python clients/pi/crate_client.py --list-devices
 Put the ids in `local.env` as `CRATE_INPUT=` / `CRATE_OUTPUT=` (gitignored), or pass `--input N --output N`.
 
 
-## Continuous porch mode
+## Continuous porch mode (desktop skips empty silence — no shy-stamp loop)
 
 Hands-free after the opener — auto-listens again when the Mayor finishes:
 

@@ -324,6 +324,8 @@ def main(argv: list[str] | None = None) -> int:
                     cfg["energy_threshold"],
                     input_device=cfg.get("_input_device"),
                 )
+                # VAD always closes on silence after speech (or times out empty).
+                metrics.post_speech_silence_ms = float(cfg["silence_s"]) * 1000.0
                 user_text, metrics.stt_ms = stt.transcribe(audio_in, cfg["sample_rate"])
                 del audio_in
                 user_text = (user_text or "").strip()
@@ -690,25 +692,56 @@ def _run_crate_session(conn, cfg, mayor, stt, speaker, sidecar, canned, history)
             vis_future = sidecar.submit_jpeg(jpeg)
         if jpeg is not None:
             del jpeg
-        audio_in, metrics.record_ms, metrics.uplink_first_ms, metrics.uplink_jitter_ms = (
-            conn.listen_pcm(
-                sample_rate=int(cfg["sample_rate"]),
-                limit_s=float(cfg["listen_limit_s"]),
-                mode=str(cfg.get("mode") or "vad"),
-                silence_s=float(cfg["silence_s"]),
-                energy_threshold=float(cfg["energy_threshold"]),
-            )
+        (
+            audio_in,
+            metrics.record_ms,
+            metrics.uplink_first_ms,
+            metrics.uplink_jitter_ms,
+            metrics.had_voice,
+        ) = conn.listen_pcm(
+            sample_rate=int(cfg["sample_rate"]),
+            limit_s=float(cfg["listen_limit_s"]),
+            mode=str(cfg.get("mode") or "vad"),
+            silence_s=float(cfg["silence_s"]),
+            energy_threshold=float(cfg["energy_threshold"]),
         )
+        if str(cfg.get("mode") or "vad") == "vad" and metrics.had_voice:
+            # Porch-perceived wait includes the silence that closed the VAD window.
+            metrics.post_speech_silence_ms = float(cfg["silence_s"]) * 1000.0
         if vis_future is None:
             jpeg = conn.take_jpeg()
             if jpeg is not None and sidecar is not None:
                 vis_future = sidecar.submit_jpeg(jpeg)
             if jpeg is not None:
                 del jpeg
+
+        if not metrics.had_voice and str(cfg.get("mode") or "vad") == "vad":
+            # Never crossed energy — no speech; skip STT/THINKING/SPEAKING.
+            print("Heard: (silence)")
+            print("  (silence — still listening)")
+            if vis_future is not None:
+                take_ready(vis_future)
+            del audio_in
+            conn.reset_talk_latch()
+            conn.send({"event": "ready"})
+            print("ready.")
+            time.sleep(float(cfg["cooldown_s"]))
+            continue
         print("THINKING")
         conn.send({"event": "thinking"})
         user_text, metrics.stt_ms = stt.transcribe(audio_in, cfg["sample_rate"])
         del audio_in
+        user_text = (user_text or "").strip()
+        if not user_text:
+            print("Heard: (silence)")
+            print("  (silence — still listening)")
+            if vis_future is not None:
+                take_ready(vis_future)
+            conn.reset_talk_latch()
+            conn.send({"event": "ready"})
+            print("ready.")
+            time.sleep(float(cfg["cooldown_s"]))
+            continue
         spoke = {"n": 0}
 
         def play_fn(samples, rate, _spoke=spoke, _conn=conn):

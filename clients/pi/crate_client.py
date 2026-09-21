@@ -307,7 +307,13 @@ def _stream_mic(
     silent = 0
     heard = False
     t0 = time.monotonic()
-    while time.monotonic() - t0 < limit_s and not should_stop():
+    # Continuous VAD: wait for speech forever (until should_stop); only then
+    # apply silence-end. One-shot Talk still caps at limit_s.
+    while not should_stop():
+        if (not vad) and (time.monotonic() - t0 >= limit_s):
+            break
+        if vad and heard and (time.monotonic() - t0 >= limit_s):
+            break
         frame = sd.rec(
             UPLINK_CHUNK_SAMPLES,
             samplerate=UPLINK_RATE,
@@ -319,6 +325,9 @@ def _stream_mic(
         if vad:
             peak = float(np.max(np.abs(arr.astype(np.float32)))) / 32768.0
             if peak >= energy:
+                if not heard:
+                    # Reset the listen clock once speech starts so limit_s is speech cap
+                    t0 = time.monotonic()
                 heard = True
                 silent = 0
             elif heard:
@@ -328,6 +337,12 @@ def _stream_mic(
                     conn.send(header, payload)
                     del payload
                     break
+            # Before first speech: keep streaming soft noise so desktop VAD can also hear
+        elif time.monotonic() - t0 >= limit_s:
+            payload = arr.tobytes()
+            conn.send(header, payload)
+            del payload
+            break
         payload = arr.tobytes()
         conn.send(header, payload)
         del payload
@@ -367,6 +382,7 @@ def _pump(conn: CrateConnection, ready: threading.Event, end_talk: threading.Eve
         elif ev == "gesture":
             print(f"GESTURE: {header.get('name') or '?'}")
         elif ev == "ready":
+            end_talk.set()  # silence-skip / turn done — stop mic even without SPEAKING
             ready.set()
             print("ready.")
         elif ev == "listen":
