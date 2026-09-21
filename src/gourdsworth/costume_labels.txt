@@ -10,7 +10,6 @@ dinosaur
 firefighter
 police
 witch
-witch mask
 wizard
 ghost
 superhero
