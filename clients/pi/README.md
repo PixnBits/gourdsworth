@@ -121,3 +121,13 @@ Cap with `--max-edge N` or `CRATE_MAX_EDGE` in `local.env` (0 = full native).
 Piper often synthesizes at 22050 Hz. Many USB dongles reject that rate — and some
 advertise 44100 but only accept 48000. On startup the client probes a working
 playback rate (stderr muted) and resamples every TTS chunk to that rate.
+
+
+## Porch run logs
+
+Both sides tee to `logs/` (gitignored):
+
+- Desktop `--serve-crate`: `logs/crate-desktop.log`
+- Pi client: `logs/crate-pi.log` (override with `--log-file` / `CRATE_LOG`)
+
+Pull them from the Framework Desktop / Pi without copy-paste.

@@ -161,6 +161,51 @@ class _StillAdaptive:
 # Cached after a silent probe — USB DACs often lie about default_samplerate
 # (e.g. claim 44100 but only accept 48000) and PortAudio spam stderr on each fail.
 _PLAY_RATE: int | None = None
+_AUDIO_LOCK = threading.Lock()  # PortAudio: never rec+play concurrently
+
+_LOG_FH = None
+
+
+def _setup_log(path: str | None) -> None:
+    """Tee stdout/stderr to a file so the coordinator can pull porch logs."""
+    global _LOG_FH
+    if not path:
+        return
+    log_path = Path(path).expanduser()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    _LOG_FH = open(log_path, "a", buffering=1, encoding="utf-8")
+    _LOG_FH.write(f"\n==== crate-pi start {time.strftime('%Y-%m-%d %H:%M:%S')} ====\n")
+    _LOG_FH.flush()
+
+    class _Tee:
+        def __init__(self, stream, fh):
+            self._stream = stream
+            self._fh = fh
+
+        def write(self, data):
+            self._stream.write(data)
+            self._fh.write(data)
+            self._fh.flush()
+            return len(data)
+
+        def flush(self):
+            self._stream.flush()
+            self._fh.flush()
+
+        def fileno(self):
+            return self._stream.fileno()
+
+        def isatty(self):
+            return False
+
+    sys.stdout = _Tee(sys.stdout, _LOG_FH)  # type: ignore[assignment]
+    sys.stderr = _Tee(sys.stderr, _LOG_FH)  # type: ignore[assignment]
+    print(f"  logging to {log_path}")
+
+
+def _log(msg: str) -> None:
+    print(msg)
+
 
 
 def _resample_f32(samples, src_rate: int, dst_rate: int):
@@ -206,8 +251,9 @@ def _probe_play_rate() -> int | None:
         for rate in candidates:
             try:
                 tone = np.zeros(int(rate * 0.02), dtype=np.float32)
-                sd.play(tone, rate)
-                sd.wait()
+                with _AUDIO_LOCK:
+                    sd.play(tone, rate)
+                    sd.wait()
                 _PLAY_RATE = rate
                 break
             except Exception:
@@ -238,32 +284,28 @@ def _play_tts(header: dict, payload: bytes | None) -> None:
     if fmt == "s16le":
         samples = np.frombuffer(payload, dtype="<i2").astype(np.float32) / 32768.0
     else:
-        samples = np.frombuffer(payload, dtype="<f4")
+        samples = np.frombuffer(payload, dtype="<f4").copy()
 
     play_rate = _probe_play_rate() or 48000
     if play_rate != rate:
         samples, play_rate = _resample_f32(samples, rate, play_rate)
 
     duration = float(samples.size) / float(play_rate) if play_rate else 0.0
-    done = threading.Event()
-
-    def _run() -> None:
+    # Play on this thread under the audio lock — never overlap sd.rec (double-free).
+    with _AUDIO_LOCK:
         try:
-            sd.play(samples, play_rate)
-            sd.wait()
+            sd.play(samples, play_rate, blocking=True)
+        except TypeError:
+            # Older sounddevice: no blocking kw
+            try:
+                sd.play(samples, play_rate)
+                sd.wait()
+            except Exception as exc:
+                print(f"  (playback failed: {exc})")
         except Exception as exc:
             print(f"  (playback failed: {exc})")
-        finally:
-            done.set()
-
-    threading.Thread(target=_run, name="crate-play", daemon=True).start()
-    if not done.wait(timeout=max(1.0, duration + 2.0)):
-        print("  (playback timed out)")
-        try:
-            sd.stop()
-        except Exception:
-            pass
     del samples
+    _log(f"play done ({duration:.1f}s @ {play_rate} Hz)")
 
 
 def _send_silence(conn: CrateConnection, seconds: float = 0.8) -> None:
@@ -314,13 +356,14 @@ def _stream_mic(
             break
         if vad and heard and (time.monotonic() - t0 >= limit_s):
             break
-        frame = sd.rec(
-            UPLINK_CHUNK_SAMPLES,
-            samplerate=UPLINK_RATE,
-            channels=1,
-            dtype="int16",
-        )
-        sd.wait()
+        with _AUDIO_LOCK:
+            frame = sd.rec(
+                UPLINK_CHUNK_SAMPLES,
+                samplerate=UPLINK_RATE,
+                channels=1,
+                dtype="int16",
+            )
+            sd.wait()
         arr = np.asarray(frame, dtype="<i2").reshape(-1)
         if vad:
             peak = float(np.max(np.abs(arr.astype(np.float32)))) / 32768.0
@@ -457,13 +500,16 @@ def _always_on_uplink(
             time.sleep(0.05)
             continue
         try:
-            frame = sd.rec(
-                UPLINK_CHUNK_SAMPLES,
-                samplerate=UPLINK_RATE,
-                channels=1,
-                dtype="int16",
-            )
-            sd.wait()
+            with _AUDIO_LOCK:
+                if pause_mic.is_set():
+                    continue
+                frame = sd.rec(
+                    UPLINK_CHUNK_SAMPLES,
+                    samplerate=UPLINK_RATE,
+                    channels=1,
+                    dtype="int16",
+                )
+                sd.wait()
         except Exception as exc:
             print(f"  (mic error: {exc})")
             time.sleep(0.2)
@@ -673,6 +719,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--listen-s", type=float, default=8.0, help="Talk cap in seconds")
     parser.add_argument(
+        "--log-file",
+        default=os.environ.get("CRATE_LOG")
+        or str(_REPO / "logs" / "crate-pi.log"),
+        help="Tee stdout/stderr to this file (env CRATE_LOG; default logs/crate-pi.log)",
+    )
+    parser.add_argument(
         "--continuous",
         action="store_true",
         help="Hands-free porch loop: after each reply, listen again (Ctrl+C / q to quit)",
@@ -714,6 +766,7 @@ def main(argv: list[str] | None = None) -> int:
         sys.stdout.reconfigure(line_buffering=True)
     except Exception:
         pass
+    _setup_log(args.log_file)
 
     if args.list_devices:
         _list_audio_devices()

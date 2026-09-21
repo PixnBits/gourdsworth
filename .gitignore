@@ -27,3 +27,5 @@ yolov8n.pt
 clients/pi/local.env
 clients/pi/.host
 *.local.yaml
+# Local porch run logs (pulled by coordinator; not committed)
+logs/
