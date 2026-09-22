@@ -61,6 +61,8 @@ PCM/JPEG. There is no TLS and no auth.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import json
 import queue
 import socket
@@ -208,6 +210,80 @@ def f32_to_le_bytes(samples) -> bytes:
     import numpy as np
 
     return np.asarray(samples, dtype="<f4").reshape(-1).tobytes()
+
+
+
+@dataclass
+class AdaptiveVad:
+    """Noise-floor + speech-peak VAD for porch groups.
+
+    Fixed absolute thresholds fail when kids chatter in the background.
+    This tracks a slow ambient floor and ends an utterance when level
+    falls back toward that floor *or* drops from the utterance peak.
+    """
+
+    # Minimum absolute start (config energy_threshold); avoids triggering on hush
+    absolute_start: float = 0.012
+    floor_min: float = 0.0015
+    start_ratio: float = 2.0
+    end_ratio: float = 1.35
+    start_margin: float = 0.012
+    end_margin: float = 0.006
+    peak_end_ratio: float = 0.32
+    floor_alpha_idle: float = 0.08
+    floor_alpha_speech: float = 0.015
+
+    floor: float = 0.008
+    peak: float = 0.0
+    voiced: bool = False
+
+    def reset_utterance(self) -> None:
+        self.peak = 0.0
+        self.voiced = False
+
+    def _update_floor(self, level: float) -> None:
+        alpha = self.floor_alpha_speech if self.voiced else self.floor_alpha_idle
+        # Pull floor toward quieter readings; creep up slowly if ambient rose
+        target = max(float(self.floor_min), float(level))
+        if level <= self.floor * 1.25 or not self.voiced:
+            self.floor = (1.0 - alpha) * self.floor + alpha * target
+        elif level < self.floor:
+            self.floor = level
+        self.floor = max(float(self.floor_min), float(self.floor))
+
+    def start_threshold(self) -> float:
+        return max(
+            float(self.absolute_start),
+            float(self.floor) * float(self.start_ratio),
+            float(self.floor) + float(self.start_margin),
+        )
+
+    def end_threshold(self) -> float:
+        floor_end = max(
+            float(self.floor) * float(self.end_ratio),
+            float(self.floor) + float(self.end_margin),
+        )
+        if self.peak > 0:
+            peak_end = float(self.peak) * float(self.peak_end_ratio)
+            # End when below the higher of floor-relative and peak-relative
+            # (peak drop catches "loud kid stopped, group still murmuring")
+            return max(floor_end, min(peak_end, self.peak * 0.9))
+        return floor_end
+
+    def observe(self, level: float) -> bool:
+        """Return True if this chunk counts as voiced speech."""
+        level = float(level)
+        self._update_floor(level)
+        if not self.voiced:
+            if level >= self.start_threshold():
+                self.voiced = True
+                self.peak = level
+                return True
+            return False
+        self.peak = max(self.peak, level)
+        if level <= self.end_threshold():
+            return False
+        return True
 
 
 def _rms(frame) -> float:
@@ -374,6 +450,10 @@ class CrateConnection:
     ):
         """Collect uplink PCM until button-up, VAD silence, or ``limit_s``.
 
+        VAD is adaptive: tracks ambient noise floor and utterance peak so
+        noisy porch groups can still end a turn when the speaker pauses.
+        ``energy_threshold`` is the minimum absolute start gate.
+
         Returns ``(float32 ndarray, record_ms, uplink_first_ms, uplink_jitter_ms, had_voice)``.
         ``had_voice`` is true only if sustained energy lasted at least ``min_voiced_s``
         (filters mic noise blips). Drops s16le chunks as converted; caller ``del``s audio.
@@ -389,6 +469,7 @@ class CrateConnection:
         voiced = False
         voiced_s = 0.0
         silent_run = 0.0
+        vad = AdaptiveVad(absolute_start=float(energy_threshold))
         block_s = UPLINK_CHUNK_MS / 1000.0
         uplink_first_ms = 0.0
         uplink_jitter_ms = 0.0
@@ -423,7 +504,8 @@ class CrateConnection:
             chunks.append(chunk)
             if mode == "vad":
                 level = _rms(chunk)
-                if level >= energy_threshold:
+                speech_now = vad.observe(level)
+                if speech_now:
                     if not voiced:
                         speech_t0 = now
                     voiced = True
