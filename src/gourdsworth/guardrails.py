@@ -304,25 +304,53 @@ def remainder_after(full: str, spoken_prefix: str) -> str:
     return ""
 
 
-# Spoken unlock for porch diagnostics. Match only a complete normalized phrase;
-# character names and ordinary mentions inside longer sentences must not unlock it.
-_DEBUG_PASS = {
-    "tri state area",
-    "price state area",
-    "try state area",
-    "tri stick area",
+# Spoken unlock for porch diagnostics (Phineas and Ferb Doofenshmirtz gag).
+# Match only a complete normalized phrase — not a substring inside longer talk.
+_DEBUG_CORES = {
+    "aren t you a little young to be a mayor",
+    "aren t you a little young to be mayor",
+    "are you a little young to be a mayor",
+    "are you a little young to be mayor",
+    "aren t you a bit young to be a mayor",
+    "aren t you a bit young to be mayor",
 }
+_DEBUG_PREFIXES = (
+    "say unto you ",  # Whisper often biblical-izes leading "Say,"
+    "say unto ",
+    "say ",
+)
 
 
-def looks_debug_pass(text: str) -> bool:
-    """True only for the exact tri-state-area phrase or observed STT variants."""
+def _normalize_debug_pass(text: str) -> str:
+    # Keep apostrophes as spaces so "aren't" → "aren t"
     normalized = "".join(
         ch.lower() if ch.isalnum() or ch.isspace() else " " for ch in (text or "")
     )
-    normalized = " ".join(normalized.split())
-    if normalized.startswith("the "):
-        normalized = normalized[4:]
-    return normalized in _DEBUG_PASS
+    return " ".join(normalized.split())
+
+
+def looks_debug_pass(text: str) -> bool:
+    """True for the Doofenshmirtz young-mayor gag (optional Say / Say unto you)."""
+    normalized = _normalize_debug_pass(text)
+    if not normalized:
+        return False
+    had_say_prefix = False
+    for prefix in _DEBUG_PREFIXES:
+        if normalized.startswith(prefix):
+            normalized = normalized[len(prefix) :].strip()
+            had_say_prefix = True
+            break
+    if normalized in _DEBUG_CORES:
+        return True
+    # Whisper often drops "aren't you" when it rewrites Say → Say unto you.
+    if had_say_prefix and normalized in {
+        "a little young to be a mayor",
+        "a little young to be mayor",
+        "a bit young to be a mayor",
+        "a bit young to be mayor",
+    }:
+        return True
+    return False
 
 
 # Personal trivia about the Mayor — fixed lore, not costume talk.
