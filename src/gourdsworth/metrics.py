@@ -102,6 +102,65 @@ class SessionStats:
         return avg_s, len(samples)
 
 
+_ONES = (
+    "zero",
+    "one",
+    "two",
+    "three",
+    "four",
+    "five",
+    "six",
+    "seven",
+    "eight",
+    "nine",
+    "ten",
+    "eleven",
+    "twelve",
+    "thirteen",
+    "fourteen",
+    "fifteen",
+    "sixteen",
+    "seventeen",
+    "eighteen",
+    "nineteen",
+)
+_TENS = (
+    "",
+    "",
+    "twenty",
+    "thirty",
+    "forty",
+    "fifty",
+    "sixty",
+    "seventy",
+    "eighty",
+    "ninety",
+)
+
+
+def score_as_percent(score: float) -> int:
+    """CLIP score 0..1 → nearest whole percent, clamped."""
+    try:
+        pct = int(round(float(score) * 100.0))
+    except (TypeError, ValueError):
+        pct = 0
+    return max(0, min(100, pct))
+
+
+def format_percent_spoken(score: float) -> str:
+    """TTS-friendly percent: 0.20 → 'twenty percent' (not 'zero point two')."""
+    pct = score_as_percent(score)
+    if pct == 100:
+        words = "one hundred"
+    elif pct < 20:
+        words = _ONES[pct]
+    else:
+        tens, ones = divmod(pct, 10)
+        words = _TENS[tens] if ones == 0 else f"{_TENS[tens]} {_ONES[ones]}"
+    return f"{words} percent"
+
+
+
 def format_debug_spoken(
     *,
     vis=None,
@@ -114,11 +173,16 @@ def format_debug_spoken(
     if vis is not None and getattr(vis, "ok", False) and getattr(vis, "note", None):
         bits.append(
             f"Vision says {getattr(vis, 'label', None) or 'unknown'} "
-            f"at {float(getattr(vis, 'score', 0.0)):.2f}."
+            f"at {format_percent_spoken(float(getattr(vis, 'score', 0.0)))}."
         )
         top3 = getattr(vis, "top3", None) or ()
         if top3:
-            tops = ", ".join(f"{n} {s:.2f}" for n, s in list(top3)[:3])
+            ranked = sorted(
+                ((str(n), float(s)) for n, s in list(top3)[:3]),
+                key=lambda kv: kv[1],
+                reverse=True,
+            )
+            tops = ", ".join(f"{n} {format_percent_spoken(s)}" for n, s in ranked)
             bits.append(f"Top guesses: {tops}.")
     elif vis is not None and getattr(vis, "skip_reason", None):
         bits.append(f"Vision skipped: {vis.skip_reason}.")

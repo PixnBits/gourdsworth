@@ -95,3 +95,32 @@ def test_format_debug_spoken_omits_missing_temp_and_average():
     assert "Pi temperature" not in line
     assert "Average response" not in line
     assert "No still ready yet." in line
+
+
+def test_format_percent_spoken_words():
+    from gourdsworth.metrics import format_percent_spoken, score_as_percent
+
+    assert score_as_percent(0.20) == 20
+    assert score_as_percent(0.16) == 16
+    assert format_percent_spoken(0.20) == "twenty percent"
+    assert format_percent_spoken(0.16) == "sixteen percent"
+    assert format_percent_spoken(0.05) == "five percent"
+    assert format_percent_spoken(1.0) == "one hundred percent"
+
+
+def test_format_debug_spoken_costume_percent_words_sorted():
+    from gourdsworth.metrics import format_debug_spoken
+    from gourdsworth.vision import VisionResult, format_visual_note
+
+    vis = VisionResult(
+        label="pirate",
+        score=0.20,
+        top3=[("witch", 0.11), ("pirate", 0.20), ("robot", 0.16)],
+        note=format_visual_note([("pirate", 0.20), ("robot", 0.16)]),
+    )
+    line = format_debug_spoken(vis=vis)
+    assert "Vision says pirate at twenty percent." in line
+    # Sorted high→low, spoken percents (not zero point …)
+    assert "Top guesses: pirate twenty percent, robot sixteen percent, witch eleven percent." in line
+    assert "0.20" not in line
+    assert "zero point" not in line.lower()
