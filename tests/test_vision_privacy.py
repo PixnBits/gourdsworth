@@ -300,6 +300,6 @@ def test_per_person_unifies_count_and_costumes(monkeypatch):
     assert "about 2 citizens" in result.note
 
 
-def test_blind_note_steers_ten_questions():
-    assert "Ten Questions" in VISION_BLIND_NOTE
-    assert "do not invent" in VISION_BLIND_NOTE.lower() or "Do not invent" in VISION_BLIND_NOTE
+def test_blind_note_does_not_quiz():
+    assert "Ten Questions" not in VISION_BLIND_NOTE
+    assert "do not invent" in VISION_BLIND_NOTE.lower()

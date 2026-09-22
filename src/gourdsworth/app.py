@@ -33,7 +33,6 @@ from gourdsworth.metrics import TurnMetrics
 from gourdsworth.stt import SpeechToText
 from gourdsworth.tts import Speaker
 from gourdsworth.vision import (
-    VISION_BLIND_NOTE,
     PRIVACY_SIGN,
     VisionSidecar,
     format_top3,
@@ -519,8 +518,8 @@ def _handle_turn(
     if vis is not None and vis.ok and vis.note:
         visual_note = vis.note
     else:
-        # No still / soft CLIP — ask, don't invent a costume.
-        visual_note = VISION_BLIND_NOTE
+        # No still / soft CLIP — invent nothing, quiz nothing (Ten Questions paused).
+        visual_note = None
 
     if looks_debug_pass(user_text):
         # Secret porch diagnostics (Phineas and Ferb passcodes).

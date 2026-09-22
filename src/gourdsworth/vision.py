@@ -17,9 +17,10 @@ from time import perf_counter
 NOTE_PREFIX = "Visual note (may be wrong, never name a person):"
 
 # When CLIP is soft / no still: steer Mayor to ask, never invent a costume.
+# Kept for tests/import; app no longer injects this (Ten Questions paused).
 VISION_BLIND_NOTE = (
-    "Visual note: Costume unclear. Play Ten Questions — ask ONE short playful "
-    "yes-or-no costume question; do not invent what they are wearing."
+    "Visual note: Costume unclear. Do not invent a costume. "
+    "Greet warmly and send them to candy."
 )
 
 
@@ -550,7 +551,7 @@ def classify_costume(
     label, score = ranked[0]
     allowed_set = set(allowed)
     if label not in allowed_set or score < min_score or note_contains_identity(label):
-        # Soft / unknown → no costume invent; Mayor plays Ten Questions instead.
+        # Soft / unknown → no costume invent (no Ten Questions quiz).
         return VisionResult(
             label="",
             score=float(score),
