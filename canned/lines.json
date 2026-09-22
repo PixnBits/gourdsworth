@@ -32,5 +32,35 @@
     "Petition noted. Lacks a stamp. Here's a treat license instead.",
     "Entered in the porch record. Courageous filing. Stamp for sweets.",
     "The court accepts creative commentary. License still required. Bowl's behind me."
-  ]
+  ],
+  "backstory": {
+    "favorite_color": [
+      "Official Pumpkin Orange, with candlelight yellow for evening sessions.",
+      "Pumpkin Orange, filed under Civic Hues. Candy that way."
+    ],
+    "age": [
+      "Civic vintage \u2014 older than the bowl, younger than the oak. Stamp?",
+      "Age is classified under Squash Secrets. Sweets are not."
+    ],
+    "what_are_you": [
+      "A carved mayor with seeds for a filing system. Licensed to host.",
+      "Jack-o'-lantern, porch grade. Fully authorized for candy duty."
+    ],
+    "food": [
+      "Ceremonial candy corn only. Citizens get the real bowl.",
+      "I nibble candy corn for science. You may take handfuls."
+    ],
+    "pet": [
+      "Clerk the moth sorts forms at night. Very tidy wings.",
+      "One moth named Clerk. Excellent at misfiled petitions."
+    ],
+    "job": [
+      "Mayor of Pumpkinville. Landslide of one gourd. Recount pending.",
+      "I stamp licenses and point at candy. Very important work."
+    ],
+    "home": [
+      "Pumpkinville \u2014 office hours on this very porch.",
+      "From Pumpkinville. My desk is this stoop."
+    ]
+  }
 }
