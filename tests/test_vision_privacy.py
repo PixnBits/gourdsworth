@@ -68,21 +68,27 @@ def test_identity_words_in_notes_are_rejected():
     assert "girl" not in coerced[len(NOTE_PREFIX) :].lower()
 
 
-def test_unknown_or_low_score_is_unsure_not_invented():
+def test_unknown_or_low_score_is_safe_homemade_note():
+    """Soft CLIP (top below min_score) → homemade / safe note for real citizens."""
     def low(jpeg, labels):
         return [(lab, 0.02) for lab in labels]
 
-    result = classify_costume(b"x", DEFAULT_LABELS, classify_fn=low, min_score=0.15)
-    assert result.skip_reason == "unsure"
-    assert not result.ok
-    assert not result.note
+    result = classify_costume(b"x", DEFAULT_LABELS, classify_fn=low, min_score=0.15, person_count=1)
+    assert result.ok
+    assert result.skip_reason is None
+    assert result.label == "homemade"
+    assert "homemade costume" in result.note
+    assert "walk looks empty" not in result.note
 
     def outsider(jpeg, labels):
         return [("secret identity", 0.99)]
 
-    result2 = classify_costume(b"x", DEFAULT_LABELS, classify_fn=outsider)
-    assert result2.skip_reason == "unsure"
-    assert not result2.ok
+    result2 = classify_costume(b"x", DEFAULT_LABELS, classify_fn=outsider, person_count=1)
+    assert result2.ok
+    assert result2.label == "homemade"
+    assert "homemade costume" in result2.note
+    assert "secret" not in result2.note.lower()
+    assert "identity" not in result2.note.lower() or "Visual note" in result2.note
 
 
 def test_run_still_leaves_no_tempfiles(tmp_path, monkeypatch):
@@ -314,3 +320,95 @@ def test_format_visual_note_scored_sorted_decimals():
     assert note.index("pirate costume 0.20") < note.index("robot costume 0.16")
     assert note.index("robot costume 0.16") < note.index("witch costume 0.11")
     assert "twenty" not in note
+
+
+def test_empty_walk_llm_note_no_homemade():
+    """persons=0 → empty walk note; no homemade costume invent; debug spoken matches."""
+    from gourdsworth.metrics import format_debug_spoken
+    from gourdsworth.vision import (
+        VisionResult,
+        classify_costume,
+        format_visual_note,
+        select_costume_labels,
+    )
+
+    ranked = [("vampire", 0.18), ("ghost", 0.09), ("witch", 0.07), ("homemade", 0.02)]
+    assert select_costume_labels(ranked, person_count=0) == []
+
+    note = format_visual_note([("homemade", 0.02)], person_count=0)
+    assert "walk looks empty" in note
+    assert "homemade" not in note
+
+    def clip(jpeg, labels):
+        return ranked
+
+    result = classify_costume(
+        b"x", DEFAULT_LABELS, classify_fn=clip, min_score=0.15, person_count=0
+    )
+    assert result.ok
+    assert result.person_count == 0
+    assert "walk looks empty" in result.note
+    assert "homemade" not in result.note
+    assert result.label == ""
+
+    vis = VisionResult(
+        label=result.label,
+        score=result.score,
+        top3=result.top3,
+        note=result.note,
+        person_count=0,
+    )
+    spoken = format_debug_spoken(vis=vis)
+    assert "Vision says the walk looks empty." in spoken
+    assert "Vision says homemade" not in spoken
+
+
+def test_llm_note_uses_selected_labels_not_stale_homemade():
+    """persons=1, top3 vampire 0.18 vs forced homemade 0.02 → note uses vampire."""
+    from gourdsworth.metrics import format_debug_spoken
+    from gourdsworth.vision import classify_costume, format_visual_note, select_costume_labels
+
+    ranked = [("vampire", 0.18), ("ghost", 0.09), ("witch", 0.07), ("homemade", 0.02)]
+    picked = select_costume_labels(ranked, min_score=0.15, person_count=1)
+    assert picked == ["vampire"]
+
+    note = format_visual_note([(lab, s) for lab, s in ranked if lab in picked], person_count=1)
+    assert "vampire costume 0.18" in note
+    assert "homemade" not in note
+    assert "about 1 citizen" in note
+
+    def clip(jpeg, labels):
+        return ranked
+
+    result = classify_costume(
+        b"x", DEFAULT_LABELS, classify_fn=clip, min_score=0.15, person_count=1
+    )
+    assert result.label == "vampire"
+    assert "vampire costume 0.18" in result.note
+    assert "homemade" not in result.note
+
+    spoken = format_debug_spoken(vis=result)
+    assert "Vision says vampire at eighteen percent." in spoken
+    assert "Vision says homemade" not in spoken
+
+
+def test_soft_clip_select_returns_homemade():
+    from gourdsworth.vision import format_visual_note, select_costume_labels
+
+    ranked = [("vampire", 0.10), ("ghost", 0.08), ("homemade", 0.02)]
+    assert select_costume_labels(ranked, min_score=0.15, person_count=1) == ["homemade"]
+    note = format_visual_note([("homemade", 0.10)], person_count=1)
+    assert "homemade costume" in note
+    assert "about 1 citizen" in note
+
+
+def test_select_caps_multi_person_max_labels():
+    from gourdsworth.vision import select_costume_labels
+
+    ranked = [("vampire", 0.5), ("ghost", 0.45), ("witch", 0.40), ("pirate", 0.35)]
+    # max_labels default 2, person_count 3 still capped by max_labels
+    picked = select_costume_labels(ranked, min_score=0.15, person_count=3, max_labels=2)
+    assert len(picked) <= 2
+    assert picked[0] == "vampire"
+    # person_count 1 hard-caps to one label
+    assert select_costume_labels(ranked, person_count=1) == ["vampire"]
