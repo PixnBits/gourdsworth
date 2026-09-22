@@ -10,6 +10,7 @@ models/*.bin
 models/*.onnx
 models/*.onnx.json
 *.wav
+!clients/pi/assets/shutdown/*.wav
 *.mp3
 .pytest_cache/
 .ruff_cache/
