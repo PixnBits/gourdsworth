@@ -29,7 +29,7 @@ from gourdsworth.guardrails import (
     remainder_after,
 )
 from gourdsworth.llm import LocalMayor
-from gourdsworth.metrics import TurnMetrics
+from gourdsworth.metrics import SessionStats, TurnMetrics, format_debug_spoken
 from gourdsworth.stt import SpeechToText
 from gourdsworth.tts import Speaker
 from gourdsworth.vision import (
@@ -501,6 +501,8 @@ def _handle_turn(
     vis_future=None,
     play_fn=None,
     gesture_fn=None,
+    session_stats=None,
+    latest_telemetry=None,
 ):
     user_text = (user_text or "").strip()
     metrics.words_in = len(user_text.split())
@@ -522,20 +524,13 @@ def _handle_turn(
         visual_note = None
 
     if looks_debug_pass(user_text):
-        # Secret porch diagnostics (Phineas and Ferb passcodes).
-        bits = ["Agent P debug channel open."]
-        if vis is not None and vis.ok and vis.note:
-            bits.append(f"Vision says {vis.label or 'unknown'} at {vis.score:.2f}.")
-            if getattr(vis, "top3", None):
-                tops = ", ".join(f"{n} {s:.2f}" for n, s in vis.top3[:3])
-                bits.append(f"Top guesses: {tops}.")
-        elif vis is not None and getattr(vis, "skip_reason", None):
-            bits.append(f"Vision skipped: {vis.skip_reason}.")
-        else:
-            bits.append("No still ready yet. Camera may still be grabbing.")
-        if metrics.uplink_first_ms:
-            bits.append(f"Uplink first {metrics.uplink_first_ms:.0f} milliseconds.")
-        line = " ".join(bits)
+        # Secret porch diagnostics (spoken "tri-state area" passphrase).
+        line = format_debug_spoken(
+            vis=vis,
+            uplink_first_ms=float(metrics.uplink_first_ms or 0.0),
+            telemetry=latest_telemetry,
+            session_stats=session_stats,
+        )
         gesture = "think"
         metrics.used_canned = True
         metrics.vision_used = bool(vis is not None and vis.ok and vis.note)
@@ -751,6 +746,7 @@ def _run_crate_session(conn, cfg, mayor, stt, speaker, sidecar, canned, history)
     if hello is None:
         raise ConnectionError("crate hello timeout")
     continuous = bool(hello.get("continuous"))
+    session_stats = SessionStats()
     opener = random.choice(canned["opener"])
     print(f"Mayor: {opener}")
     if continuous:
@@ -897,7 +893,10 @@ def _run_crate_session(conn, cfg, mayor, stt, speaker, sidecar, canned, history)
             vis_future=vis_future,
             play_fn=play_fn,
             gesture_fn=gesture_fn,
+            session_stats=session_stats,
+            latest_telemetry=conn.latest_telemetry,
         )
+        session_stats.note_completed_turn(metrics)
         # If this turn used the note, clear the future so a carried still can run next.
         # If unused (CLIP late or skipped), keep vis_future for the next utterance.
         if metrics.vision_used:

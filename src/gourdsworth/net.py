@@ -48,6 +48,11 @@ Control JSON (no payload)
     {"event":"play_done"}
     {"event":"bye"}
     {"event":"error","message":"..."}
+    {"event":"telemetry","cpu_temp_c":47.1}
+        # Pi → desktop, lightweight porch health. Optional; omitted fields mean
+        # unknown. Cached on CrateConnection.latest_telemetry; does not enter
+        # the PCM / JPEG / wait_event queues. cpu_temp_c is Celsius float.
+
 
 Default bind is 127.0.0.1. Binding a LAN address or 0.0.0.0 requires
 ``crate.allow_lan: true`` — anyone on that network could then read kids'
@@ -84,6 +89,29 @@ MAX_PAYLOAD = 2 * 1024 * 1024
 MAX_EVENTS = 64
 
 _RECV_TIMEOUT_S = 0.4
+
+
+def parse_thermal_sysfs_temp(raw: str | bytes | None) -> float | None:
+    """Parse `/sys/class/thermal/*/temp` millidegree text into Celsius.
+
+    Returns None when the reading is missing or not a plausible CPU temp.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, bytes):
+        try:
+            raw = raw.decode("ascii", errors="ignore")
+        except Exception:
+            return None
+    try:
+        milli = int(str(raw).strip().split()[0])
+    except (TypeError, ValueError, IndexError):
+        return None
+    if milli <= 0 or milli > 200_000:
+        return None
+    return milli / 1000.0
+
+
 
 
 def is_loopback(host: str) -> bool:
@@ -209,6 +237,8 @@ class CrateConnection:
         self._pcm: queue.Queue[bytes] = queue.Queue()
         self._jpeg_lock = threading.Lock()
         self._latest_jpeg: bytes | None = None
+        self._telemetry_lock = threading.Lock()
+        self._latest_telemetry: dict[str, Any] | None = None
         self._button_down = threading.Event()
         self._button_up = threading.Event()
         self._cv = threading.Condition()
@@ -295,6 +325,14 @@ class CrateConnection:
     def peek_jpeg(self) -> bool:
         with self._jpeg_lock:
             return self._latest_jpeg is not None
+
+    @property
+    def latest_telemetry(self) -> dict[str, Any] | None:
+        """Most recent Pi telemetry event header (RAM cache; may be stale)."""
+        with self._telemetry_lock:
+            if self._latest_telemetry is None:
+                return None
+            return dict(self._latest_telemetry)
 
     def wait_jpeg(self, timeout_s: float = 2.0) -> bytes | None:
         """Wait briefly for a speech-triggered still (Pi encode is ~1–2s)."""
@@ -479,6 +517,11 @@ class CrateConnection:
                     self._listening = False
                     self._button_up.set()
             self._push_event(header, None)
+            return
+        if ev == "telemetry":
+            # Cache only — do not enqueue (keeps wait_event / wait_any free of noise).
+            with self._telemetry_lock:
+                self._latest_telemetry = dict(header)
             return
         self._push_event(header, payload)
 
