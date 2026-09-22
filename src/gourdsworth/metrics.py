@@ -171,17 +171,31 @@ def format_debug_spoken(
     """Build the spoken Agent P debug line (concise, porch-safe)."""
     bits = ["Agent P debug channel open."]
     if vis is not None and getattr(vis, "ok", False) and getattr(vis, "note", None):
-        bits.append(
-            f"Vision says {getattr(vis, 'label', None) or 'unknown'} "
-            f"at {format_percent_spoken(float(getattr(vis, 'score', 0.0)))}."
-        )
         top3 = getattr(vis, "top3", None) or ()
+        ranked: list[tuple[str, float]] = []
         if top3:
             ranked = sorted(
                 ((str(n), float(s)) for n, s in list(top3)[:3]),
                 key=lambda kv: kv[1],
                 reverse=True,
             )
+        person_count = getattr(vis, "person_count", None)
+        if person_count is not None and person_count <= 0:
+            # Empty walk: do not speak fake primary "homemade" from select_costume_labels.
+            bits.append("Vision says the walk looks empty.")
+        elif ranked:
+            # Primary must match highest top3 (log/spoken stay consistent).
+            primary_label, primary_score = ranked[0]
+            bits.append(
+                f"Vision says {primary_label} "
+                f"at {format_percent_spoken(primary_score)}."
+            )
+        else:
+            bits.append(
+                f"Vision says {getattr(vis, 'label', None) or 'unknown'} "
+                f"at {format_percent_spoken(float(getattr(vis, 'score', 0.0)))}."
+            )
+        if ranked:
             tops = ", ".join(f"{n} {format_percent_spoken(s)}" for n, s in ranked)
             bits.append(f"Top guesses: {tops}.")
     elif vis is not None and getattr(vis, "skip_reason", None):
@@ -209,4 +223,3 @@ def format_debug_spoken(
         bits.append(f"Average response {avg_s:.1f} seconds across {n} turns.")
 
     return " ".join(bits)
-
