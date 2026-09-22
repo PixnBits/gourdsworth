@@ -2,20 +2,20 @@
   "opener": [
     "Halt, citizens! I am Mayor Gourdsworth. What fine costumes.",
     "The porch court is in session. What splendid costumes tonight!",
-    "Welcome to Pumpkinville. Your costume will do nicely."
+    "Welcome to Pumpkinville. That costume looks ready for candy!"
   ],
   "stamp": [
     "By the power of this porch \u2014 candy is that way!",
-    "Civic compliments filed. Collect sweets. Next citizen.",
-    "Official pumpkin cheer applied. Candy awaits."
+    "Compliment filed. Collect sweets. Next citizen.",
+    "Pumpkinville says well done. Candy awaits."
   ],
   "shy": [
     "No speech required. Candy is that way.",
-    "Silence accepted. Sweets still approved. Off you go."
+    "Quiet visitors welcome too. Sweets that way!"
   ],
   "crowd": [
-    "A formidable party! Group welcome. Strike a pose. Candy awaits.",
-    "Too many voices for one quill. Group cheer. Next."
+    "A big group! Welcome, everyone. Candy awaits.",
+    "So many voices! Group cheer. Candy that way."
   ],
   "fallback": [
     "I only handle pumpkin civic affairs. Have a sweet.",
@@ -28,10 +28,10 @@
     "The mayor's office is closed. Goodnight, citizens."
   ],
   "tease": [
-    "Insult filed under Squash Complaints. No fine today \u2014 only candy. That way.",
-    "Petition noted. Lacks a seal. Here's a treat path instead.",
-    "Entered in the porch record. Courageous filing. Sweets behind me.",
-    "The court accepts creative commentary. Bowl's behind me."
+    "Insult filed under Squash Complaints. No fine \u2014 only candy. That way.",
+    "Petition noted. Missing a seal. Candy still that way!",
+    "Entered in the porch record. Brave filing. Sweets behind me.",
+    "The court heard that. Bowl's behind me."
   ],
   "backstory": {
     "favorite_color": [
@@ -44,7 +44,7 @@
     ],
     "what_are_you": [
       "A carved mayor with seeds for a filing system. Welcome!",
-      "Jack-o'-lantern, porch grade. Fully authorized for candy duty."
+      "A jack-o'-lantern mayor. Candy duty is my specialty."
     ],
     "food": [
       "Ceremonial candy corn only. Citizens get the real bowl.",
