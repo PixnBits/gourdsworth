@@ -407,6 +407,45 @@ def _play_local_shutdown(*, kind: str = "disconnect") -> None:
         print(f"  (shutdown wav failed: {exc})")
 
 
+
+def _wait_for_desktop(
+    host: str,
+    port: int,
+    quit_ev: threading.Event,
+    *,
+    retry_s: float = 5.0,
+    announce_every_s: float = 45.0,
+    connect_timeout_s: float = 8.0,
+    announce_immediately: bool = True,
+    play=None,
+) -> socket.socket | None:
+    """Block until the desktop accepts TCP. Play generic disconnect lines while waiting.
+
+    Returns a connected socket, or None if quit_ev is set. Announces on first failure
+    when announce_immediately is True; later announcements are spaced by announce_every_s.
+    """
+    play_fn = play or _play_local_shutdown
+    next_announce = 0.0 if announce_immediately else (time.monotonic() + float(announce_every_s))
+    printed_hint = False
+    while not quit_ev.is_set():
+        try:
+            sock = socket.create_connection((host, port), timeout=connect_timeout_s)
+            print(f"  connected to {host}:{port}")
+            return sock
+        except OSError as exc:
+            now = time.monotonic()
+            print(f"  waiting for desktop {host}:{port}: {exc}")
+            if not printed_hint:
+                print("  On the desktop: python -m gourdsworth --serve-crate   (or --crate-echo)")
+                printed_hint = True
+            if now >= next_announce:
+                play_fn(kind="disconnect")
+                next_announce = now + float(announce_every_s)
+            if quit_ev.wait(timeout=max(0.5, float(retry_s))):
+                return None
+    return None
+
+
 def _play_tts(header: dict, payload: bytes | None) -> None:
     if not payload:
         return
@@ -934,104 +973,100 @@ def main(argv: list[str] | None = None) -> int:
     if args.host not in {"127.0.0.1", "localhost", "::1"}:
         print("  LAN mode: PCM/JPEG cross the house network, not the internet. No TLS.")
     gpio = _try_gpio(args.button_pin)
-    try:
-        sock = socket.create_connection((args.host, args.port), timeout=8)
-    except OSError as exc:
-        print(f"Could not connect to {args.host}:{args.port}: {exc}")
-        print("On the desktop: python -m gourdsworth --serve-crate   (or --crate-echo)")
-        return 1
-    conn = CrateConnection(sock)
-    stop = threading.Event()
-    ready = threading.Event()
-    end_talk = threading.Event()
-    pause_mic = threading.Event()
-    shutdown_played = False
-    pump = threading.Thread(
-        target=_pump,
-        args=(conn, ready, end_talk, stop, pause_mic),
-        name="crate-pump",
-        daemon=True,
-    )
-    pump.start()
-    try:
-        hello = {"event": "hello", "role": "crate", "proto": PROTO}
-        if args.continuous:
-            hello["continuous"] = True
-        conn.send(hello)
-        if not ready.wait(timeout=20):
-            print("No ready from desktop (is --serve-crate / --crate-echo running?)")
-            return 1
-        telemetry = threading.Thread(
-            target=_telemetry_loop,
-            args=(conn, stop),
-            name="crate-telemetry",
+    quit_ev = threading.Event()
+
+    def _run_connected_session(conn: CrateConnection) -> str:
+        """Run one desktop session. Returns 'goodbye' (stop client) or 'disconnect' (retry)."""
+        stop = threading.Event()
+        ready = threading.Event()
+        end_talk = threading.Event()
+        pause_mic = threading.Event()
+        shutdown_played = False
+        pump = threading.Thread(
+            target=_pump,
+            args=(conn, ready, end_talk, stop, pause_mic),
+            name="crate-pump",
             daemon=True,
         )
-        telemetry.start()
-        still_adapt = _StillAdaptive(
-            start_edge=int(args.max_edge),
-            slow_ms=float(args.still_slow_ms),
-        )
-        if not args.no_camera:
-            edge = int(args.max_edge)
-            print(
-                "  stills: full native (adaptive downscale if sends are slow)"
-                if edge <= 0
-                else f"  stills: max long-edge {edge}px (adaptive)"
-            )
-        if args.continuous:
-            print(
-                "Continuous porch mode — mic always on except while the Mayor speaks."
-            )
-            print("  Speak anytime. Ctrl+C or q = quit")
-            # Duck mic during opener playback leftovers, then open uplink
-            pause_mic.clear()
-            if args.no_mic:
-                print("  (--no-mic set; continuous needs a mic)")
-                return 2
-            conn.send({"event": "button", "state": "down"})
-            uplink = threading.Thread(
-                target=_always_on_uplink,
-                kwargs={
-                    "conn": conn,
-                    "stop": stop,
-                    "pause_mic": pause_mic,
-                    "energy": 0.015,
-                    "camera": not args.no_camera,
-                    "camera_index": int(args.camera),
-                    "still": still_adapt,
-                },
-                name="crate-uplink",
+        pump.start()
+        exit_kind = "disconnect"
+        try:
+            hello = {"event": "hello", "role": "crate", "proto": PROTO}
+            if args.continuous:
+                hello["continuous"] = True
+            conn.send(hello)
+            if not ready.wait(timeout=20):
+                print("No ready from desktop (is --serve-crate / --crate-echo running?)")
+                return "disconnect"
+            telemetry = threading.Thread(
+                target=_telemetry_loop,
+                args=(conn, stop),
+                name="crate-telemetry",
                 daemon=True,
             )
-            uplink.start()
-            exit_kind = "disconnect"
-            while not stop.is_set() and not conn.closed:
-                if _stdin_ready(0.25):
-                    line = sys.stdin.readline()
-                    # nohup/systemd closes stdin → empty read; do not treat as quit
-                    if not line:
-                        if not sys.stdin.isatty():
-                            time.sleep(0.5)
-                            continue
-                        break
-                    if line.strip().lower() in {"q", "quit", "exit"}:
-                        try:
-                            conn.send({"event": "bye"})
-                        except (ConnectionError, OSError):
-                            pass
-                        exit_kind = "goodbye"
-                        break
-            else:
-                # loop ended because conn.closed
-                if conn.closed:
-                    exit_kind = "disconnect"
-            stop.set()
-            pause_mic.set()  # duck uplink before local play
-            _play_local_shutdown(kind=exit_kind)
-            shutdown_played = True
-        else:
-            while True:
+            telemetry.start()
+            still_adapt = _StillAdaptive(
+                start_edge=int(args.max_edge),
+                slow_ms=float(args.still_slow_ms),
+            )
+            if not args.no_camera:
+                edge = int(args.max_edge)
+                print(
+                    "  stills: full native (adaptive downscale if sends are slow)"
+                    if edge <= 0
+                    else f"  stills: max long-edge {edge}px (adaptive)"
+                )
+            if args.continuous:
+                print(
+                    "Continuous porch mode — mic always on except while the Mayor speaks."
+                )
+                print("  Speak anytime. Ctrl+C or q = quit")
+                pause_mic.clear()
+                if args.no_mic:
+                    print("  (--no-mic set; continuous needs a mic)")
+                    return "goodbye"
+                conn.send({"event": "button", "state": "down"})
+                uplink = threading.Thread(
+                    target=_always_on_uplink,
+                    kwargs={
+                        "conn": conn,
+                        "stop": stop,
+                        "pause_mic": pause_mic,
+                        "energy": 0.015,
+                        "camera": not args.no_camera,
+                        "camera_index": int(args.camera),
+                        "still": still_adapt,
+                    },
+                    name="crate-uplink",
+                    daemon=True,
+                )
+                uplink.start()
+                while not stop.is_set() and not conn.closed and not quit_ev.is_set():
+                    if _stdin_ready(0.25):
+                        line = sys.stdin.readline()
+                        if not line:
+                            if not sys.stdin.isatty():
+                                time.sleep(0.5)
+                                continue
+                            break
+                        if line.strip().lower() in {"q", "quit", "exit"}:
+                            try:
+                                conn.send({"event": "bye"})
+                            except (ConnectionError, OSError):
+                                pass
+                            exit_kind = "goodbye"
+                            break
+                else:
+                    if conn.closed or quit_ev.is_set():
+                        exit_kind = "disconnect"
+                stop.set()
+                pause_mic.set()
+                if exit_kind == "goodbye":
+                    _play_local_shutdown(kind="goodbye")
+                    shutdown_played = True
+                return exit_kind
+
+            while not quit_ev.is_set():
                 ready.clear()
                 trig = _wait_trigger(gpio, stop)
                 if trig == "quit":
@@ -1041,7 +1076,7 @@ def main(argv: list[str] | None = None) -> int:
                         pass
                     _play_local_shutdown(kind="goodbye")
                     shutdown_played = True
-                    break
+                    return "goodbye"
                 _talk(
                     conn,
                     trigger=trig,
@@ -1057,26 +1092,61 @@ def main(argv: list[str] | None = None) -> int:
                 if not ready.wait(timeout=float(args.listen_s) + 15):
                     print("  (timed out waiting for desktop ready)")
                     if conn.closed:
-                        break
-    except (KeyboardInterrupt, ConnectionError, OSError) as exc:
-        kind = "goodbye" if isinstance(exc, KeyboardInterrupt) else "disconnect"
-        if not isinstance(exc, KeyboardInterrupt):
-            print(f"disconnected: {exc}")
-        if not shutdown_played:
+                        return "disconnect"
+            return "disconnect"
+        except (KeyboardInterrupt, ConnectionError, OSError) as exc:
+            kind = "goodbye" if isinstance(exc, KeyboardInterrupt) else "disconnect"
+            if isinstance(exc, KeyboardInterrupt):
+                quit_ev.set()
+            elif not isinstance(exc, KeyboardInterrupt):
+                print(f"disconnected: {exc}")
+            if not shutdown_played and kind == "goodbye":
+                try:
+                    pause_mic.set()
+                except Exception:
+                    pass
+                _play_local_shutdown(kind="goodbye")
+                shutdown_played = True
+            return kind
+        finally:
+            stop.set()
             try:
-                pause_mic.set()
+                conn.send({"event": "button", "state": "up"})
             except Exception:
                 pass
-            _play_local_shutdown(kind=kind)
-            shutdown_played = True
+            conn.close()
+
+    try:
+        announce_now = True
+        while not quit_ev.is_set():
+            sock = _wait_for_desktop(
+                args.host,
+                args.port,
+                quit_ev,
+                announce_immediately=announce_now,
+            )
+            if sock is None:
+                return 0
+            conn = CrateConnection(sock)
+            try:
+                reason = _run_connected_session(conn)
+            except (KeyboardInterrupt, ConnectionError, OSError) as exc:
+                if isinstance(exc, KeyboardInterrupt):
+                    quit_ev.set()
+                    _play_local_shutdown(kind="goodbye")
+                    break
+                print(f"disconnected: {exc}")
+                reason = "disconnect"
+            if reason == "goodbye" or quit_ev.is_set():
+                break
+            # Desktop dropped or never became ready — announce, then wait again.
+            print("  desktop gone; will retry when it returns")
+            _play_local_shutdown(kind="disconnect")
+            announce_now = False  # already spoke; next wait is quieter until interval
+    except KeyboardInterrupt:
+        quit_ev.set()
+        _play_local_shutdown(kind="goodbye")
         print()
-    finally:
-        stop.set()
-        try:
-            conn.send({"event": "button", "state": "up"})
-        except Exception:
-            pass
-        conn.close()
     return 0
 
 
