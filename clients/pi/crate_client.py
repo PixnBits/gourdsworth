@@ -509,11 +509,48 @@ def _always_on_uplink(
     }
     speech_hot = False
     cool = 0
+    was_paused = False
+    need_quiet = 6  # ~0.6s — align with desktop silence_s
+
+    def _snap_bg(tag: str, _still=still) -> None:
+        if not camera or _still is None:
+            return
+        if _SNAP_BUSY.is_set():
+            return
+
+        def _run() -> None:
+            _SNAP_BUSY.set()
+            try:
+                jpeg, wh = _grab_jpeg(
+                    camera_index, max_edge=_still.edge, quality=_still.quality
+                )
+                if jpeg:
+                    t_send = time.monotonic()
+                    conn.send({"event": "jpeg"}, jpeg)
+                    _still.note_send(len(jpeg), (time.monotonic() - t_send) * 1000)
+                    if wh:
+                        print(
+                            f"  still {wh[0]}x{wh[1]}  {len(jpeg) // 1024}KiB  "
+                            f"({tag})"
+                        )
+                    del jpeg
+            except Exception as exc:
+                print(f"  (still failed: {exc})")
+            finally:
+                _SNAP_BUSY.clear()
+
+        threading.Thread(target=_run, name="crate-still", daemon=True).start()
+
     while not stop.is_set() and not conn.closed:
         if pause_mic.is_set():
-            speech_hot = False
+            # Mayor often answers before our quiet timer — snap on duck.
+            if speech_hot and not was_paused:
+                _snap_bg("speech-end")
+                speech_hot = False
+            was_paused = True
             time.sleep(0.05)
             continue
+        was_paused = False
         try:
             with _AUDIO_LOCK:
                 if pause_mic.is_set():
@@ -532,44 +569,15 @@ def _always_on_uplink(
         arr = np.asarray(frame, dtype="<i2").reshape(-1)
         peak = float(np.max(np.abs(arr.astype(np.float32)))) / 32768.0
 
-        def _snap_bg(tag: str, _still=still) -> None:
-            if not camera or _still is None:
-                return
-            if _SNAP_BUSY.is_set():
-                return
-
-            def _run() -> None:
-                _SNAP_BUSY.set()
-                try:
-                    jpeg, wh = _grab_jpeg(
-                        camera_index, max_edge=_still.edge, quality=_still.quality
-                    )
-                    if jpeg:
-                        t_send = time.monotonic()
-                        conn.send({"event": "jpeg"}, jpeg)
-                        _still.note_send(len(jpeg), (time.monotonic() - t_send) * 1000)
-                        if wh:
-                            print(
-                                f"  still {wh[0]}x{wh[1]}  {len(jpeg) // 1024}KiB  "
-                                f"({tag})"
-                            )
-                        del jpeg
-                except Exception as exc:
-                    print(f"  (still failed: {exc})")
-                finally:
-                    _SNAP_BUSY.clear()
-
-            threading.Thread(target=_run, name="crate-still", daemon=True).start()
-
         if peak >= energy:
             speech_hot = True
             cool = 0
         elif speech_hot:
             cool += 1
-            if cool > 20:
-                # Thermal: one snap per utterance, at speech-end (freshest + half the cam churn)
+            if cool >= need_quiet:
                 _snap_bg("speech-end")
                 speech_hot = False
+
         try:
             conn.send(header, arr.tobytes())
         except (ConnectionError, OSError):
