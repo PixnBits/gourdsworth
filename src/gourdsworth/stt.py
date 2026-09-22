@@ -9,11 +9,11 @@ import numpy as np
 # Bias Whisper toward porch vocabulary (does not force matches).
 PORCH_PROMPT = (
     "Halloween porch in Pumpkinville. Children say trick or treat, smell my feet, "
-    "candy, costume, pumpkin, jack-o'-lantern, Mayor Gourdsworth, license, please."
+    "candy, costume, pumpkin, jack-o'-lantern, Mayor Gourdsworth, please."
 )
 PORCH_HOTWORDS = (
     "trick or treat candy costume pumpkin Gourdsworth Pumpkinville "
-    "jack-o'-lantern license smell my feet"
+    "jack-o'-lantern candy smell my feet"
 )
 
 # Short utterances often mangled by tiny/base — map near-misses back.

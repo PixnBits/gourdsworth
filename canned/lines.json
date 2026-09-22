@@ -1,24 +1,24 @@
 {
   "opener": [
     "Halt, citizens! I am Mayor Gourdsworth. What fine costumes.",
-    "The porch court is in session. Step forward and be licensed.",
-    "Welcome to Pumpkinville. Papers, please \u2014 ah, your costume will do."
+    "The porch court is in session. Step forward and be admired.",
+    "Welcome to Pumpkinville. Your costume will do nicely."
   ],
   "stamp": [
-    "By the power of this porch, licensed to collect sweets. Stamp!",
-    "Form 31-B approved. Collect sweets. Next citizen.",
-    "Official pumpkin seal applied. Candy awaits."
+    "By the power of this porch \u2014 candy is that way!",
+    "Civic compliments filed. Collect sweets. Next citizen.",
+    "Official pumpkin cheer applied. Candy awaits."
   ],
   "shy": [
-    "No speech required. I stamp you anyway. Candy is that way.",
-    "Silence is accepted as consent to sweets. Licensed. Off you go."
+    "No speech required. Candy is that way.",
+    "Silence accepted. Sweets still approved. Off you go."
   ],
   "crowd": [
-    "A formidable party! Group license approved. Strike a pose. Candy awaits.",
-    "Too many voices for one quill. Group stamp. Next."
+    "A formidable party! Group welcome. Strike a pose. Candy awaits.",
+    "Too many voices for one quill. Group cheer. Next."
   ],
   "fallback": [
-    "I only handle pumpkin civic affairs. Have a sweet. Stamp.",
+    "I only handle pumpkin civic affairs. Have a sweet.",
     "The paperwork is jammed. Take candy while I sort the gourds."
   ],
   "distress": [
@@ -28,10 +28,10 @@
     "The mayor's office is closed. Goodnight, citizens."
   ],
   "tease": [
-    "Insult filed under Squash Complaints. No fine today \u2014 only a license. Candy that way.",
-    "Petition noted. Lacks a stamp. Here's a treat license instead.",
-    "Entered in the porch record. Courageous filing. Stamp for sweets.",
-    "The court accepts creative commentary. License still required. Bowl's behind me."
+    "Insult filed under Squash Complaints. No fine today \u2014 only candy. That way.",
+    "Petition noted. Lacks a seal. Here's a treat path instead.",
+    "Entered in the porch record. Courageous filing. Sweets behind me.",
+    "The court accepts creative commentary. Bowl's behind me."
   ],
   "backstory": {
     "favorite_color": [
@@ -39,11 +39,11 @@
       "Pumpkin Orange, filed under Civic Hues. Candy that way."
     ],
     "age": [
-      "Civic vintage \u2014 older than the bowl, younger than the oak. Stamp?",
+      "Civic vintage \u2014 older than the bowl, younger than the oak. Candy?",
       "Age is classified under Squash Secrets. Sweets are not."
     ],
     "what_are_you": [
-      "A carved mayor with seeds for a filing system. Licensed to host.",
+      "A carved mayor with seeds for a filing system. Welcome!",
       "Jack-o'-lantern, porch grade. Fully authorized for candy duty."
     ],
     "food": [
@@ -56,7 +56,7 @@
     ],
     "job": [
       "Mayor of Pumpkinville. Landslide of one gourd. Recount pending.",
-      "I stamp licenses and point at candy. Very important work."
+      "I greet costumes and point at candy. Very important work."
     ],
     "home": [
       "Pumpkinville \u2014 office hours on this very porch.",

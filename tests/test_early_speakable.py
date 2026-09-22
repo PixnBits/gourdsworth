@@ -28,7 +28,7 @@ def test_early_none_while_short():
 def test_early_comma_after_min_words():
     raw = (
         "You look truly wonderful tonight in that handmade cape of many bright colors, "
-        "and I hereby stamp your license"
+        "and I hereby cheer your costume"
     )
     got = early_speakable(raw, min_words=12)
     assert got is not None
@@ -36,9 +36,9 @@ def test_early_comma_after_min_words():
     assert "colors," in got
 
 
-def test_early_license_line_does_not_split_at_to():
+def test_early_cheer_line_does_not_split_at_to():
     partial = (
-        'Here\'s your Trick-or-Treat License: "Gourd-geous in costume, you are '
+        'Here\'s your Trick-or-Treat welcome: "Gourd-geous in costume, you are '
         "hereby permitted to "
     )
     got = early_speakable(partial, min_words=12)
@@ -47,9 +47,9 @@ def test_early_license_line_does_not_split_at_to():
         assert "permitted to" not in got
 
 
-def test_early_license_full_flushes_at_sentence():
+def test_early_cheer_full_flushes_at_sentence():
     raw = (
-        'Here\'s your Trick-or-Treat License: "Gourd-geous in costume, you are '
+        'Here\'s your Trick-or-Treat welcome: "Gourd-geous in costume, you are '
         'hereby permitted to collect treats in Pumpkinville."'
     )
     got = early_speakable(raw, min_words=12)

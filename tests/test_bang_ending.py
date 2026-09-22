@@ -9,8 +9,8 @@ def test_split_comma_tag():
 
 
 def test_split_emdash_tag():
-    raw = "What fine costumes — licensed!"
-    assert split_bang_ending(raw) == "What fine costumes. Licensed!"
+    raw = "What fine costumes — splendid!"
+    assert split_bang_ending(raw) == "What fine costumes. Splendid!"
 
 
 def test_no_split_without_bang():
