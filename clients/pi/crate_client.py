@@ -18,7 +18,9 @@ import os
 import select
 import socket
 import sys
+import random
 import threading
+import wave
 import time
 from pathlib import Path
 
@@ -283,6 +285,65 @@ def _probe_play_rate() -> int | None:
     else:
         print("  (warning: could not probe a working playback sample rate)")
     return _PLAY_RATE
+
+
+
+def _shutdown_wav_dir() -> Path:
+    return Path(__file__).resolve().parent / "assets" / "shutdown"
+
+
+def _load_wav_f32(path: Path):
+    import numpy as np
+
+    with wave.open(str(path), "rb") as wf:
+        ch = wf.getnchannels()
+        sw = wf.getsampwidth()
+        rate = wf.getframerate()
+        raw = wf.readframes(wf.getnframes())
+    if sw == 2:
+        arr = np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
+    else:
+        raise RuntimeError(f"unsupported wav width {sw} in {path}")
+    if ch > 1:
+        arr = arr.reshape(-1, ch).mean(axis=1)
+    return arr, int(rate)
+
+
+def _play_local_shutdown(*, kind: str = "disconnect") -> None:
+    """Play a canned Mayor line from disk — no desktop, no TTS on the Pi."""
+    try:
+        import numpy as np  # noqa: F401 — used via _load_wav_f32
+        import sounddevice as sd
+    except ImportError:
+        print("  (no sounddevice; skip local shutdown line)")
+        return
+    root = _shutdown_wav_dir()
+    if kind == "goodbye":
+        paths = sorted(root.glob("goodbye_*.wav"))
+        if not paths:
+            paths = sorted(root.glob("disconnect_*.wav"))
+    else:
+        paths = sorted(root.glob("disconnect_*.wav"))
+        if not paths:
+            paths = sorted(root.glob("goodbye_*.wav"))
+    if not paths:
+        print("  (no local shutdown wavs)")
+        return
+    path = random.choice(paths)
+    try:
+        samples, rate = _load_wav_f32(path)
+        play_rate = _probe_play_rate() or rate
+        if play_rate != rate:
+            samples, play_rate = _resample_f32(samples, rate, play_rate)
+        with _AUDIO_LOCK:
+            try:
+                sd.play(samples, play_rate, blocking=True)
+            except TypeError:
+                sd.play(samples, play_rate)
+                sd.wait()
+        print(f"  shutdown line: {path.name}")
+    except Exception as exc:
+        print(f"  (shutdown wav failed: {exc})")
 
 
 def _play_tts(header: dict, payload: bytes | None) -> None:
@@ -823,6 +884,7 @@ def main(argv: list[str] | None = None) -> int:
     ready = threading.Event()
     end_talk = threading.Event()
     pause_mic = threading.Event()
+    shutdown_played = False
     pump = threading.Thread(
         target=_pump,
         args=(conn, ready, end_talk, stop, pause_mic),
@@ -875,6 +937,7 @@ def main(argv: list[str] | None = None) -> int:
                 daemon=True,
             )
             uplink.start()
+            exit_kind = "disconnect"
             while not stop.is_set() and not conn.closed:
                 if _stdin_ready(0.25):
                     line = sys.stdin.readline()
@@ -889,8 +952,16 @@ def main(argv: list[str] | None = None) -> int:
                             conn.send({"event": "bye"})
                         except (ConnectionError, OSError):
                             pass
+                        exit_kind = "goodbye"
                         break
+            else:
+                # loop ended because conn.closed
+                if conn.closed:
+                    exit_kind = "disconnect"
             stop.set()
+            pause_mic.set()  # duck uplink before local play
+            _play_local_shutdown(kind=exit_kind)
+            shutdown_played = True
         else:
             while True:
                 ready.clear()
@@ -900,6 +971,8 @@ def main(argv: list[str] | None = None) -> int:
                         conn.send({"event": "bye"})
                     except (ConnectionError, OSError):
                         pass
+                    _play_local_shutdown(kind="goodbye")
+                    shutdown_played = True
                     break
                 _talk(
                     conn,
@@ -918,8 +991,16 @@ def main(argv: list[str] | None = None) -> int:
                     if conn.closed:
                         break
     except (KeyboardInterrupt, ConnectionError, OSError) as exc:
+        kind = "goodbye" if isinstance(exc, KeyboardInterrupt) else "disconnect"
         if not isinstance(exc, KeyboardInterrupt):
             print(f"disconnected: {exc}")
+        if not shutdown_played:
+            try:
+                pause_mic.set()
+            except Exception:
+                pass
+            _play_local_shutdown(kind=kind)
+            shutdown_played = True
         print()
     finally:
         stop.set()

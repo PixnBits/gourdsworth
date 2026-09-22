@@ -1,0 +1,5 @@
+disconnect_1|Pumpkinville Parks is closed for a moment. Please try again shortly.
+disconnect_2|The civic line went quiet. Candy is still available.
+disconnect_3|Mayor Gourdsworth stepped away from the desk. Hold that thought.
+disconnect_4|Connection lost. The paperwork will resume shortly.
+goodbye_1|Office hours ended. Happy Halloween, citizens.
