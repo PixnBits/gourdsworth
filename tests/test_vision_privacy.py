@@ -303,3 +303,14 @@ def test_per_person_unifies_count_and_costumes(monkeypatch):
 def test_blind_note_does_not_quiz():
     assert "Ten Questions" not in VISION_BLIND_NOTE
     assert "do not invent" in VISION_BLIND_NOTE.lower()
+
+
+def test_format_visual_note_scored_sorted_decimals():
+    from gourdsworth.vision import format_visual_note
+
+    note = format_visual_note([("witch", 0.11), ("pirate", 0.20), ("robot", 0.16)])
+    # High→low; LLM keeps 0.20 form
+    assert "pirate costume 0.20" in note
+    assert note.index("pirate costume 0.20") < note.index("robot costume 0.16")
+    assert note.index("robot costume 0.16") < note.index("witch costume 0.11")
+    assert "twenty" not in note

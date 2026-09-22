@@ -136,27 +136,50 @@ def _phrase_for_label(lab: str) -> str:
 
 
 def format_visual_note(
-    label: str | Sequence[str],
+    label: str | Sequence[str] | Sequence[tuple[str, float]],
     *,
     person_count: int | None = None,
 ) -> str:
-    """One line for the mayor. Optional person_count is YOLO/presence — not CLIP."""
+    """One line for the mayor. Optional person_count is YOLO/presence — not CLIP.
+
+    Labels may be bare strings or (label, score) pairs. Scored lists are sorted
+    high→low and keep decimal scores (0.20) for the LLM; spoken debug uses
+    percent words separately.
+    """
     if isinstance(label, str):
-        labs = [label]
+        raw_items: list[tuple[str, float | None]] = [(label, None)]
     else:
-        labs = list(label)
-    cleaned: list[str] = []
-    for raw in labs:
+        raw_items = []
+        for item in label:
+            if isinstance(item, (tuple, list)) and len(item) == 2 and not isinstance(item, str):
+                raw_items.append((str(item[0]), float(item[1])))
+            else:
+                raw_items.append((str(item), None))
+
+    cleaned: list[tuple[str, float | None]] = []
+    seen: set[str] = set()
+    for raw, score in raw_items:
         lab = (raw or "").strip().lower()
         if not lab or note_contains_identity(lab):
             continue
         if lab == "group":
             continue  # headcount comes from person_count, not the CLIP "group" tag
-        if lab not in cleaned:
-            cleaned.append(lab)
+        if lab in seen:
+            continue
+        seen.add(lab)
+        cleaned.append((lab, score))
     if not cleaned:
-        cleaned = ["homemade"]
-    phrases = [_phrase_for_label(lab) for lab in cleaned]
+        cleaned = [("homemade", None)]
+    if any(sc is not None for _, sc in cleaned):
+        cleaned.sort(key=lambda kv: (kv[1] is not None, kv[1] or 0.0), reverse=True)
+
+    phrases: list[str] = []
+    for lab, score in cleaned:
+        phrase = _phrase_for_label(lab)
+        if score is not None:
+            phrases.append(f"{phrase} {float(score):.2f}")
+        else:
+            phrases.append(phrase)
     parts: list[str] = []
     if person_count is not None and person_count >= 0:
         n = min(int(person_count), 8)
@@ -232,7 +255,12 @@ def attach_visual_note(user_text: str, note: str | None) -> str:
 
 
 def format_top3(top3: Sequence[tuple[str, float]]) -> str:
-    return ", ".join(f"{lab} {score:.2f}" for lab, score in list(top3)[:3])
+    ranked = sorted(
+        ((str(lab), float(score)) for lab, score in list(top3)[:3]),
+        key=lambda kv: kv[1],
+        reverse=True,
+    )
+    return ", ".join(f"{lab} {score:.2f}" for lab, score in ranked)
 
 
 def missing_vision_deps() -> str | None:
@@ -473,13 +501,18 @@ def classify_persons_then_frame(
             per_scores.append(score)
 
     if per_labels:
-        # One costume per detected person; keep order, allow duplicates only once in note
-        unique: list[str] = []
-        for lab in per_labels:
-            if lab not in unique:
-                unique.append(lab)
+        # One costume per detected person; dedupe, then sort by score for the LLM note
+        scored_unique: list[tuple[str, float]] = []
+        seen_labs: set[str] = set()
+        for lab, sc in zip(per_labels, per_scores):
+            if lab in seen_labs:
+                continue
+            seen_labs.add(lab)
+            scored_unique.append((lab, float(sc)))
+        scored_unique.sort(key=lambda kv: kv[1], reverse=True)
+        unique = [lab for lab, _ in scored_unique]
         label = unique[0]
-        score = per_scores[0]
+        score = scored_unique[0][1]
         # Full-frame top3 still useful for logs
         full_ranked = sorted(
             (
@@ -490,7 +523,7 @@ def classify_persons_then_frame(
             reverse=True,
         )
         top3 = full_ranked[:3]
-        note = format_visual_note(unique, person_count=person_count)
+        note = format_visual_note(scored_unique, person_count=person_count)
         if safe_visual_note(note) is None:
             return VisionResult(
                 label="",
@@ -568,10 +601,15 @@ def classify_costume(
         max_labels=2,
         person_count=person_count,
     )
-    label = labels_for_note[0]
-    score = next(s for lab, s in ranked if lab == label)
+    score_by = {lab: s for lab, s in ranked}
+    scored_for_note = [(lab, float(score_by[lab])) for lab in labels_for_note if lab in score_by]
+    if not scored_for_note:
+        scored_for_note = [(labels_for_note[0], float(ranked[0][1]))]
+    scored_for_note.sort(key=lambda kv: kv[1], reverse=True)
+    label = scored_for_note[0][0]
+    score = scored_for_note[0][1]
 
-    note = format_visual_note(labels_for_note, person_count=person_count)
+    note = format_visual_note(scored_for_note, person_count=person_count)
     safe = safe_visual_note(note)
     if safe is None:
         return VisionResult(
