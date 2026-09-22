@@ -19,6 +19,7 @@ from gourdsworth.net import (
     serve_echo,
 )
 from gourdsworth.guardrails import (
+    looks_debug_pass,
     early_speakable,
     looks_distress,
     looks_tease,
@@ -515,7 +516,25 @@ def _handle_turn(
     vis = take_ready(vis_future)
     visual_note = vis.note if vis is not None and vis.ok else None
 
-    if looks_distress(user_text):
+    if looks_debug_pass(user_text):
+        # Secret porch diagnostics (Phineas and Ferb passcodes).
+        bits = ["Agent P debug channel open."]
+        if vis is not None and vis.ok and vis.note:
+            bits.append(f"Vision says {vis.label or 'unknown'} at {vis.score:.2f}.")
+            if getattr(vis, "top3", None):
+                tops = ", ".join(f"{n} {s:.2f}" for n, s in vis.top3[:3])
+                bits.append(f"Top guesses: {tops}.")
+        elif vis is not None and getattr(vis, "skip_reason", None):
+            bits.append(f"Vision skipped: {vis.skip_reason}.")
+        else:
+            bits.append("No still ready yet. Camera may still be grabbing.")
+        if metrics.uplink_first_ms:
+            bits.append(f"Uplink first {metrics.uplink_first_ms:.0f} milliseconds.")
+        line = " ".join(bits)
+        gesture = "think"
+        metrics.used_canned = True
+        metrics.vision_used = bool(vis is not None and vis.ok and vis.note)
+    elif looks_distress(user_text):
         line = canned["distress"][0]
         gesture = "listen"
         metrics.used_canned = True

@@ -266,3 +266,38 @@ def remainder_after(full: str, spoken_prefix: str) -> str:
     if spoken_prefix and spoken_prefix in (full or ""):
         return (full.split(spoken_prefix, 1)[1]).strip(" .,;:")
     return ""
+
+
+# Spoken unlock for porch diagnostics (Phineas and Ferb). Keep the list small.
+_DEBUG_PASS = {
+    "perry",
+    "perry the platypus",
+    "agent p",
+    "agent perry",
+    "doofenshmirtz",
+    "heinz doofenshmirtz",
+    "candace",
+    "phineas",
+    "ferb",
+    "isabella",
+    "baljeet",
+    "buford",
+    "major monogram",
+    "dr doofenshmirtz",
+}
+
+
+def looks_debug_pass(text: str) -> bool:
+    """True when the kid (or operator) says a secret character passcode."""
+    n = "".join(ch.lower() if ch.isalnum() or ch.isspace() else " " for ch in (text or ""))
+    n = " ".join(n.split())
+    if not n:
+        return False
+    if n in _DEBUG_PASS:
+        return True
+    # Allow "hey perry" / "code perry the platypus"
+    for phrase in _DEBUG_PASS:
+        if phrase in n:
+            return True
+    return False
+
