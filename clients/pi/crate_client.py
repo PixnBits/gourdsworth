@@ -91,8 +91,9 @@ def _grab_jpeg_unlocked(
             return None, None
         # Ask for a high mode; driver may still deliver native/sensor size.
         if max_edge <= 0:
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 3840)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 2160)
+            # 1080p is enough for costume CLIP; 4K open/read heated the Pi for no gain.
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
         else:
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, int(max_edge))
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(max_edge))
@@ -101,7 +102,8 @@ def _grab_jpeg_unlocked(
         except Exception:
             pass
         ok = False
-        for _ in range(4):
+        # Two reads is enough with BUFFERSIZE=1; four was extra heat/time per open.
+        for _ in range(2):
             ok, frame = cap.read()
         if not ok or frame is None:
             print(f"  camera {index} produced no frame")
@@ -533,8 +535,7 @@ def _always_on_uplink(
         def _snap_bg(tag: str, _still=still) -> None:
             if not camera or _still is None:
                 return
-            # Prefer speech-end freshness; skip a start snap if one is already running.
-            if tag == "speech-start" and _SNAP_BUSY.is_set():
+            if _SNAP_BUSY.is_set():
                 return
 
             def _run() -> None:
@@ -561,14 +562,12 @@ def _always_on_uplink(
             threading.Thread(target=_run, name="crate-still", daemon=True).start()
 
         if peak >= energy:
-            if not speech_hot:
-                # Early snap so encode overlaps the rest of the utterance
-                _snap_bg("speech-start")
             speech_hot = True
             cool = 0
         elif speech_hot:
             cool += 1
-            if cool > 20:  # ~ quiet — fresher frame near speech end
+            if cool > 20:
+                # Thermal: one snap per utterance, at speech-end (freshest + half the cam churn)
                 _snap_bg("speech-end")
                 speech_hot = False
         try:

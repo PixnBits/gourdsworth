@@ -131,3 +131,11 @@ Both sides tee to `logs/` (gitignored):
 - Pi client: `logs/crate-pi.log` (override with `--log-file` / `CRATE_LOG`)
 
 Pull them from the Framework Desktop / Pi without copy-paste.
+
+
+## Porch thermal (outdoor / hot days)
+
+Continuous mode takes **one still per utterance at speech-end** (not also at
+speech-start) to cut camera open/USB churn. Prefer `CRATE_MAX_EDGE=1280` in
+`local.env`. Camera stays on the Pi for now; the desktop already accepts crate
+JPEGs, so a later desktop webcam path does not need a new protocol.
