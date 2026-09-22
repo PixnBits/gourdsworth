@@ -169,7 +169,9 @@ def format_visual_note(
         seen.add(lab)
         cleaned.append((lab, score))
     if not cleaned:
-        cleaned = [("homemade", None)]
+        # Empty walk: do not invent a homemade costume for the LLM note.
+        if person_count is None or person_count > 0:
+            cleaned = [("homemade", None)]
     if any(sc is not None for _, sc in cleaned):
         cleaned.sort(key=lambda kv: (kv[1] is not None, kv[1] or 0.0), reverse=True)
 
@@ -185,15 +187,20 @@ def format_visual_note(
         n = min(int(person_count), 8)
         if n == 0:
             parts.append("walk looks empty")
+            # Empty walk: never invent / echo costume scores for the LLM.
+            phrases = []
         elif n == 1:
             parts.append("about 1 citizen")
         else:
             # Explicit family/friends so the LLM never invents "couple"
             parts.append(f"about {n} citizens (family or friends, never a couple)")
-    if len(phrases) == 1:
-        parts.append(phrases[0])
-    else:
-        parts.append(", ".join(phrases))
+    if phrases:
+        if len(phrases) == 1:
+            parts.append(phrases[0])
+        else:
+            parts.append(", ".join(phrases))
+    elif not parts:
+        parts.append(_phrase_for_label("homemade"))
     body = "; ".join(parts)
     note = f"{NOTE_PREFIX} {body}."
     if note_contains_identity(note):
@@ -209,10 +216,14 @@ def select_costume_labels(
     relative_floor: float = 0.40,
     person_count: int | None = None,
 ) -> list[str]:
-    """Pick a short costume list. Cap by person_count when known (1 person → 1 label)."""
+    """Pick a short costume list. Cap by person_count when known (1 person → 1 label).
+
+    Empty walk (person_count <= 0): return no labels — callers must not invent homemade.
+    Soft CLIP (top below min_score): return ["homemade"] for real citizens.
+    """
     if person_count is not None:
         if person_count <= 0:
-            return ["homemade"]
+            return []
         max_labels = min(max_labels, max(1, int(person_count)))
     if not ranked:
         return ["homemade"]
@@ -584,15 +595,47 @@ def classify_costume(
 
     label, score = ranked[0]
     allowed_set = set(allowed)
-    if label not in allowed_set or score < min_score or note_contains_identity(label):
-        # Soft / unknown → no costume invent (no Ten Questions quiz).
+
+    # Empty walk: honest LLM note only — never push a fake homemade costume.
+    if person_count is not None and person_count <= 0:
+        note = format_visual_note([], person_count=person_count)
+        safe = safe_visual_note(note)
+        if safe is None:
+            return VisionResult(
+                label="",
+                score=float(score),
+                top3=top3,
+                note="",
+                person_count=person_count,
+                skip_reason="unsure",
+            )
         return VisionResult(
             label="",
             score=float(score),
             top3=top3,
-            note="",
+            note=note,
             person_count=person_count,
-            skip_reason="unsure",
+        )
+
+    if label not in allowed_set or score < min_score or note_contains_identity(label):
+        # Soft / unknown for real citizens → safe homemade note (no Ten Questions quiz).
+        note = format_visual_note([("homemade", float(score))], person_count=person_count)
+        safe = safe_visual_note(note)
+        if safe is None:
+            return VisionResult(
+                label="",
+                score=float(score),
+                top3=top3,
+                note="",
+                person_count=person_count,
+                skip_reason="unsure",
+            )
+        return VisionResult(
+            label="homemade",
+            score=float(score),
+            top3=top3,
+            note=note,
+            person_count=person_count,
         )
 
     labels_for_note = select_costume_labels(
@@ -604,6 +647,16 @@ def classify_costume(
     score_by = {lab: s for lab, s in ranked}
     scored_for_note = [(lab, float(score_by[lab])) for lab in labels_for_note if lab in score_by]
     if not scored_for_note:
+        if not labels_for_note:
+            note = format_visual_note([], person_count=person_count)
+            return VisionResult(
+                label="",
+                score=float(score),
+                top3=top3,
+                note=note if safe_visual_note(note) else "",
+                person_count=person_count,
+                skip_reason=None if safe_visual_note(note) else "unsure",
+            )
         scored_for_note = [(labels_for_note[0], float(ranked[0][1]))]
     scored_for_note.sort(key=lambda kv: kv[1], reverse=True)
     label = scored_for_note[0][0]

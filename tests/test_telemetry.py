@@ -130,12 +130,12 @@ def test_format_debug_spoken_empty_walk_lists_top_guesses():
     from gourdsworth.metrics import format_debug_spoken
     from gourdsworth.vision import VisionResult, format_visual_note
 
-    # persons=0 → select_costume_labels returns homemade, but spoken must be honest.
+    # persons=0 → LLM note is empty walk only; spoken must match (no fake homemade).
     vis = VisionResult(
-        label="homemade",
-        score=0.02,
+        label="",
+        score=0.18,
         top3=[("vampire", 0.18), ("ghost", 0.09), ("witch", 0.07)],
-        note=format_visual_note([("homemade", 0.02)], person_count=0),
+        note=format_visual_note([], person_count=0),
         person_count=0,
     )
     line = format_debug_spoken(vis=vis)
