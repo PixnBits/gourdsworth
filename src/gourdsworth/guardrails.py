@@ -158,6 +158,41 @@ def finish_spoken(line: str) -> str:
     return line
 
 
+_RELATIONSHIP_BAD = re.compile(
+    r"\b("
+    r"couple|couples|partners|sweethearts?|husband|wife|wives|"
+    r"boyfriend|girlfriend|fiancé|fiance|fiancée|fiancee|"
+    r"newlyweds?|lovers?"
+    r")\b",
+    re.I,
+)
+
+
+def scrub_relationship_words(line: str) -> str:
+    """Never invent romantic relationships on a family porch."""
+    text = (line or "").strip()
+    if not text or not _RELATIONSHIP_BAD.search(text):
+        return text
+    # Common LLM slip: "A clever couple, ..."
+    text = re.sub(
+        r"\b(?:a|an|the)\s+(?:clever|brave|fine|lovely|handsome|cute|sweet|nice|happy)?\s*couples?\b[,!]?",
+        "Welcome, citizens",
+        text,
+        flags=re.I,
+    )
+    text = re.sub(
+        r"\byou(?:'re| are)\s+(?:a\s+)?(?:lovely|sweet|fine)?\s*couples?\b",
+        "you are welcome citizens",
+        text,
+        flags=re.I,
+    )
+    # Remaining banned relationship nouns → citizens
+    text = _RELATIONSHIP_BAD.sub("citizens", text)
+    text = re.sub(r"\s{2,}", " ", text).strip(" ,;")
+    return text
+
+
+
 def sanitize_spoken(line: str) -> str:
     """Strip leaked gesture *tags*, not English verbs like "stamp" / "wave".
 
@@ -197,6 +232,7 @@ def sanitize_spoken(line: str) -> str:
     letters = [c for c in line if c.isalpha()]
     if letters and sum(1 for c in letters if c.isupper()) / len(letters) > 0.7 and len(letters) > 4:
         line = line.title()
+    line = scrub_relationship_words(line)
     return strip_markdown(line)
 
 def parse_reply(raw: str) -> tuple[str, str]:

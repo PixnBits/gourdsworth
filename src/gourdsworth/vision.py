@@ -165,7 +165,8 @@ def format_visual_note(
         elif n == 1:
             parts.append("about 1 citizen")
         else:
-            parts.append(f"about {n} citizens")
+            # Explicit family/friends so the LLM never invents "couple"
+            parts.append(f"about {n} citizens (family or friends, never a couple)")
     if len(phrases) == 1:
         parts.append(phrases[0])
     else:
