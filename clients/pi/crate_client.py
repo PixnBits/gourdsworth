@@ -870,7 +870,13 @@ def main(argv: list[str] | None = None) -> int:
             while not stop.is_set() and not conn.closed:
                 if _stdin_ready(0.25):
                     line = sys.stdin.readline()
-                    if not line or line.strip().lower() in {"q", "quit", "exit"}:
+                    # nohup/systemd closes stdin → empty read; do not treat as quit
+                    if not line:
+                        if not sys.stdin.isatty():
+                            time.sleep(0.5)
+                            continue
+                        break
+                    if line.strip().lower() in {"q", "quit", "exit"}:
                         try:
                             conn.send({"event": "bye"})
                         except (ConnectionError, OSError):
