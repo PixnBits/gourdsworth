@@ -143,3 +143,7 @@ JPEGs, so a later desktop webcam path does not need a new protocol.
 ## Local shutdown lines
 
 Pre-rendered WAVs in `assets/shutdown/` play when the desktop drops or the client exits (no Pi TTS).
+
+If the desktop is not up yet (or goes away mid-porch), the client **keeps waiting** and
+plays a random `disconnect_*.wav` on the first miss, then about every 45s, until
+`--serve-crate` accepts the connection again. `goodbye_*.wav` is only for an explicit quit.
