@@ -524,7 +524,7 @@ def _handle_turn(
         visual_note = None
 
     if looks_debug_pass(user_text):
-        # Secret porch diagnostics (spoken "tri-state area" passphrase).
+        # Secret porch diagnostics (Doofenshmirtz young-mayor passphrase).
         line = format_debug_spoken(
             vis=vis,
             uplink_first_ms=float(metrics.uplink_first_ms or 0.0),
