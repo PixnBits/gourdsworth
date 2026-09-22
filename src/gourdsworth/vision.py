@@ -16,6 +16,13 @@ from time import perf_counter
 
 NOTE_PREFIX = "Visual note (may be wrong, never name a person):"
 
+# When CLIP is soft / no still: steer Mayor to ask, never invent a costume.
+VISION_BLIND_NOTE = (
+    "Visual note: Costume unclear. Play Ten Questions — ask ONE short playful "
+    "yes-or-no costume question; do not invent what they are wearing."
+)
+
+
 PRIVACY_SIGN = (
     "A camera looks only when someone is at the crate. "
     "No faces are saved. Nothing leaves this house."
@@ -483,8 +490,14 @@ def classify_persons_then_frame(
         top3 = full_ranked[:3]
         note = format_visual_note(unique, person_count=person_count)
         if safe_visual_note(note) is None:
-            note = format_visual_note("homemade", person_count=person_count)
-            label = "homemade"
+            return VisionResult(
+                label="",
+                score=float(score),
+                top3=top3,
+                note="",
+                person_count=person_count,
+                skip_reason="unsure",
+            )
         return VisionResult(
             label=label,
             score=score,
@@ -525,30 +538,48 @@ def classify_costume(
     top3 = ranked[:3]
 
     if not ranked:
-        label, score = "homemade", 0.0
-        labels_for_note = ["homemade"]
-    else:
-        label, score = ranked[0]
-        allowed_set = set(allowed)
-        if label not in allowed_set or score < min_score or note_contains_identity(label):
-            homemade_score = next((s for lab, s in ranked if lab == "homemade"), score)
-            label, score = "homemade", homemade_score
-            labels_for_note = ["homemade"]
-        else:
-            labels_for_note = select_costume_labels(
-                ranked,
-                min_score=min_score,
-                max_labels=2,
-                person_count=person_count,
-            )
-            label = labels_for_note[0]
-            score = next(s for lab, s in ranked if lab == label)
+        return VisionResult(
+            label="",
+            score=0.0,
+            top3=[],
+            note="",
+            person_count=person_count,
+            skip_reason="unsure",
+        )
+
+    label, score = ranked[0]
+    allowed_set = set(allowed)
+    if label not in allowed_set or score < min_score or note_contains_identity(label):
+        # Soft / unknown → no costume invent; Mayor plays Ten Questions instead.
+        return VisionResult(
+            label="",
+            score=float(score),
+            top3=top3,
+            note="",
+            person_count=person_count,
+            skip_reason="unsure",
+        )
+
+    labels_for_note = select_costume_labels(
+        ranked,
+        min_score=min_score,
+        max_labels=2,
+        person_count=person_count,
+    )
+    label = labels_for_note[0]
+    score = next(s for lab, s in ranked if lab == label)
 
     note = format_visual_note(labels_for_note, person_count=person_count)
     safe = safe_visual_note(note)
     if safe is None:
-        label = "homemade"
-        note = format_visual_note("homemade", person_count=person_count)
+        return VisionResult(
+            label="",
+            score=float(score),
+            top3=top3,
+            note="",
+            person_count=person_count,
+            skip_reason="unsure",
+        )
     return VisionResult(
         label=label,
         score=score,

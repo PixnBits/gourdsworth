@@ -32,6 +32,7 @@ from gourdsworth.metrics import TurnMetrics
 from gourdsworth.stt import SpeechToText
 from gourdsworth.tts import Speaker
 from gourdsworth.vision import (
+    VISION_BLIND_NOTE,
     PRIVACY_SIGN,
     VisionSidecar,
     format_top3,
@@ -514,7 +515,11 @@ def _handle_turn(
     line = ""
     t_post_stt = perf_counter()
     vis = take_ready(vis_future)
-    visual_note = vis.note if vis is not None and vis.ok else None
+    if vis is not None and vis.ok and vis.note:
+        visual_note = vis.note
+    else:
+        # No still / soft CLIP — ask, don't invent a costume.
+        visual_note = VISION_BLIND_NOTE
 
     if looks_debug_pass(user_text):
         # Secret porch diagnostics (Phineas and Ferb passcodes).
@@ -578,7 +583,7 @@ def _handle_turn(
             if done:
                 break
         metrics.llm_total_ms = (perf_counter() - t_llm0) * 1000
-        metrics.vision_used = bool(visual_note)
+        metrics.vision_used = bool(vis is not None and vis.ok and vis.note)
         raw = "".join(parts).strip()
         line, gesture = parse_reply(raw)
         if not line or model_went_dark(line):

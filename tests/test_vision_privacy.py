@@ -15,6 +15,7 @@ from gourdsworth.vision import (
     VisionSidecar,
     attach_visual_note,
     classify_costume,
+    VISION_BLIND_NOTE,
     format_visual_note,
     load_labels,
     missing_vision_deps,
@@ -67,20 +68,21 @@ def test_identity_words_in_notes_are_rejected():
     assert "girl" not in coerced[len(NOTE_PREFIX) :].lower()
 
 
-def test_unknown_or_low_score_defaults_homemade():
+def test_unknown_or_low_score_is_unsure_not_invented():
     def low(jpeg, labels):
         return [(lab, 0.02) for lab in labels]
 
     result = classify_costume(b"x", DEFAULT_LABELS, classify_fn=low, min_score=0.15)
-    assert result.label == "homemade"
-    assert "homemade" in result.note
-    assert not note_contains_identity(result.note)
+    assert result.skip_reason == "unsure"
+    assert not result.ok
+    assert not result.note
 
     def outsider(jpeg, labels):
         return [("secret identity", 0.99)]
 
     result2 = classify_costume(b"x", DEFAULT_LABELS, classify_fn=outsider)
-    assert result2.label == "homemade"
+    assert result2.skip_reason == "unsure"
+    assert not result2.ok
 
 
 def test_run_still_leaves_no_tempfiles(tmp_path, monkeypatch):
@@ -296,3 +298,8 @@ def test_per_person_unifies_count_and_costumes(monkeypatch):
     assert "hot dog costume" in result.note
     assert "bear costume" in result.note
     assert "about 2 citizens" in result.note
+
+
+def test_blind_note_steers_ten_questions():
+    assert "Ten Questions" in VISION_BLIND_NOTE
+    assert "do not invent" in VISION_BLIND_NOTE.lower() or "Do not invent" in VISION_BLIND_NOTE
