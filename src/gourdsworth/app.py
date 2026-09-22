@@ -20,6 +20,7 @@ from gourdsworth.net import (
 )
 from gourdsworth.guardrails import (
     looks_debug_pass,
+    match_backstory,
     early_speakable,
     looks_distress,
     looks_tease,
@@ -547,6 +548,10 @@ def _handle_turn(
         # Dry bureaucratic clapback — never roast the child (littles may be imitating).
         line = random.choice(canned["tease"])
         gesture = random.choice(["stamp", "bow", "think", "laugh"])
+        metrics.used_canned = True
+    elif (bk := match_backstory(user_text)) and canned.get("backstory", {}).get(bk):
+        line = random.choice(canned["backstory"][bk])
+        gesture = random.choice(["think", "bow", "laugh", "stamp"])
         metrics.used_canned = True
     elif not user_text:
         line = random.choice(canned["shy"])

@@ -301,3 +301,57 @@ def looks_debug_pass(text: str) -> bool:
             return True
     return False
 
+
+# Personal trivia about the Mayor — fixed lore, not costume talk.
+_BACKSTORY_KEYS = (
+    ("favorite_color", re.compile(
+        r"\b(favou?rite|fav)\s+colou?r\b|"
+        r"\bwhat colou?r (do you like|is your favou?rite|are you)\b|"
+        r"\byour favou?rite colou?r\b",
+        re.I,
+    )),
+    ("age", re.compile(
+        r"\bhow old (are you|is the mayor)\b|"
+        r"\bwhat('?s| is) your age\b|"
+        r"\bare you (old|ancient)\b",
+        re.I,
+    )),
+    ("what_are_you", re.compile(
+        r"\b(are you|what are you) (a )?(real )?(pumpkin|gourd|jack[- ]?o[- ]?lantern)\b|"
+        r"\bare you (real|alive|a robot|ai|an ai)\b|"
+        r"\bwhat are you\b",
+        re.I,
+    )),
+    ("food", re.compile(
+        r"\b(favou?rite|fav)\s+(food|snack|candy|treat)\b|"
+        r"\bdo you eat\b|"
+        r"\bwhat do you (eat|like to eat)\b",
+        re.I,
+    )),
+    ("pet", re.compile(
+        r"\b(do you have|got) (a )?(pet|pets|cat|dog)\b|"
+        r"\byour (pet|pets)\b",
+        re.I,
+    )),
+    ("job", re.compile(
+        r"\bwhat do you do\b|"
+        r"\b(are you|you('?re| are)) (the )?mayor\b|"
+        r"\bhow (did|do) you (become|get to be) mayor\b",
+        re.I,
+    )),
+    ("home", re.compile(
+        r"\bwhere (do you live|are you from)\b|"
+        r"\byour (home|hometown|town)\b",
+        re.I,
+    )),
+)
+
+
+def match_backstory(text: str) -> str | None:
+    """Return a backstory key if the visitor asked personal trivia about the Mayor."""
+    raw = text or ""
+    for key, rx in _BACKSTORY_KEYS:
+        if rx.search(raw):
+            return key
+    return None
+
