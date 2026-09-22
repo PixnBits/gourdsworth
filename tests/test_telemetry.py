@@ -124,3 +124,48 @@ def test_format_debug_spoken_costume_percent_words_sorted():
     assert "Top guesses: pirate twenty percent, robot sixteen percent, witch eleven percent." in line
     assert "0.20" not in line
     assert "zero point" not in line.lower()
+
+
+def test_format_debug_spoken_empty_walk_lists_top_guesses():
+    from gourdsworth.metrics import format_debug_spoken
+    from gourdsworth.vision import VisionResult, format_visual_note
+
+    # persons=0 → select_costume_labels returns homemade, but spoken must be honest.
+    vis = VisionResult(
+        label="homemade",
+        score=0.02,
+        top3=[("vampire", 0.18), ("ghost", 0.09), ("witch", 0.07)],
+        note=format_visual_note([("homemade", 0.02)], person_count=0),
+        person_count=0,
+    )
+    line = format_debug_spoken(vis=vis)
+    assert "Vision says the walk looks empty." in line
+    assert "Vision says homemade" not in line
+    assert (
+        "Top guesses: vampire eighteen percent, ghost nine percent, witch seven percent."
+        in line
+    )
+
+
+def test_format_debug_spoken_primary_follows_top3_not_stale_label():
+    from gourdsworth.metrics import format_debug_spoken
+    from gourdsworth.vision import VisionResult, format_visual_note
+
+    # Live porch contradiction: label/score homemade 0.02 vs top3 vampire 0.18.
+    vis = VisionResult(
+        label="homemade",
+        score=0.02,
+        top3=[("witch", 0.07), ("vampire", 0.18), ("ghost", 0.09)],
+        note=format_visual_note(
+            [("vampire", 0.18), ("ghost", 0.09), ("witch", 0.07)],
+            person_count=1,
+        ),
+        person_count=1,
+    )
+    line = format_debug_spoken(vis=vis)
+    assert "Vision says vampire at eighteen percent." in line
+    assert "Vision says homemade" not in line
+    assert (
+        "Top guesses: vampire eighteen percent, ghost nine percent, witch seven percent."
+        in line
+    )
