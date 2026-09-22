@@ -304,38 +304,25 @@ def remainder_after(full: str, spoken_prefix: str) -> str:
     return ""
 
 
-# Spoken unlock for porch diagnostics (Phineas and Ferb). Keep the list small.
+# Spoken unlock for porch diagnostics. Match only a complete normalized phrase;
+# character names and ordinary mentions inside longer sentences must not unlock it.
 _DEBUG_PASS = {
-    "perry",
-    "perry the platypus",
-    "agent p",
-    "agent perry",
-    "doofenshmirtz",
-    "heinz doofenshmirtz",
-    "candace",
-    "phineas",
-    "ferb",
-    "isabella",
-    "baljeet",
-    "buford",
-    "major monogram",
-    "dr doofenshmirtz",
+    "tri state area",
+    "price state area",
+    "try state area",
+    "tri stick area",
 }
 
 
 def looks_debug_pass(text: str) -> bool:
-    """True when the kid (or operator) says a secret character passcode."""
-    n = "".join(ch.lower() if ch.isalnum() or ch.isspace() else " " for ch in (text or ""))
-    n = " ".join(n.split())
-    if not n:
-        return False
-    if n in _DEBUG_PASS:
-        return True
-    # Allow "hey perry" / "code perry the platypus"
-    for phrase in _DEBUG_PASS:
-        if phrase in n:
-            return True
-    return False
+    """True only for the exact tri-state-area phrase or observed STT variants."""
+    normalized = "".join(
+        ch.lower() if ch.isalnum() or ch.isspace() else " " for ch in (text or "")
+    )
+    normalized = " ".join(normalized.split())
+    if normalized.startswith("the "):
+        normalized = normalized[4:]
+    return normalized in _DEBUG_PASS
 
 
 # Personal trivia about the Mayor — fixed lore, not costume talk.

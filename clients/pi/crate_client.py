@@ -38,6 +38,7 @@ try:
         UPLINK_FORMAT,
         UPLINK_RATE,
         CrateConnection,
+        parse_thermal_sysfs_temp,
     )
 except ImportError as exc:  # pragma: no cover
     raise SystemExit(
@@ -181,6 +182,66 @@ _CAMERA_LOCK = threading.Lock()  # one OpenCV open at a time
 _SNAP_BUSY = threading.Event()
 
 _LOG_FH = None
+
+# Porch CPU temp telemetry (Pi → desktop). Prefer sysfs; vcgencmd is optional.
+_TELEMETRY_INTERVAL_S = 15.0
+_THERMAL_SYSFS = Path("/sys/class/thermal/thermal_zone0/temp")
+
+
+def read_cpu_temp_c() -> float | None:
+    """Return SoC temperature in Celsius, or None if unavailable."""
+    try:
+        raw = _THERMAL_SYSFS.read_text(encoding="ascii")
+    except OSError:
+        raw = None
+    temp = parse_thermal_sysfs_temp(raw)
+    if temp is not None:
+        return temp
+    try:
+        import subprocess
+
+        out = subprocess.check_output(
+            ["vcgencmd", "measure_temp"],
+            text=True,
+            timeout=1.0,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        return None
+    # Typical: temp=47.8'C
+    try:
+        part = out.strip().split("=", 1)[1]
+        part = part.replace("'C", "").replace("C", "").strip()
+        val = float(part)
+    except (IndexError, ValueError):
+        return None
+    if val <= 0 or val > 200:
+        return None
+    return val
+
+
+def _send_telemetry(conn: CrateConnection) -> None:
+    temp = read_cpu_temp_c()
+    header: dict = {"event": "telemetry"}
+    if temp is not None:
+        header["cpu_temp_c"] = round(float(temp), 1)
+    try:
+        conn.send(header)
+    except (ConnectionError, OSError):
+        raise
+
+
+def _telemetry_loop(conn: CrateConnection, stop: threading.Event, interval_s: float = _TELEMETRY_INTERVAL_S) -> None:
+    """Send lightweight CPU temp after connect and every interval_s thereafter."""
+    while not stop.is_set() and not conn.closed:
+        try:
+            _send_telemetry(conn)
+        except (ConnectionError, OSError):
+            return
+        except Exception as exc:
+            print(f"  (telemetry skipped: {exc})")
+        if stop.wait(timeout=max(1.0, float(interval_s))):
+            return
 
 
 def _setup_log(path: str | None) -> None:
@@ -900,6 +961,13 @@ def main(argv: list[str] | None = None) -> int:
         if not ready.wait(timeout=20):
             print("No ready from desktop (is --serve-crate / --crate-echo running?)")
             return 1
+        telemetry = threading.Thread(
+            target=_telemetry_loop,
+            args=(conn, stop),
+            name="crate-telemetry",
+            daemon=True,
+        )
+        telemetry.start()
         still_adapt = _StillAdaptive(
             start_edge=int(args.max_edge),
             slow_ms=float(args.still_slow_ms),

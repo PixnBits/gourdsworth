@@ -47,6 +47,11 @@ class TurnMetrics:
             base = self.stt_ms + self.llm_ttft_ms + self.tts_first_ms
         return base + self.post_speech_silence_ms
 
+    @property
+    def first_syllable_ms(self) -> float:
+        """Alias for the porch-facing first-audio metric (see render())."""
+        return self.first_audio_from_silence_ms()
+
     def render(self) -> str:
         return (
             f"record={self.record_ms:.0f}ms  "
@@ -73,3 +78,71 @@ class TurnMetrics:
                 else ""
             )
         )
+
+
+@dataclass
+class SessionStats:
+    """Running porch-session stats for spoken diagnostics (crate desktop)."""
+
+    response_latencies_ms: list[float] = field(default_factory=list)
+
+    def note_completed_turn(self, metrics: TurnMetrics) -> None:
+        """Record a finished turn's first-syllable latency (skip zeros/failures)."""
+        ms = float(metrics.first_syllable_ms or 0.0)
+        if ms <= 0:
+            return
+        self.response_latencies_ms.append(ms)
+
+    def average_response(self) -> tuple[float, int] | None:
+        """Return (average_seconds, n_turns) or None if no samples yet."""
+        samples = self.response_latencies_ms
+        if not samples:
+            return None
+        avg_s = (sum(samples) / len(samples)) / 1000.0
+        return avg_s, len(samples)
+
+
+def format_debug_spoken(
+    *,
+    vis=None,
+    uplink_first_ms: float = 0.0,
+    telemetry: dict | None = None,
+    session_stats: SessionStats | None = None,
+) -> str:
+    """Build the spoken Agent P debug line (concise, porch-safe)."""
+    bits = ["Agent P debug channel open."]
+    if vis is not None and getattr(vis, "ok", False) and getattr(vis, "note", None):
+        bits.append(
+            f"Vision says {getattr(vis, 'label', None) or 'unknown'} "
+            f"at {float(getattr(vis, 'score', 0.0)):.2f}."
+        )
+        top3 = getattr(vis, "top3", None) or ()
+        if top3:
+            tops = ", ".join(f"{n} {s:.2f}" for n, s in list(top3)[:3])
+            bits.append(f"Top guesses: {tops}.")
+    elif vis is not None and getattr(vis, "skip_reason", None):
+        bits.append(f"Vision skipped: {vis.skip_reason}.")
+    else:
+        bits.append("No still ready yet.")
+
+    if uplink_first_ms:
+        bits.append(f"Uplink first {uplink_first_ms:.0f} milliseconds.")
+
+    temp_c = None
+    if telemetry:
+        raw = telemetry.get("cpu_temp_c")
+        if raw is not None:
+            try:
+                temp_c = float(raw)
+            except (TypeError, ValueError):
+                temp_c = None
+    if temp_c is not None:
+        bits.append(f"Pi temperature {int(round(temp_c))} degrees.")
+
+    avg = session_stats.average_response() if session_stats is not None else None
+    if avg is not None:
+        avg_s, n = avg
+        bits.append(f"Average response {avg_s:.1f} seconds across {n} turns.")
+
+    return " ".join(bits)
+
