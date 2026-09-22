@@ -12,7 +12,7 @@ def test_keeps_let_me_stamp():
 
 
 def test_keeps_stamp_applied_fallback():
-    assert sanitize_spoken("Stamp applied. Candy awaits.") == "Stamp applied. Candy awaits."
+    assert sanitize_spoken("Candy awaits, citizens.") == "Candy awaits, citizens."
 
 
 def test_strip_trailing_stamp_word():

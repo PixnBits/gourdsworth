@@ -148,7 +148,7 @@ _GESTURE_WORDS = frozenset({"stamp", "wave", "think", "laugh", "bow", "listen"})
 
 
 def finish_spoken(line: str) -> str:
-    """Avoid hanging mid-thought endings like '...License:'."""
+    """Avoid hanging mid-thought endings like '...Candy:'."""
     line = (line or "").strip()
     if not line:
         return line
@@ -161,7 +161,7 @@ def finish_spoken(line: str) -> str:
 def sanitize_spoken(line: str) -> str:
     """Strip leaked gesture *tags*, not English verbs like "stamp" / "wave".
 
-    Keep mid-sentence words ("I'll stamp your license"). Only drop:
+    Keep mid-sentence English verbs ("I'll cheer you on"). Only drop:
     - leading Gesture:/Wave:/Stamp: prefixes
     - a gesture word dangling after sentence-end punctuation
     - a lone ALL-CAPS gesture token, or a whole utterance that is just one
@@ -212,7 +212,7 @@ def parse_reply(raw: str) -> tuple[str, str]:
     line = finish_spoken(line)
     # If the model only emitted a gesture tag, don't speak "Wave: wave"
     if not line:
-        line = "Stamp applied. Candy awaits."
+        line = "Candy awaits, citizens."
     # Catch residual "Wave: wave" / "Gesture: stamp" left as spoken text
     only_gesture = re.fullmatch(
         r"(?:GESTURE|Gesture|gesture|Wave|WAVE)\s*:\s*([A-Za-z]+)\s*",
@@ -223,7 +223,7 @@ def parse_reply(raw: str) -> tuple[str, str]:
         name = only_gesture.group(1).strip().lower()
         if name in ALLOWED_GESTURES:
             gesture = name
-        line = "Stamp applied. Candy awaits."
+        line = "Candy awaits, citizens."
     return line, gesture
 
 
