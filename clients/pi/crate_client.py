@@ -177,6 +177,7 @@ class _StillAdaptive:
 # Cached after a silent probe — USB DACs often lie about default_samplerate
 # (e.g. claim 44100 but only accept 48000) and PortAudio spam stderr on each fail.
 _PLAY_RATE: int | None = None
+_CAPTURE_RATE: int | None = None
 _AUDIO_LOCK = threading.Lock()  # PortAudio: never rec+play concurrently
 _CAMERA_LOCK = threading.Lock()  # one OpenCV open at a time
 _SNAP_BUSY = threading.Event()
@@ -346,6 +347,71 @@ def _probe_play_rate() -> int | None:
     else:
         print("  (warning: could not probe a working playback sample rate)")
     return _PLAY_RATE
+
+
+def _probe_capture_rate() -> int | None:
+    """Find one sample rate the current input device accepts. Mute PortAudio noise."""
+    global _CAPTURE_RATE
+    if _CAPTURE_RATE is not None:
+        return _CAPTURE_RATE
+    try:
+        import sounddevice as sd
+    except ImportError:
+        return None
+
+    candidates: list[int] = []
+    try:
+        in_id = sd.default.device[0] if isinstance(sd.default.device, (list, tuple)) else sd.default.device
+        native = int(float(sd.query_devices(in_id).get("default_samplerate") or 0))
+    except Exception:
+        in_id = None
+        native = 0
+    # Prefer 48k first — CM108 USB PnP rejects 16 kHz even when advertised.
+    for r in (48000, 44100, native, UPLINK_RATE):
+        if r and int(r) not in candidates:
+            candidates.append(int(r))
+
+    devnull = open(os.devnull, "w")
+    old_err = os.dup(2)
+    try:
+        os.dup2(devnull.fileno(), 2)
+        for rate in candidates:
+            try:
+                kwargs = {"samplerate": rate, "channels": 1, "dtype": "int16"}
+                if in_id is not None:
+                    kwargs["device"] = in_id
+                sd.check_input_settings(**kwargs)
+                _CAPTURE_RATE = rate
+                break
+            except Exception:
+                continue
+    finally:
+        os.dup2(old_err, 2)
+        os.close(old_err)
+        devnull.close()
+
+    if _CAPTURE_RATE is not None:
+        print(f"  capture sample rate: {_CAPTURE_RATE} Hz (probed)")
+    else:
+        print("  (warning: could not probe a working capture sample rate)")
+    return _CAPTURE_RATE
+
+
+def _capture_chunk_samples(capture_rate: int) -> int:
+    if capture_rate <= 0:
+        return int(UPLINK_CHUNK_SAMPLES)
+    return max(1, int(round(float(UPLINK_CHUNK_SAMPLES) * float(capture_rate) / float(UPLINK_RATE))))
+
+
+def _i16_to_uplink(arr, capture_rate: int):
+    import numpy as np
+
+    if capture_rate == UPLINK_RATE:
+        return np.asarray(arr, dtype="<i2").reshape(-1)
+    f32 = np.asarray(arr, dtype=np.float32).reshape(-1) / 32768.0
+    f32, _ = _resample_f32(f32, capture_rate, UPLINK_RATE)
+    return np.clip(np.rint(f32 * 32768.0), -32768, 32767).astype("<i2")
+
 
 
 
@@ -520,6 +586,8 @@ def _stream_mic(
         "channels": 1,
         "format": UPLINK_FORMAT,
     }
+    capture_rate = _probe_capture_rate() or UPLINK_RATE
+    capture_n = _capture_chunk_samples(capture_rate)
     chunk_s = float(UPLINK_CHUNK_SAMPLES) / float(UPLINK_RATE)
     need_silent = max(1, int(silence_s / chunk_s))
     silent = 0
@@ -534,13 +602,13 @@ def _stream_mic(
             break
         with _AUDIO_LOCK:
             frame = sd.rec(
-                UPLINK_CHUNK_SAMPLES,
-                samplerate=UPLINK_RATE,
+                capture_n,
+                samplerate=capture_rate,
                 channels=1,
                 dtype="int16",
             )
             sd.wait()
-        arr = np.asarray(frame, dtype="<i2").reshape(-1)
+        arr = _i16_to_uplink(frame, capture_rate)
         if vad:
             peak = float(np.max(np.abs(arr.astype(np.float32)))) / 32768.0
             if peak >= energy:
@@ -668,6 +736,8 @@ def _always_on_uplink(
         "channels": 1,
         "format": UPLINK_FORMAT,
     }
+    capture_rate = _probe_capture_rate() or UPLINK_RATE
+    capture_n = _capture_chunk_samples(capture_rate)
     speech_hot = False
     cool = 0
     was_paused = False
@@ -717,8 +787,8 @@ def _always_on_uplink(
                 if pause_mic.is_set():
                     continue
                 frame = sd.rec(
-                    UPLINK_CHUNK_SAMPLES,
-                    samplerate=UPLINK_RATE,
+                    capture_n,
+                    samplerate=capture_rate,
                     channels=1,
                     dtype="int16",
                 )
@@ -727,7 +797,7 @@ def _always_on_uplink(
             print(f"  (mic error: {exc})")
             time.sleep(0.2)
             continue
-        arr = np.asarray(frame, dtype="<i2").reshape(-1)
+        arr = _i16_to_uplink(frame, capture_rate)
         peak = float(np.max(np.abs(arr.astype(np.float32)))) / 32768.0
 
         if peak >= energy:
@@ -868,7 +938,7 @@ def _list_audio_devices() -> None:
 
 def _apply_audio_devices(input_id: int | None, output_id: int | None) -> None:
     """Pin sounddevice defaults so BRIO mic + TRS speakers stick on the Pi."""
-    global _PLAY_RATE
+    global _PLAY_RATE, _CAPTURE_RATE
     try:
         import sounddevice as sd
     except ImportError:
@@ -884,7 +954,9 @@ def _apply_audio_devices(input_id: int | None, output_id: int | None) -> None:
     )
     print(f"  audio devices: input={sd.default.device[0]} output={sd.default.device[1]}")
     _PLAY_RATE = None  # device changed — re-probe
+    _CAPTURE_RATE = None
     _probe_play_rate()
+    _probe_capture_rate()
 
 
 def main(argv: list[str] | None = None) -> int:
