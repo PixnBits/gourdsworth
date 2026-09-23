@@ -14,6 +14,7 @@ keyboard Enter starts Talk; optional silence is sent if sounddevice is missing.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import os
 import select
 import socket
@@ -857,6 +858,32 @@ def _env_int(name: str) -> int | None:
     return int(raw)
 
 
+def _env_str(name: str) -> str | None:
+    import os
+
+    local = _load_local_env()
+    raw = os.environ.get(name) or local.get(name)
+    if raw is None:
+        return None
+    raw = str(raw).strip()
+    return raw or None
+
+
+def _import_audio_devices():
+    mod_path = Path(__file__).resolve().with_name("audio_devices.py")
+    spec = importlib.util.spec_from_file_location("crate_audio_devices", mod_path)
+    if spec is None or spec.loader is None:  # pragma: no cover
+        raise ImportError(f"Could not load {mod_path}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_ad = _import_audio_devices()
+match_sounddevice_index = _ad.match_sounddevice_index
+resolve_audio_device_ids = _ad.resolve_audio_device_ids
+
+
 def _list_audio_devices() -> None:
     import sounddevice as sd
 
@@ -867,7 +894,7 @@ def _list_audio_devices() -> None:
 
 
 def _apply_audio_devices(input_id: int | None, output_id: int | None) -> None:
-    """Pin sounddevice defaults so BRIO mic + TRS speakers stick on the Pi."""
+    """Pin sounddevice defaults so USB mic + PipeWire/JBL or TRS out stick on the Pi."""
     global _PLAY_RATE
     try:
         import sounddevice as sd
@@ -947,14 +974,24 @@ def main(argv: list[str] | None = None) -> int:
         type=int,
         default=_env_int("CRATE_INPUT"),
         metavar="N",
-        help="sounddevice input id (env CRATE_INPUT / local.env)",
+        help="sounddevice input id (env CRATE_INPUT / local.env); overrides name match",
     )
     parser.add_argument(
         "--output",
         type=int,
         default=_env_int("CRATE_OUTPUT"),
         metavar="N",
-        help="sounddevice output id (env CRATE_OUTPUT / local.env)",
+        help="sounddevice output id (env CRATE_OUTPUT / local.env); overrides name match",
+    )
+    parser.add_argument(
+        "--input-name",
+        default=_env_str("CRATE_INPUT_NAME"),
+        help="Input device name substring (env CRATE_INPUT_NAME / local.env)",
+    )
+    parser.add_argument(
+        "--output-name",
+        default=_env_str("CRATE_OUTPUT_NAME"),
+        help="Output device name substring (env CRATE_OUTPUT_NAME / local.env)",
     )
     args = parser.parse_args(argv)
     try:
@@ -966,7 +1003,17 @@ def main(argv: list[str] | None = None) -> int:
     if args.list_devices:
         _list_audio_devices()
         raise SystemExit(0)
-    _apply_audio_devices(args.input, args.output)
+    in_id, out_id = resolve_audio_device_ids(
+        args.input,
+        args.output,
+        input_name=args.input_name,
+        output_name=args.output_name,
+    )
+    if args.input is None and in_id is not None:
+        print(f"  resolved input device: {in_id}")
+    if args.output is None and out_id is not None:
+        print(f"  resolved output device: {out_id}")
+    _apply_audio_devices(in_id, out_id)
 
     print("Gourdsworth crate client — I/O only. No models on this machine.")
     print(f"  desktop {args.host}:{args.port}")
