@@ -102,6 +102,23 @@ PYTHONPATH=src python clients/pi/crate_client.py --list-devices
 
 Put the ids in `local.env` as `CRATE_INPUT=` / `CRATE_OUTPUT=` (gitignored), or pass `--input N --output N`.
 
+When ids are omitted, the client also matches by name:
+
+- **Input** — `CRATE_INPUT_NAME` / `--input-name`, else first device whose name contains `USB PnP`, `CM108`, or `C-Media` (CM108 dongle).
+- **Output** — `CRATE_OUTPUT_NAME` / `--output-name`, else first playback device named `default` or `pipewire` (PipeWire ALSA plugin). Explicit ints always win.
+
+### Bluetooth / JBL Charge (PipeWire default sink)
+
+Mayor TTS and disconnect WAVs go through PortAudio/`sounddevice`, which only sees ALSA. To reach the JBL (or any PipeWire default sink):
+
+1. Install the ALSA plugin (once): `sudo apt-get install -y pipewire-alsa`
+2. Confirm `--list-devices` shows `pipewire` and/or `default` (not only hw: CM108 / headphones / BRIO).
+3. Keep the mic on the USB CM108 card (`CRATE_INPUT=` that card, or leave unset for USB PnP name match).
+4. Point playback at PipeWire: `CRATE_OUTPUT=` the `default` (preferred) or `pipewire` index, **or** set `CRATE_OUTPUT_NAME=default` and leave `CRATE_OUTPUT` unset.
+5. Pair/connect the speaker (`bluetoothctl connect 00:1D:DF:EC:51:2F`) and set it as the PipeWire default sink (`wpctl status` / `wpctl set-default <sink-id>`). `pw-play` and crate TTS then both hit the JBL.
+
+Do **not** set `CRATE_OUTPUT` to the USB PnP output if you want Bluetooth — that stays on the dongle DAC. Night-of `usb_audio_watch.sh recover` may rewrite both `CRATE_INPUT` and `CRATE_OUTPUT` to the USB card index; after a recover, restore `CRATE_OUTPUT` / `CRATE_OUTPUT_NAME` to `default`/`pipewire` if Mayor should stay on the JBL.
+
 
 ## Continuous porch mode — mic always on except while Mayor speaks; stills fire on speech
 
