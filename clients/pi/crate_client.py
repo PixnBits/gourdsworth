@@ -784,7 +784,7 @@ def _always_on_uplink(
     camera_index: int,
     still: _StillAdaptive | None,
 ) -> None:
-    """Stream PCM forever except while pause_mic (SPEAKING). Snap still on speech start."""
+    """Stream PCM forever except while pause_mic (SPEAKING). Snap still on speech start and end."""
     try:
         import numpy as np
         import sounddevice as sd
@@ -807,6 +807,7 @@ def _always_on_uplink(
     def _snap_bg(tag: str, _still=still) -> None:
         if not camera or _still is None:
             return
+        # Skip if a snap is already in flight (start may still be busy when end fires — OK).
         if _SNAP_BUSY.is_set():
             return
 
@@ -862,6 +863,9 @@ def _always_on_uplink(
         peak = float(np.max(np.abs(arr.astype(np.float32)))) / 32768.0
 
         if peak >= energy:
+            if not speech_hot:
+                # Early snap so encode/CLIP can race the rest of the utterance.
+                _snap_bg("speech-start")
             speech_hot = True
             cool = 0
         elif speech_hot:
