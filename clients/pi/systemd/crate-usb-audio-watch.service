@@ -1,0 +1,14 @@
+[Unit]
+Description=Gourdsworth Pi USB audio one-shot health/recover
+After=sound.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/projects/gourdsworth
+# Do NOT set CRATE_USB_ALLOW_REBOOT here unless you intend auto-reboot on dead xHCI.
+Environment=CRATE_USB_ALLOW_REBOOT=0
+ExecStart=%h/projects/gourdsworth/clients/pi/usb_audio_watch.sh watch --once
+Nice=10
+
+[Install]
+WantedBy=default.target

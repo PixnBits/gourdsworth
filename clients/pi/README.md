@@ -147,3 +147,72 @@ Pre-rendered WAVs in `assets/shutdown/` play when the desktop drops or the clien
 If the desktop is not up yet (or goes away mid-porch), the client **keeps waiting** and
 plays a random `disconnect_*.wav` on the first miss, then about every 45s, until
 `--serve-crate` accepts the connection again. `goodbye_*.wav` is only for an explicit quit.
+
+
+## USB audio recovery (Halloween night)
+
+Night-of helper when the CM108 USB audio dongle (C-Media **0d8c:013c**, ALSA
+**USB PnP Sound Device**) vanishes after an xHCI host death
+(`xHCI host controller not responding` / `HC died` in dmesg). Soft `usbreset`
+is useless once the device is gone from `lsusb`; a PCI remove+rescan of
+`0000:01:00.0` may bring USB back **but can also reboot the Pi**. Cleanest
+remote recovery when the host controller is dead: `sudo reboot`.
+
+### Commands
+
+From the repo root on the Pi (`~/projects/gourdsworth`):
+
+```bash
+# Health snapshot (prefer VID:PID / ALSA name — not fragile sounddevice indices)
+./clients/pi/usb_audio_watch.sh check
+
+# Ordered recover: usbreset (if CM108 still listed) → xHCI unbind/bind →
+# PCI remove+rescan (may reboot) → sudo reboot (gated)
+./clients/pi/usb_audio_watch.sh recover --dry-run   # print plan only
+./clients/pi/usb_audio_watch.sh recover             # no auto-reboot unless allowed
+./clients/pi/usb_audio_watch.sh recover --allow-reboot
+
+# Cron / systemd-friendly one-shot (recover only if unhealthy; cooldown + reboot cap)
+./clients/pi/usb_audio_watch.sh watch --once
+```
+
+**Auto-reboot stays off** unless you pass `--allow-reboot` or set
+`CRATE_USB_ALLOW_REBOOT=1` in `clients/pi/local.env`.
+
+After a successful recover the script may rewrite only `CRATE_INPUT` /
+`CRATE_OUTPUT` in `local.env` to the current USB PnP card index, then restart
+`crate_client.py --continuous` if it was marked as running (will not start a
+second healthy client).
+
+### Night-of triage log (SSH)
+
+```bash
+tail -f ~/projects/gourdsworth/logs/usb-audio-watch.log
+```
+
+Every check/recover/watch iteration appends an ISO timestamp, ok/fail + why,
+VID:PID presence, ALSA summary, recovery actions, and reboot decisions.
+When unhealthy, a short dmesg tail is copied into the same log and a sibling
+`logs/usb-audio-dmesg-YYYYmmdd-HHMMSS.log`. The main log truncates around 2 MiB.
+
+### Enable the watch (optional — not required just to have the script)
+
+User systemd timer examples live in `clients/pi/systemd/` (not installed
+automatically):
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp clients/pi/systemd/crate-usb-audio-watch.* ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now crate-usb-audio-watch.timer
+systemctl --user status crate-usb-audio-watch.timer
+```
+
+Or cron every 2 minutes:
+
+```bash
+*/2 * * * * cd $HOME/projects/gourdsworth && ./clients/pi/usb_audio_watch.sh watch --once >> logs/usb-audio-watch.log 2>&1
+```
+
+Leave `CRATE_USB_ALLOW_REBOOT` unset/0 until you explicitly want dead-xHCI
+auto-reboot on the porch.

@@ -1,0 +1,12 @@
+[Unit]
+Description=Run USB audio watch every ~2 minutes (Halloween porch)
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+AccuracySec=30s
+Persistent=true
+Unit=crate-usb-audio-watch.service
+
+[Install]
+WantedBy=timers.target
