@@ -436,6 +436,79 @@ def _load_wav_f32(path: Path):
     return arr, int(rate)
 
 
+
+def _playback_backend() -> str:
+    """pw = PipeWire pw-play (stable on Bluetooth); sounddevice = PortAudio."""
+    raw = (os.environ.get("CRATE_PLAYBACK") or _load_local_env().get("CRATE_PLAYBACK") or "auto").strip().lower()
+    if raw in {"pw", "pipewire", "pw-play"}:
+        return "pw"
+    if raw in {"sd", "sounddevice", "portaudio"}:
+        return "sounddevice"
+    try:
+        import sounddevice as sd
+        out_id = sd.default.device[1] if isinstance(sd.default.device, (list, tuple)) else sd.default.device
+        name = str(sd.query_devices(out_id).get("name") or "").lower()
+        if "pipewire" in name or name.strip() == "default":
+            return "pw"
+    except Exception:
+        pass
+    return "sounddevice"
+
+
+def _play_pcm_f32(samples, rate: int) -> None:
+    """Play mono float32 PCM. Prefer pw-play for PipeWire/Bluetooth sinks."""
+    import numpy as np
+
+    samples = np.asarray(samples, dtype=np.float32).reshape(-1)
+    if samples.size == 0 or rate <= 0:
+        return
+    # Bluetooth A2DP often clips the first ~100ms — prime with short silence.
+    prime_ms = int(os.environ.get("CRATE_BT_PRIME_MS") or _load_local_env().get("CRATE_BT_PRIME_MS") or "180")
+    backend = _playback_backend()
+    if backend == "pw" and prime_ms > 0:
+        n_prime = max(1, int(rate * (prime_ms / 1000.0)))
+        samples = np.concatenate([np.zeros(n_prime, dtype=np.float32), samples])
+    if backend == "pw":
+        import subprocess
+        import tempfile
+        import wave
+
+        clipped = np.clip(samples, -1.0, 1.0)
+        pcm = np.clip(np.rint(clipped * 32767.0), -32768, 32767).astype("<i2")
+        fd, wav_path = tempfile.mkstemp(prefix="crate-play-", suffix=".wav")
+        os.close(fd)
+        try:
+            with wave.open(wav_path, "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(int(rate))
+                wf.writeframes(pcm.tobytes())
+            env = os.environ.copy()
+            env.setdefault("PIPEWIRE_LATENCY", "1024/48000")
+            with _AUDIO_LOCK:
+                subprocess.run(
+                    ["pw-play", wav_path],
+                    check=False,
+                    env=env,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+        finally:
+            try:
+                os.unlink(wav_path)
+            except OSError:
+                pass
+        return
+    import sounddevice as sd
+
+    with _AUDIO_LOCK:
+        try:
+            sd.play(samples, int(rate), blocking=True)
+        except TypeError:
+            sd.play(samples, int(rate))
+            sd.wait()
+
+
 def _play_local_shutdown(*, kind: str = "disconnect") -> None:
     """Play a canned Mayor line from disk — no desktop, no TTS on the Pi."""
     try:
@@ -462,13 +535,8 @@ def _play_local_shutdown(*, kind: str = "disconnect") -> None:
         play_rate = _probe_play_rate() or rate
         if play_rate != rate:
             samples, play_rate = _resample_f32(samples, rate, play_rate)
-        with _AUDIO_LOCK:
-            try:
-                sd.play(samples, play_rate, blocking=True)
-            except TypeError:
-                sd.play(samples, play_rate)
-                sd.wait()
-        print(f"  shutdown line: {path.name}")
+        _play_pcm_f32(samples, play_rate)
+        print(f"  shutdown line: {path.name}  playback={_playback_backend()}")
     except Exception as exc:
         print(f"  (shutdown wav failed: {exc})")
 
@@ -534,20 +602,13 @@ def _play_tts(header: dict, payload: bytes | None) -> None:
 
     duration = float(samples.size) / float(play_rate) if play_rate else 0.0
     # Play on this thread under the audio lock — never overlap sd.rec (double-free).
-    with _AUDIO_LOCK:
-        try:
-            sd.play(samples, play_rate, blocking=True)
-        except TypeError:
-            # Older sounddevice: no blocking kw
-            try:
-                sd.play(samples, play_rate)
-                sd.wait()
-            except Exception as exc:
-                print(f"  (playback failed: {exc})")
-        except Exception as exc:
-            print(f"  (playback failed: {exc})")
+    try:
+        _play_pcm_f32(samples, play_rate)
+    except Exception as exc:
+        print(f"  (playback failed: {exc})")
+        return
     del samples
-    _log(f"play done ({duration:.1f}s @ {play_rate} Hz)")
+    _log(f"play done ({duration:.1f}s @ {play_rate} Hz) backend={_playback_backend()}")
 
 
 def _send_silence(conn: CrateConnection, seconds: float = 0.8) -> None:
