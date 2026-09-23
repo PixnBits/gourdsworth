@@ -36,7 +36,7 @@ load_local_env() {
     source <(grep -E '^[A-Za-z_][A-Za-z0-9_]*=' "${LOCAL_ENV}" || true)
     set +a
   fi
-  [[ "${CRATE_USB_ALLOW_REBOOT:-0}" == "1" ]] && ALLOW_REBOOT=1
+  if [[ "${CRATE_USB_ALLOW_REBOOT:-0}" == "1" ]]; then ALLOW_REBOOT=1; fi
 }
 iso_now() { date -Iseconds; }
 rotate_log_if_needed() {
@@ -56,13 +56,13 @@ aplay_text() { cap aplay -l || true; }
 cm108_present() { grep -qiE "${CM108_VIDPID}|C-Media.*CM108|USB PnP Sound Device" <<<"$(lsusb_text)"; }
 alsa_has_usb_pnp() { grep -qiE "USB PnP Sound Device|USB Audio" <<<"$(arecord_text)"$'\n'"$(aplay_text)"; }
 xhci_looks_dead() {
+  # If CM108 is visible, host controller is not dead for our purposes.
+  if cm108_present; then return 1; fi
   local d; d="$(cap dmesg -T 2>/dev/null | tail -n 80 || true)"
-  grep -qiE 'xHCI host controller not responding|HC died|xhci_hcd.*cannot reset' <<<"$d" && return 0
+  if grep -qiE 'xHCI host controller not responding|HC died|xhci_hcd.*cannot reset' <<<"$d"; then return 0; fi
   [[ ! -e "/sys/bus/pci/devices/${XHCI_PCI}" ]] && return 0
-  if ! cm108_present; then
-    local n; n="$(grep -Eiv 'root hub|Linux Foundation .* root hub' <<<"$(lsusb_text)" | grep -c 'Bus' || true)"
-    [[ "${n}" -eq 0 ]] && return 0
-  fi
+  local n; n="$(grep -Eiv 'root hub|Linux Foundation .* root hub' <<<"$(lsusb_text)" | grep -c 'Bus' || true)"
+  [[ "${n}" -eq 0 ]] && return 0
   return 1
 }
 find_cm108_usb_bus_dev() {
@@ -88,14 +88,14 @@ summarize_health() {
   local usb cards vidpid_present=0 alsa_ok=0 why=()
   usb="$(lsusb_text | tr '\n' '|' | sed 's/|$//')"
   cards="$( { arecord_text; echo '---'; aplay_text; } | tr '\n' ';' )"
-  cm108_present && vidpid_present=1 || why+=("cm108_absent")
-  alsa_has_usb_pnp && alsa_ok=1 || why+=("alsa_usb_pnp_absent")
-  xhci_looks_dead && why+=("xhci_dead_or_empty")
+  if cm108_present; then vidpid_present=1; else why+=("cm108_absent"); fi
+  if alsa_has_usb_pnp; then alsa_ok=1; else why+=("alsa_usb_pnp_absent"); fi
+  if xhci_looks_dead; then why+=("xhci_dead_or_empty"); fi
   local status="ok"
   [[ "${vidpid_present}" -eq 1 && "${alsa_ok}" -eq 1 ]] || status="fail"
   [[ ${#why[@]} -eq 0 ]] && why+=("healthy")
   printf 'status=%s vidpid_present=%s alsa_usb_pnp=%s why=%s\n' \
-    "${status}" "${vidpid_present}" "${alsa_ok}" "$((IFS=,; echo "${why[*]}"))"
+    "${status}" "${vidpid_present}" "${alsa_ok}" "$(IFS=,; echo "${why[*]}")"
   printf 'lsusb_summary=%s\n' "${usb}"
   printf 'alsa_summary=%s\n' "${cards}"
 }
@@ -214,7 +214,7 @@ try_reboot() {
 health_ok() { local report; report="$(summarize_health)"; grep -q '^status=ok' <<<"${report}"; }
 cmd_recover() {
   load_local_env
-  crate_client_running && touch "${STATE_DIR}/crate_was_continuous"
+  if crate_client_running; then touch "${STATE_DIR}/crate_was_continuous"; fi
   local report; report="$(summarize_health)"
   log_line "recover_start ${report//$'\n'/ | } dry_run=${DRY_RUN} allow_reboot=${ALLOW_REBOOT}"
   if grep -q '^status=ok' <<<"${report}"; then
@@ -243,7 +243,7 @@ cmd_watch() {
   load_local_env
   log_line "watch_start once=${WATCH_ONCE} interval=${INTERVAL} allow_reboot=${ALLOW_REBOOT}"
   while true; do
-    crate_client_running && touch "${STATE_DIR}/crate_was_continuous"
+    if crate_client_running; then touch "${STATE_DIR}/crate_was_continuous"; fi
     if health_ok; then
       local report; report="$(summarize_health)"
       log_line "watch healthy ${report//$'\n'/ | }"
