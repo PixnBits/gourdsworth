@@ -7,6 +7,8 @@ on the LAN and are never written to disk.
 
 Degraded mode (no button, no camera, no mic) is the default dry path:
 keyboard Enter starts Talk; optional silence is sent if sounddevice is missing.
+SIGTERM and SIGHUP stop cleanly (audio streams and the camera are closed
+before exit). A nohup launch keeps SIGHUP ignored.
 
   PYTHONPATH=src python clients/pi/crate_client.py --host 127.0.0.1 --no-camera
 """
@@ -16,6 +18,7 @@ from __future__ import annotations
 import argparse
 import os
 import select
+import signal
 import socket
 import sys
 import random
@@ -70,6 +73,8 @@ def _grab_jpeg(
 
     Returns (jpeg_bytes, (width, height)) or (None, None).
     """
+    if _SHUTDOWN.is_set():
+        return None, None
     try:
         import cv2
     except ImportError:
@@ -87,6 +92,7 @@ def _grab_jpeg_unlocked(
     quality: int = 90,
 ) -> tuple[bytes | None, tuple[int, int] | None]:
     cap = cv2.VideoCapture(int(index))
+    _ACTIVE_CAPS.add(cap)
     frame = None
     try:
         if not cap.isOpened():
@@ -127,6 +133,7 @@ def _grab_jpeg_unlocked(
             return None, None
         return bytes(buf), (int(w), int(h))
     finally:
+        _ACTIVE_CAPS.discard(cap)
         cap.release()
         del frame
 
@@ -181,8 +188,136 @@ _CAPTURE_RATE: int | None = None
 _AUDIO_LOCK = threading.Lock()  # PortAudio: never rec+play concurrently
 _CAMERA_LOCK = threading.Lock()  # one OpenCV open at a time
 _SNAP_BUSY = threading.Event()
+_SHUTDOWN = threading.Event()
+_SHUTDOWN_SIGNAL: int | None = None
+_CLEANUP_LOCK = threading.Lock()
+_CLEANUP_DONE = False
+_ACTIVE_CAPS: set = set()  # live cv2.VideoCapture objects
+_PW_PLAY_PROC = None  # live pw-play Popen
 
 _LOG_FH = None
+
+
+class _ShutdownSignal(KeyboardInterrupt):
+    """SIGTERM/SIGHUP delivered as KeyboardInterrupt so existing handlers exit cleanly."""
+
+    def __init__(self, signum: int) -> None:
+        self.signum = int(signum)
+        super().__init__(self.signum)
+
+
+def _on_shutdown_signal(signum, frame) -> None:
+    """First signal raises; a second one force-closes devices and re-kills."""
+    global _SHUTDOWN_SIGNAL
+    if _SHUTDOWN.is_set():
+        try:
+            _cleanup_devices(force=True)
+        except Exception:
+            pass
+        signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+        return
+    _SHUTDOWN.set()
+    _SHUTDOWN_SIGNAL = int(signum)
+    try:
+        name = signal.Signals(int(signum)).name
+    except Exception:
+        name = str(signum)
+    try:
+        print(f"  caught {name} — shutting down (closing audio/camera)", flush=True)
+    except Exception:
+        pass
+    raise _ShutdownSignal(int(signum))
+
+
+def _install_signal_handlers() -> list[int]:
+    """Install SIGTERM, and SIGHUP unless nohup already set SIG_IGN. Main thread only."""
+    if threading.current_thread() is not threading.main_thread():
+        return []
+    installed: list[int] = []
+    signal.signal(signal.SIGTERM, _on_shutdown_signal)
+    installed.append(int(signal.SIGTERM))
+    # usb_audio_watch.sh starts the client under nohup, which ignores SIGHUP on purpose.
+    if signal.getsignal(signal.SIGHUP) is not signal.SIG_IGN:
+        signal.signal(signal.SIGHUP, _on_shutdown_signal)
+        installed.append(int(signal.SIGHUP))
+    return installed
+
+
+def _cleanup_devices(*, force: bool = False, camera_wait_s: float = 2.0) -> bool:
+    """Stop PortAudio, pw-play, and the camera. Idempotent; never raises.
+
+    Does not take ``_AUDIO_LOCK`` — the uplink thread may hold it inside ``sd.wait()``.
+    The camera lock, once acquired, is held so a snap cannot open a new device.
+    """
+    global _CLEANUP_DONE
+    if not _CLEANUP_LOCK.acquire(blocking=False):
+        return False
+    try:
+        if _CLEANUP_DONE:
+            return True
+        try:
+            import sounddevice as sd
+
+            sd.stop(ignore_errors=True)
+        except ImportError:
+            pass
+        except Exception:
+            pass
+        try:
+            proc = _PW_PLAY_PROC
+            if proc is not None and proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=1)
+                except Exception:
+                    pass
+                if proc.poll() is None:
+                    proc.kill()
+        except Exception:
+            pass
+        try:
+            got_lock = False
+            if not force:
+                got_lock = _CAMERA_LOCK.acquire(timeout=float(camera_wait_s))
+            if not got_lock:
+                for cap in list(_ACTIVE_CAPS):
+                    try:
+                        cap.release()
+                    except Exception:
+                        pass
+                _ACTIVE_CAPS.clear()
+            # got_lock: keep it. Opens happen under this lock, so nothing is live.
+        except Exception:
+            pass
+        _CLEANUP_DONE = True
+        try:
+            print("  devices released (audio streams stopped, camera closed)")
+        except Exception:
+            pass
+        return True
+    finally:
+        _CLEANUP_LOCK.release()
+
+
+def _reset_shutdown_state_for_tests() -> None:
+    """Reset signal-shutdown flags so unit tests do not leak into each other."""
+    global _SHUTDOWN_SIGNAL, _CLEANUP_DONE, _PW_PLAY_PROC
+    _SHUTDOWN.clear()
+    _SHUTDOWN_SIGNAL = None
+    _CLEANUP_DONE = False
+    _ACTIVE_CAPS.clear()
+    _PW_PLAY_PROC = None
+    if _CAMERA_LOCK.locked():
+        try:
+            _CAMERA_LOCK.release()
+        except RuntimeError:
+            pass
+    if _CLEANUP_LOCK.locked():
+        try:
+            _CLEANUP_LOCK.release()
+        except RuntimeError:
+            pass
 
 # Porch CPU temp telemetry (Pi → desktop). Prefer sysfs; vcgencmd is optional.
 _TELEMETRY_INTERVAL_S = 15.0
@@ -349,6 +484,29 @@ def _probe_play_rate() -> int | None:
     return _PLAY_RATE
 
 
+def _capture_rate_candidates(native: int, override: int | None = None) -> list[int]:
+    """Devices that are natively 16 kHz open at 16 kHz with no resample; everything else
+    (BRIO webcam mic = 48 kHz, CM108 = 48 kHz) opens at a native hardware rate and
+    ``_i16_to_uplink`` resamples to 16 kHz.
+    """
+    raw: list[int] = []
+    if override:
+        raw.append(int(override))
+    if int(native) == int(UPLINK_RATE):
+        raw.append(int(UPLINK_RATE))
+    raw.extend((48000, 44100, int(native) if native else 0, int(UPLINK_RATE)))
+    out: list[int] = []
+    for item in raw:
+        try:
+            rate = int(item)
+        except (TypeError, ValueError):
+            continue
+        if rate <= 0 or rate in out:
+            continue
+        out.append(rate)
+    return out
+
+
 def _probe_capture_rate() -> int | None:
     """Find one sample rate the current input device accepts. Mute PortAudio noise."""
     global _CAPTURE_RATE
@@ -359,17 +517,25 @@ def _probe_capture_rate() -> int | None:
     except ImportError:
         return None
 
-    candidates: list[int] = []
+    in_id = None
+    native = 0
+    dev_name = ""
     try:
-        in_id = sd.default.device[0] if isinstance(sd.default.device, (list, tuple)) else sd.default.device
-        native = int(float(sd.query_devices(in_id).get("default_samplerate") or 0))
+        dev = sd.default.device
+        in_id = dev[0] if isinstance(dev, (list, tuple)) else dev
+        info = sd.query_devices(in_id)
+        native = int(float(info.get("default_samplerate") or 0))
+        dev_name = str(info.get("name") or "")
     except Exception:
         in_id = None
         native = 0
-    # Prefer 48k first — CM108 USB PnP rejects 16 kHz even when advertised.
-    for r in (48000, 44100, native, UPLINK_RATE):
-        if r and int(r) not in candidates:
-            candidates.append(int(r))
+        dev_name = ""
+    try:
+        override = _env_int("CRATE_INPUT_RATE")
+    except (TypeError, ValueError):
+        print("  (warning: CRATE_INPUT_RATE is not an integer; ignoring)")
+        override = None
+    candidates = _capture_rate_candidates(native, override)
 
     devnull = open(os.devnull, "w")
     old_err = os.dup(2)
@@ -384,6 +550,11 @@ def _probe_capture_rate() -> int | None:
                 _CAPTURE_RATE = rate
                 break
             except Exception:
+                if override is not None and int(rate) == int(override):
+                    print(
+                        f"  (warning: CRATE_INPUT_RATE={int(override)} rejected "
+                        "by input device; trying other capture rates)"
+                    )
                 continue
     finally:
         os.dup2(old_err, 2)
@@ -391,7 +562,15 @@ def _probe_capture_rate() -> int | None:
         devnull.close()
 
     if _CAPTURE_RATE is not None:
-        print(f"  capture sample rate: {_CAPTURE_RATE} Hz (probed)")
+        if int(_CAPTURE_RATE) == int(UPLINK_RATE):
+            how = "no resample"
+        else:
+            how = f"resample → {UPLINK_RATE} uplink"
+        named = f"{dev_name}; " if dev_name else ""
+        print(
+            f"  capture sample rate: {_CAPTURE_RATE} Hz "
+            f"({named}device native {native}; {how})"
+        )
     else:
         print("  (warning: could not probe a working capture sample rate)")
     return _CAPTURE_RATE
@@ -457,6 +636,7 @@ def _playback_backend() -> str:
 
 def _play_pcm_f32(samples, rate: int) -> None:
     """Play mono float32 PCM. Prefer pw-play for PipeWire/Bluetooth sinks."""
+    global _PW_PLAY_PROC
     import numpy as np
 
     samples = np.asarray(samples, dtype=np.float32).reshape(-1)
@@ -486,13 +666,25 @@ def _play_pcm_f32(samples, rate: int) -> None:
             env = os.environ.copy()
             env.setdefault("PIPEWIRE_LATENCY", "1024/48000")
             with _AUDIO_LOCK:
-                subprocess.run(
+                # Popen (not run) so signal cleanup can terminate an in-flight pw-play.
+                proc = subprocess.Popen(
                     ["pw-play", wav_path],
-                    check=False,
                     env=env,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
+                _PW_PLAY_PROC = proc
+                try:
+                    proc.wait()
+                finally:
+                    if proc.poll() is None:  # interrupted (signal) — don't orphan it
+                        try:
+                            proc.terminate()
+                            proc.wait(timeout=1)
+                        except Exception:
+                            proc.kill()
+                    if _PW_PLAY_PROC is proc:
+                        _PW_PLAY_PROC = None
         finally:
             try:
                 os.unlink(wav_path)
@@ -511,6 +703,9 @@ def _play_pcm_f32(samples, rate: int) -> None:
 
 def _play_local_shutdown(*, kind: str = "disconnect") -> None:
     """Play a canned Mayor line from disk — no desktop, no TTS on the Pi."""
+    if _SHUTDOWN.is_set():
+        print("  (signal shutdown: skipping canned goodbye audio)")
+        return
     try:
         import numpy as np  # noqa: F401 — used via _load_wav_f32
         import sounddevice as sd
@@ -561,7 +756,7 @@ def _wait_for_desktop(
     play_fn = play or _play_local_shutdown
     next_announce = 0.0 if announce_immediately else (time.monotonic() + float(announce_every_s))
     printed_hint = False
-    while not quit_ev.is_set():
+    while not quit_ev.is_set() and not _SHUTDOWN.is_set():
         try:
             sock = socket.create_connection((host, port), timeout=connect_timeout_s)
             print(f"  connected to {host}:{port}")
@@ -656,7 +851,7 @@ def _stream_mic(
     t0 = time.monotonic()
     # Continuous VAD: wait for speech forever (until should_stop); only then
     # apply silence-end. One-shot Talk still caps at limit_s.
-    while not should_stop():
+    while not should_stop() and not _SHUTDOWN.is_set():
         if (not vad) and (time.monotonic() - t0 >= limit_s):
             break
         if vad and heard and (time.monotonic() - t0 >= limit_s):
@@ -762,7 +957,7 @@ def _pump(
 
 def _wait_trigger(gpio, stop: threading.Event) -> str:
     print("Enter = Talk" + (" (or hold the button)" if gpio is not None else "") + ", q = quit")
-    while not stop.is_set():
+    while not stop.is_set() and not _SHUTDOWN.is_set():
         if gpio is not None and gpio.is_pressed:
             return "gpio"
         if _stdin_ready(0.1):
@@ -834,7 +1029,7 @@ def _always_on_uplink(
 
         threading.Thread(target=_run, name="crate-still", daemon=True).start()
 
-    while not stop.is_set() and not conn.closed:
+    while not stop.is_set() and not conn.closed and not _SHUTDOWN.is_set():
         if pause_mic.is_set():
             # Mayor often answers before our quiet timer — snap on duck.
             if speech_hot and not was_paused:
@@ -1059,7 +1254,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--continuous",
         action="store_true",
-        help="Hands-free porch loop: after each reply, listen again (Ctrl+C / q to quit)",
+        help="Hands-free porch loop: after each reply, listen again (Ctrl+C / q to quit; SIGTERM/SIGHUP stop cleanly)",
     )
     parser.add_argument(
         "--max-edge",
@@ -1099,6 +1294,7 @@ def main(argv: list[str] | None = None) -> int:
     except Exception:
         pass
     _setup_log(args.log_file)
+    _install_signal_handlers()
 
     if args.list_devices:
         _list_audio_devices()
@@ -1126,6 +1322,7 @@ def main(argv: list[str] | None = None) -> int:
             daemon=True,
         )
         pump.start()
+        uplink: threading.Thread | None = None
         exit_kind = "disconnect"
         try:
             hello = {"event": "hello", "role": "crate", "proto": PROTO}
@@ -1178,7 +1375,12 @@ def main(argv: list[str] | None = None) -> int:
                     daemon=True,
                 )
                 uplink.start()
-                while not stop.is_set() and not conn.closed and not quit_ev.is_set():
+                while (
+                    not stop.is_set()
+                    and not conn.closed
+                    and not quit_ev.is_set()
+                    and not _SHUTDOWN.is_set()
+                ):
                     if _stdin_ready(0.25):
                         line = sys.stdin.readline()
                         if not line:
@@ -1247,11 +1449,27 @@ def main(argv: list[str] | None = None) -> int:
             return kind
         finally:
             stop.set()
+            pause_mic.set()
+            if _SHUTDOWN.is_set():
+                try:
+                    conn.send({"event": "bye"})
+                except Exception:
+                    pass
             try:
                 conn.send({"event": "button", "state": "up"})
             except Exception:
                 pass
             conn.close()
+            if uplink is not None and uplink.is_alive():
+                try:
+                    import sounddevice as sd
+
+                    sd.stop(ignore_errors=True)
+                except Exception:
+                    pass
+                uplink.join(timeout=1.5)
+            if _SHUTDOWN.is_set():
+                pump.join(timeout=1.0)
 
     try:
         announce_now = True
@@ -1284,8 +1502,16 @@ def main(argv: list[str] | None = None) -> int:
         quit_ev.set()
         _play_local_shutdown(kind="goodbye")
         print()
+    finally:
+        # Any exit path (Ctrl+C, SIGTERM/SIGHUP, desktop gone): close audio + camera.
+        _cleanup_devices()
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        # Signal/Ctrl+C before the connect loop (e.g. during the device probe).
+        _cleanup_devices()
+        raise SystemExit(0 if _SHUTDOWN.is_set() else 130)

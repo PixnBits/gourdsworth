@@ -2,8 +2,14 @@
 # Halloween-night USB audio recovery (CM108 0d8c:013c / USB PnP Sound Device).
 # Usage: usb_audio_watch.sh check|recover|watch [--dry-run] [--allow-reboot] [--once] [--interval SEC]
 # Auto-reboot only with --allow-reboot or CRATE_USB_ALLOW_REBOOT=1.
+# Exit 3 / USB_CONTROLLER_DEAD: xHCI host died or Pi 4 VL805 hub missing — reboot required.
 set -euo pipefail
 CM108_VIDPID="0d8c:013c"
+VL805_VIDPID="${CRATE_USB_HUB_VIDPID:-2109:3431}"
+DT_MODEL_FILE="${CRATE_USB_DT_MODEL_FILE:-/proc/device-tree/model}"
+BOOT_ID_FILE="${CRATE_USB_BOOT_ID_FILE:-/proc/sys/kernel/random/boot_id}"
+# Kernel lines that mean the host controller itself is dead (not a missing CM108).
+HC_DEAD_ERE='HC died|Host halt failed|xHCI host not responding to stop endpoint command|xHCI host controller not responding, assume dead'
 XHCI_PCI="0000:01:00.0"
 USBRESET_BIN="${USBRESET_BIN:-/usr/bin/usbreset}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -53,6 +59,76 @@ cap() { set +e; local o; o="$("$@" 2>&1)"; local rc=$?; set -e; printf '%s' "$o"
 lsusb_text() { cap lsusb || true; }
 arecord_text() { cap arecord -l || true; }
 aplay_text() { cap aplay -l || true; }
+# Full kernel log — do not tail. Rate-mismatch spam can scroll an "HC died" line
+# out of the last 80 lines while the controller stays dead.
+kernel_log_text() {
+  local d="" rc=0
+  set +e
+  d="$(dmesg -T 2>&1)"
+  rc=$?
+  if [[ "${rc}" -ne 0 || -z "${d}" ]]; then
+    d="$(journalctl -k -b --no-pager -q 2>&1)"
+  fi
+  set -e
+  printf '%s\n' "${d}"
+}
+current_boot_id() {
+  if [[ -r "${BOOT_ID_FILE}" ]]; then
+    tr -d '[:space:]\0' < "${BOOT_ID_FILE}"
+    return 0
+  fi
+  echo "unknown"
+}
+expect_vl805() {
+  # Empty CRATE_USB_HUB_VIDPID disables the Pi-4-only hub check.
+  [[ -n "${VL805_VIDPID}" ]] || return 1
+  [[ -f "${DT_MODEL_FILE}" ]] || return 1
+  local model
+  model="$(tr -d '\0' < "${DT_MODEL_FILE}" 2>/dev/null || true)"
+  [[ "${model}" == *"Raspberry Pi 4"* ]]
+}
+vl805_present() {
+  [[ -n "${VL805_VIDPID}" ]] || return 1
+  if grep -qiF -- "${VL805_VIDPID}" <<<"$(lsusb_text)"; then
+    return 0
+  fi
+  local sysfs="${CRATE_USB_SYSFS_DIR:-/sys/bus/usb/devices}"
+  [[ -d "${sysfs}" ]] || return 1
+  local want_vid want_pid d vid pid
+  want_vid="${VL805_VIDPID%%:*}"
+  want_pid="${VL805_VIDPID##*:}"
+  want_vid="${want_vid,,}"
+  want_pid="${want_pid,,}"
+  for d in "${sysfs}"/*; do
+    [[ -e "${d}" ]] || continue
+    [[ -f "${d}/idVendor" && -f "${d}/idProduct" ]] || continue
+    vid="$(tr -d '[:space:]' < "${d}/idVendor" 2>/dev/null || true)"
+    pid="$(tr -d '[:space:]' < "${d}/idProduct" 2>/dev/null || true)"
+    if [[ "${vid,,}" == "${want_vid}" && "${pid,,}" == "${want_pid}" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+# Echo comma-separated reasons and return 0 when the host controller is dead.
+usb_controller_dead() {
+  local log="" reasons=()
+  log="$(kernel_log_text)"
+  if grep -qiE "${HC_DEAD_ERE}" <<<"${log}"; then
+    reasons+=("hc_died")
+  fi
+  if expect_vl805; then
+    if ! vl805_present; then
+      reasons+=("vl805_hub_missing")
+    fi
+  fi
+  if [[ ${#reasons[@]} -eq 0 ]]; then
+    return 1
+  fi
+  local IFS=','
+  printf '%s\n' "${reasons[*]}"
+  return 0
+}
 cm108_present() { grep -qiE "${CM108_VIDPID}|C-Media.*CM108|USB PnP Sound Device" <<<"$(lsusb_text)"; }
 alsa_has_usb_pnp() { grep -qiE "USB PnP Sound Device|USB Audio" <<<"$(arecord_text)"$'\n'"$(aplay_text)"; }
 xhci_looks_dead() {
@@ -91,11 +167,25 @@ summarize_health() {
   if cm108_present; then vidpid_present=1; else why+=("cm108_absent"); fi
   if alsa_has_usb_pnp; then alsa_ok=1; else why+=("alsa_usb_pnp_absent"); fi
   if xhci_looks_dead; then why+=("xhci_dead_or_empty"); fi
+  local controller_dead=0 ctrl_why="" part
+  if ctrl_why="$(usb_controller_dead)"; then
+    controller_dead=1
+    why+=("controller_dead")
+    local parts=()
+    IFS=',' read -r -a parts <<<"${ctrl_why}"
+    for part in "${parts[@]}"; do
+      [[ -n "${part}" ]] && why+=("${part}")
+    done
+  fi
   local status="ok"
-  [[ "${vidpid_present}" -eq 1 && "${alsa_ok}" -eq 1 ]] || status="fail"
+  if [[ "${controller_dead}" -eq 1 ]]; then
+    status="controller_dead"
+  elif [[ "${vidpid_present}" -ne 1 || "${alsa_ok}" -ne 1 ]]; then
+    status="fail"
+  fi
   [[ ${#why[@]} -eq 0 ]] && why+=("healthy")
-  printf 'status=%s vidpid_present=%s alsa_usb_pnp=%s why=%s\n' \
-    "${status}" "${vidpid_present}" "${alsa_ok}" "$(IFS=,; echo "${why[*]}")"
+  printf 'status=%s vidpid_present=%s alsa_usb_pnp=%s controller_dead=%s why=%s\n' \
+    "${status}" "${vidpid_present}" "${alsa_ok}" "${controller_dead}" "$(IFS=,; echo "${why[*]}")"
   printf 'lsusb_summary=%s\n' "${usb}"
   printf 'alsa_summary=%s\n' "${cards}"
 }
@@ -107,7 +197,49 @@ cmd_check() {
     echo "OK: USB audio healthy (CM108 ${CM108_VIDPID} / USB PnP Sound Device)"
     echo "${report}"; return 0
   fi
+  if grep -q '^status=controller_dead' <<<"${report}"; then
+    local reasons=""
+    reasons="$(usb_controller_dead || true)"
+    note_controller_dead "${reasons}"
+    echo "FAIL: USB controller dead (xHCI HC died) — reboot required"
+    echo "${report}"
+    return 3
+  fi
   echo "FAIL: USB audio unhealthy"; echo "${report}"; return 1
+}
+controller_dead_noted_this_boot() {
+  local marker="${STATE_DIR}/controller_dead" id first
+  [[ -f "${marker}" ]] || return 1
+  id="$(current_boot_id)"
+  [[ -n "${id}" ]] || return 1
+  first="$(awk 'NR==1{print $1; exit}' "${marker}")"
+  [[ "${first}" == "${id}" ]]
+}
+# Log once per boot. A marker from a previous boot is replaced.
+note_controller_dead() {
+  local reasons="${1:-}"
+  local id marker first n=0 line log
+  id="$(current_boot_id)"
+  marker="${STATE_DIR}/controller_dead"
+  if [[ -f "${marker}" ]]; then
+    first="$(awk 'NR==1{print $1; exit}' "${marker}")"
+    if [[ "${first}" == "${id}" ]]; then
+      return 0
+    fi
+    rm -f "${marker}"
+  fi
+  printf '%s %s %s\n' "${id}" "$(iso_now)" "${reasons}" > "${marker}"
+  log_line "USB_CONTROLLER_DEAD reboot_required=1 why=${reasons} boot_id=${id} hint='xHCI host controller died; usbreset/xhci rebind cannot recover it — reboot the Pi'"
+  log="$(kernel_log_text)"
+  while IFS= read -r line; do
+    [[ -z "${line}" ]] && continue
+    if grep -qiE "${HC_DEAD_ERE}" <<<"${line}"; then
+      log_line "kernel| ${line}"
+      n=$((n + 1))
+      [[ "${n}" -ge 5 ]] && break
+    fi
+  done <<<"${log}"
+  capture_dmesg_snapshot
 }
 capture_dmesg_snapshot() {
   local stamp path; stamp="$(date +%Y%m%d-%H%M%S)"
@@ -215,6 +347,16 @@ health_ok() { local report; report="$(summarize_health)"; grep -q '^status=ok' <
 cmd_recover() {
   load_local_env
   if crate_client_running; then touch "${STATE_DIR}/crate_was_continuous"; fi
+  # A dead HC cannot be usbreset/rebind'd (probe fails -110). Reboot gate only.
+  local ctrl_reasons=""
+  if ctrl_reasons="$(usb_controller_dead)"; then
+    if controller_dead_noted_this_boot && [[ "${ALLOW_REBOOT}" -ne 1 ]]; then
+      return 3
+    fi
+    note_controller_dead "${ctrl_reasons}"
+    try_reboot && return 0
+    return 3
+  fi
   local report; report="$(summarize_health)"
   log_line "recover_start ${report//$'\n'/ | } dry_run=${DRY_RUN} allow_reboot=${ALLOW_REBOOT}"
   if grep -q '^status=ok' <<<"${report}"; then
@@ -247,6 +389,9 @@ cmd_watch() {
     if health_ok; then
       local report; report="$(summarize_health)"
       log_line "watch healthy ${report//$'\n'/ | }"
+    elif usb_controller_dead >/dev/null; then
+      # cmd_recover logs USB_CONTROLLER_DEAD once per boot; don't repeat every tick.
+      cmd_recover || true
     else
       log_line "watch unhealthy invoking_recover"; cmd_recover || true
     fi
