@@ -7,10 +7,19 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Optional
+from typing import Iterable, Optional
 
 CM108_VIDPID = "0d8c:013c"
 CM108_ALSA_NAME = "USB PnP Sound Device"
+VL805_HUB_VIDPID = "2109:3431"
+
+# xHCI gave up. usbreset / driver rebind cannot bring the bus back; reboot.
+_HC_DEAD_PATTERNS = (
+    re.compile(r"HC died", re.IGNORECASE),
+    re.compile(r"Host halt failed", re.IGNORECASE),
+    re.compile(r"xHCI host not responding to stop endpoint command", re.IGNORECASE),
+    re.compile(r"xHCI host controller not responding, assume dead", re.IGNORECASE),
+)
 
 
 @dataclass(frozen=True)
@@ -72,6 +81,65 @@ def evaluate_health(lsusb_text: str, arecord_text: str, aplay_text: str = "") ->
         vidpid_present=vid,
         alsa_usb_pnp=alsa,
         alsa_card_index=idx,
+        reasons=tuple(reasons),
+    )
+
+
+def kernel_log_hc_dead(kernel_log: str) -> tuple[str, ...]:
+    """Return stripped kernel lines that show a dead xHCI host controller."""
+    found: list[str] = []
+    for line in (kernel_log or "").splitlines():
+        stripped = line.strip()
+        if stripped and any(pat.search(stripped) for pat in _HC_DEAD_PATTERNS):
+            found.append(stripped)
+    return tuple(found)
+
+
+def vl805_hub_present(lsusb_text: str, sysfs_vidpids: Iterable[str] = ()) -> bool:
+    """True if the Pi 4 VL805 hub (2109:3431) is in lsusb text or sysfs vid:pid pairs."""
+    target = VL805_HUB_VIDPID.lower()
+    if target and target in (lsusb_text or "").lower():
+        return True
+    for raw in sysfs_vidpids:
+        token = str(raw).strip().lower().replace(" ", "")
+        if token == target:
+            return True
+    return False
+
+
+@dataclass(frozen=True)
+class ControllerSnapshot:
+    dead: bool
+    hc_died_lines: tuple[str, ...]
+    hub_missing: bool
+    reasons: tuple[str, ...]
+
+
+def evaluate_controller(
+    kernel_log: str,
+    lsusb_text: str,
+    *,
+    expect_vl805: bool,
+    sysfs_vidpids: Iterable[str] = (),
+) -> ControllerSnapshot:
+    """Dead if the kernel says the HC died, or a Pi 4's VL805 hub is missing.
+
+    ``hub_missing`` is only set when ``expect_vl805`` is true — other boards
+    have no VL805, so an absent hub is not a failure there.
+    """
+    lines = kernel_log_hc_dead(kernel_log)
+    hub_missing = bool(expect_vl805) and not vl805_hub_present(lsusb_text, sysfs_vidpids)
+    reasons: list[str] = []
+    if lines:
+        reasons.append("hc_died")
+    if hub_missing:
+        reasons.append("vl805_hub_missing")
+    if not reasons:
+        reasons.append("controller_ok")
+    return ControllerSnapshot(
+        dead=bool(lines) or hub_missing,
+        hc_died_lines=lines,
+        hub_missing=hub_missing,
         reasons=tuple(reasons),
     )
 

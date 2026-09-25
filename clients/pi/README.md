@@ -101,6 +101,7 @@ PYTHONPATH=src python clients/pi/crate_client.py --list-devices
 ```
 
 Put the ids in `local.env` as `CRATE_INPUT=` / `CRATE_OUTPUT=` (gitignored), or pass `--input N --output N`.
+Optional `CRATE_INPUT_RATE` (Hz) forces the capture rate; leave it unset for auto (a 16 kHz mic stays at 16 kHz, anything else opens at a hardware rate and is resampled to the 16 kHz uplink).
 
 
 ## Continuous porch mode — mic always on except while Mayor speaks; stills fire on speech
@@ -157,6 +158,11 @@ Night-of helper when the CM108 USB audio dongle (C-Media **0d8c:013c**, ALSA
 is useless once the device is gone from `lsusb`; a PCI remove+rescan of
 `0000:01:00.0` may bring USB back **but can also reboot the Pi**. Cleanest
 remote recovery when the host controller is dead: `sudo reboot`.
+
+`check` exit code **3**, or a log line `USB_CONTROLLER_DEAD`, means the xHCI
+host controller died (or a Pi 4's VL805 hub `2109:3431` is missing). usbreset
+and xHCI rebind cannot recover that — reboot the Pi. The watch still will not
+reboot unless `--allow-reboot` / `CRATE_USB_ALLOW_REBOOT=1`.
 
 ### Commands
 
