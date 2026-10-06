@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import re
 
+from gourdsworth.net import ALLOWED_GESTURES, DEFAULT_GESTURE
+
 BANNED = re.compile(
     r"\b("
     r"kill|murder|blood|gore|guts|stab|gun|knife|bomb|"
@@ -61,17 +63,16 @@ def strip_markdown(text: str) -> str:
     return " ".join(text.split())
 
 
-# Model sometimes emits "GESTURE: wave", "Gesture: wave", or even "Wave: wave".
+# Model sometimes emits "GESTURE: tip", "Gesture: tip", or even "Tip: tip".
 GESTURE_RE = re.compile(
-    r"(?:^|\s)(?:GESTURE|Gesture|gesture|Wave|WAVE)\s*:\s*([A-Za-z]+)\b",
+    r"(?:^|\s)(?:GESTURE|Gesture|gesture|Tip|Beam|Reckon|Chuckle|Attend|Wave|WAVE)\s*:\s*([A-Za-z]+)\b",
     re.I | re.M,
 )
-ALLOWED_GESTURES = frozenset({"stamp", "wave", "think", "laugh", "bow", "listen"})
 
 
 def _extract_gesture(raw: str) -> tuple[str, str]:
-    """Return (text_without_gesture, gesture_name). Default gesture is stamp."""
-    gesture = "stamp"
+    """Return (text_without_gesture, gesture_name). Unknown names become the default."""
+    gesture = DEFAULT_GESTURE
     matches = list(GESTURE_RE.finditer(raw or ""))
     if matches:
         name = matches[-1].group(1).strip().lower()
@@ -143,7 +144,12 @@ def clip_spoken(line: str, max_words: int = 20) -> str:
 
 
 
-_GESTURE_WORDS = frozenset({"stamp", "wave", "think", "laugh", "bow", "listen"})
+_GESTURE_WORDS = frozenset(
+    {
+        "stamp", "wave", "think", "laugh", "bow", "listen",
+        "tip", "beam", "reckon", "chuckle", "attend",
+    }
+)
 
 
 
@@ -196,8 +202,8 @@ def scrub_relationship_words(line: str) -> str:
 def sanitize_spoken(line: str) -> str:
     """Strip leaked gesture *tags*, not English verbs like "stamp" / "wave".
 
-    Keep mid-sentence English verbs ("I'll cheer you on"). Only drop:
-    - leading Gesture:/Wave:/Stamp: prefixes
+    Keep mid-sentence English ("I'll stamp that", "attend the bowl"). Only drop:
+    - leading Gesture:/Tip:/Wave: prefixes
     - a gesture word dangling after sentence-end punctuation
     - a lone ALL-CAPS gesture token, or a whole utterance that is just one
     """
@@ -205,14 +211,14 @@ def sanitize_spoken(line: str) -> str:
     if not line:
         return line
     line = re.sub(
-        r"^(?:GESTURE|Gesture|Wave|Stamp|Think|Laugh|Bow|Listen)\s*[:.]\s*",
+        r"^(?:GESTURE|Gesture|Wave|Stamp|Think|Laugh|Bow|Listen|Tip|Beam|Reckon|Chuckle|Attend)\s*[:.]\s*",
         "",
         line,
         flags=re.I,
     ).strip()
-    # "...for you. stamp" / "...candy. Wave" — leaked tag after a sentence
+    # "...for you. stamp" / "...candy. Tip" — leaked tag after a sentence
     line = re.sub(
-        r"(?<=[.!?])\s+(?:stamp|wave|think|laugh|bow|listen)\s*[.!?]?\s*$",
+        r"(?<=[.!?])\s+(?:stamp|wave|think|laugh|bow|listen|tip|beam|reckon|chuckle|attend)\s*[.!?]?\s*$",
         "",
         line,
         flags=re.I,
@@ -246,12 +252,12 @@ def parse_reply(raw: str) -> tuple[str, str]:
     line = clip_spoken(line, max_words=20)
     line = sanitize_spoken(line)
     line = finish_spoken(line)
-    # If the model only emitted a gesture tag, don't speak "Wave: wave"
+    # If the model only emitted a gesture tag, don't speak "Tip: tip"
     if not line:
         line = "Candy awaits, citizens."
-    # Catch residual "Wave: wave" / "Gesture: stamp" left as spoken text
+    # Catch residual "Tip: tip" / "Gesture: beam" left as spoken text
     only_gesture = re.fullmatch(
-        r"(?:GESTURE|Gesture|gesture|Wave|WAVE)\s*:\s*([A-Za-z]+)\s*",
+        r"(?:GESTURE|Gesture|gesture|Wave|WAVE|Tip|Beam|Reckon|Chuckle|Attend)\s*:\s*([A-Za-z]+)\s*",
         line,
         flags=re.I,
     )

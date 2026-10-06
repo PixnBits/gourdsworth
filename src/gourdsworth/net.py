@@ -44,7 +44,7 @@ Control JSON (no payload)
     {"event":"button","state":"down"|"up"}
     {"event":"still"}                 # optional hint; JPEG may follow
     {"event":"listen"|"thinking"|"speaking"|"ready"}
-    {"event":"gesture","name":"stamp"|"wave"|"think"|"laugh"|"bow"|"listen"}
+    {"event":"gesture","name":"tip"|"beam"|"reckon"|"chuckle"|"attend"}
     {"event":"play_done"}
     {"event":"bye"}
     {"event":"error","message":"..."}
@@ -84,7 +84,8 @@ UPLINK_CHUNK_SAMPLES = UPLINK_RATE * UPLINK_CHUNK_MS // 1000  # 1600
 UPLINK_CHUNK_BYTES = UPLINK_CHUNK_SAMPLES * 2  # 3200
 
 DOWNLINK_FORMAT = "f32le"
-ALLOWED_GESTURES = frozenset({"stamp", "wave", "think", "laugh", "bow", "listen"})
+ALLOWED_GESTURES = frozenset({"tip", "beam", "reckon", "chuckle", "attend"})
+DEFAULT_GESTURE = "tip"
 
 MAX_LINE = 16 * 1024
 MAX_PAYLOAD = 2 * 1024 * 1024
@@ -650,7 +651,7 @@ class CrateListener:
             pass
 
 
-def run_echo_session(conn: CrateConnection, *, gesture: str = "stamp") -> None:
+def run_echo_session(conn: CrateConnection, *, gesture: str = "tip") -> None:
     """Protocol smoke: hello, then Talk → echo PCM as play + a gesture.
 
     Stays on the connection until the client drops. Does not run STT/LLM/TTS.
@@ -658,7 +659,7 @@ def run_echo_session(conn: CrateConnection, *, gesture: str = "stamp") -> None:
     """
     conn.send({"event": "hello", "role": "desktop", "proto": PROTO})
     conn.send({"event": "ready"})
-    name = gesture if gesture in ALLOWED_GESTURES else "stamp"
+    name = gesture if gesture in ALLOWED_GESTURES else DEFAULT_GESTURE
     while not conn.closed:
         if not conn.wait_button("down", timeout=0.5):
             continue

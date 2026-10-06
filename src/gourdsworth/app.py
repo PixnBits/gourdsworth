@@ -11,6 +11,7 @@ from time import perf_counter
 from gourdsworth.audio_io import list_devices, play, record_ptt, record_vad, set_devices
 from gourdsworth.config import canned_path, load_config, prompt_path
 from gourdsworth.net import (
+    DEFAULT_GESTURE,
     DEFAULT_HOST,
     DEFAULT_PORT,
     CrateListener,
@@ -513,7 +514,7 @@ def _handle_turn(
             return float(play_fn(samples, rate) or 0.0)
         return play(samples, rate, cfg.get("_output_device"))
 
-    gesture = "stamp"
+    gesture = DEFAULT_GESTURE
     line = ""
     t_post_stt = perf_counter()
     vis = take_ready(vis_future)
@@ -531,25 +532,25 @@ def _handle_turn(
             telemetry=latest_telemetry,
             session_stats=session_stats,
         )
-        gesture = "think"
+        gesture = "reckon"
         metrics.used_canned = True
         metrics.vision_used = bool(vis is not None and vis.ok and vis.note)
     elif looks_distress(user_text):
         line = canned["distress"][0]
-        gesture = "listen"
+        gesture = "attend"
         metrics.used_canned = True
     elif looks_tease(user_text) and canned.get("tease"):
         # Dry bureaucratic clapback — never roast the child (littles may be imitating).
         line = random.choice(canned["tease"])
-        gesture = random.choice(["stamp", "bow", "think", "laugh"])
+        gesture = random.choice(["tip", "beam", "reckon", "chuckle"])
         metrics.used_canned = True
     elif (bk := match_backstory(user_text)) and canned.get("backstory", {}).get(bk):
         line = random.choice(canned["backstory"][bk])
-        gesture = random.choice(["think", "bow", "laugh", "stamp"])
+        gesture = random.choice(["reckon", "tip", "chuckle", "beam"])
         metrics.used_canned = True
     elif not user_text:
         line = random.choice(canned["shy"])
-        gesture = "stamp"
+        gesture = DEFAULT_GESTURE
         metrics.used_canned = True
     else:
         # M1: stream tokens; start TTS on first sentence or 12 words — do not wait for full reply
@@ -587,7 +588,7 @@ def _handle_turn(
         line, gesture = parse_reply(raw)
         if not line or model_went_dark(line):
             line = random.choice(canned["fallback"])
-            gesture = "stamp"
+            gesture = DEFAULT_GESTURE
             metrics.used_canned = True
             early = None  # speak full canned below
         elif early:

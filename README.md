@@ -113,7 +113,7 @@ crate:
 python -m gourdsworth --crate-echo
 # other terminal, same machine:
 PYTHONPATH=src python clients/pi/crate_client.py --host 127.0.0.1 --no-camera --no-mic
-# Enter = Talk (sends silence). You should see GESTURE: stamp and a play round-trip.
+# Enter = Talk (sends silence). You should see GESTURE: tip and a play round-trip.
 ```
 
 Unit tests cover framing with an in-process loopback client (`pytest tests/test_net_framing.py`) — no hardware.
@@ -126,13 +126,13 @@ PYTHONPATH=src python clients/pi/crate_client.py --host 192.168.x.desktop --no-c
 PYTHONPATH=src python clients/pi/crate_client.py --host 192.168.x.desktop --button-pin 17
 ```
 
-Uplink is 16 kHz mono signed 16-bit little-endian, 100 ms chunks (3200 bytes). Downlink is Piper float32 little-endian at the voice's native rate. JPEG is one length-prefixed still per Talk. Control is JSON lines: `{"event":"button","state":"down"}`, `{"event":"gesture","name":"stamp"}`.
+Uplink is 16 kHz mono signed 16-bit little-endian, 100 ms chunks (3200 bytes). Downlink is Piper float32 little-endian at the voice's native rate. JPEG is one length-prefixed still per Talk. Control is JSON lines: `{"event":"button","state":"down"}`, `{"event":"gesture","name":"tip"}`.
 
 ## Hardware
 
 Face, power, and pins live in [`hardware/`](hardware/README.md): [BOM](hardware/BOM.md) and [wiring diagram](hardware/wiring.svg).
 
-Jaw = RMS of the outgoing samples. Body = six canned gestures the model *names* (`GESTURE` JSON to the Pi; the ESP32 turns a name into a PCA9685 pulse). Do not generate servo trajectories on the desktop. See `ARCHITECTURE.md`.
+Jaw = RMS of the outgoing samples, sent as a viseme id. The face plays five canned gestures the model *names* (`tip`, `beam`, `reckon`, `chuckle`, `attend`). The Pi forwards that name over UART; the ESP32 turns it into a PCA9685 pulse and clocks the LEDs. Do not generate servo trajectories on the desktop. See `ARCHITECTURE.md` and `firmware/esp32/README.md`.
 
 ## Mayor voice
 

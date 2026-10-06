@@ -2,5 +2,6 @@
 numpy>=1.24
 sounddevice>=0.5.1
 opencv-python-headless>=4.8  # JPEG stills (USB webcam)
+pyserial>=3.5  # UART to the ESP32 face; the Pi does not drive LEDs or servos
 # optional Talk button
 # gpiozero

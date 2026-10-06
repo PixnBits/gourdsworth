@@ -20,7 +20,7 @@ JSON lines + length-prefixed binary (`n` then raw bytes). See
 | Pi → desktop | JPEG still, one frame on Talk |
 | Pi → desktop | `{"event":"button","state":"down"\|"up"}` |
 | desktop → Pi | TTS **f32le** (`{"event":"play","rate":…,"format":"f32le"}` + samples) |
-| desktop → Pi | `{"event":"gesture","name":"stamp"\|"wave"\|…}` (print now; jaw/LED later) |
+| desktop → Pi | `{"event":"gesture","name":"tip"\|"beam"\|"reckon"\|"chuckle"\|"attend"}` |
 
 ## Raspberry Pi OS deps
 
@@ -79,8 +79,30 @@ On a real Pi on the porch LAN:
 PYTHONPATH=src python clients/pi/crate_client.py --button-pin 17   # host from local.env
 ```
 
-Enter starts Talk; Enter again stops (or release the GPIO button). Received
-`GESTURE:` names are printed — servo / LED wiring is later.
+Enter starts Talk; Enter again stops (or release the GPIO button). A
+`GESTURE` event is printed and, when `--face-port` / `CRATE_FACE_PORT` is
+set, forwarded to the ESP32. The Pi does not pulse servos or clock LEDs.
+
+## Face UART
+
+`clients/pi/face_link.py` turns the gesture event and the RMS of the playback
+buffer into newline-terminated JSON for the ESP32 on the Pi's UART (GPIO 14
+TX / 15 RX, 115200 8N1, `/dev/serial0`). Commands are `viseme` (id
+`rest|aa|ee|oh|mbp` plus `rms` 0–1 at about 30 Hz), `gesture`
+(`tip`, `beam`, `reckon`, `chuckle`, `attend`), `idle` when playback ends,
+and `ping`. Old names `stamp`, `wave`, `think`, `laugh`, `bow`, and `listen`
+are ignored and do not stall the mouth.
+
+```bash
+PYTHONPATH=src python clients/pi/crate_client.py --face-dry-run
+PYTHONPATH=src python clients/pi/crate_client.py --face-port /dev/serial0 --host 127.0.0.1 --no-camera
+```
+
+`--face-dry-run` prints the UART lines for one gesture and a short PCM block
+and does not open a serial port. Free `/dev/serial0` from the login shell
+before a real run (hardware UART on, serial console off). Confirm the ESP32
+with `{"op":"ping"}` → `{"op":"pong"}` as in `firmware/esp32/README.md`.
+
 
 ## Degraded mode
 
@@ -91,7 +113,8 @@ Enter starts Talk; Enter again stops (or release the GPIO button). Received
 | No GPIO / no `--button-pin` | Enter on the keyboard |
 | No speakers / no sounddevice | Prints that TTS bytes were dropped |
 
-Jaw RMS, PIR presence, and on-Pi inference are out of scope.
+PIR presence and on-Pi inference are out of scope. Mouth level is the RMS of
+downlink PCM, sent as a viseme id — the ESP32 draws the frame.
 
 
 ## Audio device pick

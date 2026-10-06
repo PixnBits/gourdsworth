@@ -30,3 +30,7 @@ clients/pi/.host
 *.local.yaml
 # Local porch run logs (pulled by coordinator; not committed)
 logs/
+
+# PlatformIO build tree
+firmware/esp32/.pio/
+

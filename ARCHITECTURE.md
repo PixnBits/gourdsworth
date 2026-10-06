@@ -29,7 +29,7 @@ USB cam ──JPEG on Talk/still────────► vision sidecar (opti
 speakers ◄──f32le / s16le chunks───── Piper TTS
 button   ──JSON event lines─────────► Talk / listen
 jaw/LED  ◄──GESTURE JSON───────────── parse_reply gesture tags
-          (print now; servos later)
+          Pi UART → ESP32 servos + LEDs
 ```
 
 Default bind is `127.0.0.1:8746`. A LAN bind (`0.0.0.0` or a LAN IP) requires
@@ -78,7 +78,7 @@ Crate Talk    ──► same thread, but JPEG arrived over LAN (desktop camera u
 
 ## What is deliberately missing in 0.1 / Phase 2
 
-- Servo / LED trajectories (jaw follows PCM RMS later; crate only prints `GESTURE`)
+- Servo trajectories from the desktop or the Pi (the ESP32 owns the PCA9685 and the WS2812 clocks; the Pi forwards a gesture name and viseme RMS)
 - PIR presence loop
 - On-Pi inference (Hailo / Whisper / Ollama)
 - Moonshine streaming STT (swap-in later; faster-whisper is the known-good AMD path)

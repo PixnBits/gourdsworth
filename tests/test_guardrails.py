@@ -13,35 +13,35 @@ def test_dark_output_caught():
 
 def test_parse_truncates_and_reads_gesture():
     line, gesture = parse_reply(
-        "By the power of this porch you are licensed to collect many many many many many sweets tonight my dear.\nGESTURE: stamp"
+        "By the power of this porch you are licensed to collect many many many many many sweets tonight my dear.\nGESTURE: tip"
     )
-    assert gesture == "stamp"
+    assert gesture == "tip"
     assert len(line.split()) <= 20
     assert "GESTURE" not in line.upper()
 
 
-def test_parse_inline_gesture_wave():
+def test_parse_inline_gesture_beam():
     line, gesture = parse_reply(
-        "You're a vision of sugary specterhood. GESTURE: wave"
+        "You're a vision of sugary specterhood. GESTURE: beam"
     )
-    assert gesture == "wave"
+    assert gesture == "beam"
     assert "GESTURE" not in line.upper()
-    assert "wave" not in line.lower() or "vision" in line.lower()
+    assert "beam" not in line.lower()
     assert line.startswith("You're a vision")
 
 
-def test_parse_inline_gesture_same_line_stamp():
+def test_parse_inline_gesture_same_line_tip():
     line, gesture = parse_reply(
-        "Your costume is a marvel. Candy awaits. GESTURE: stamp"
+        "Your costume is a marvel. Candy awaits. GESTURE: tip"
     )
-    assert gesture == "stamp"
+    assert gesture == "tip"
     assert "GESTURE" not in line.upper()
     assert "candy" in line.lower() or "marvel" in line.lower()
 
 
-def test_parse_unknown_gesture_defaults_stamp():
+def test_parse_unknown_gesture_defaults_tip():
     line, gesture = parse_reply("Hello citizens. GESTURE: moonwalk")
-    assert gesture == "stamp"
+    assert gesture == "tip"
     assert "GESTURE" not in line.upper()
     assert "moonwalk" not in line.lower()
 
@@ -74,12 +74,13 @@ def test_clip_drops_dangling_where():
 
 def test_parse_wave_colon_leak():
     line, gesture = parse_reply("Wave: wave")
-    assert gesture == "wave"
-    assert "wave: wave" not in line.lower()
+    assert gesture == "tip"
+    assert "wave" not in line.lower()
     assert line  # some spoken fallback
 
 
 def test_parse_gesture_only_line():
-    line, gesture = parse_reply("GESTURE: bow")
-    assert gesture == "bow"
+    line, gesture = parse_reply("GESTURE: chuckle")
+    assert gesture == "chuckle"
     assert "gesture" not in line.lower()
+    assert "chuckle" not in line.lower()
