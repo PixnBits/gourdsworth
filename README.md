@@ -128,10 +128,11 @@ PYTHONPATH=src python clients/pi/crate_client.py --host 192.168.x.desktop --butt
 
 Uplink is 16 kHz mono signed 16-bit little-endian, 100 ms chunks (3200 bytes). Downlink is Piper float32 little-endian at the voice's native rate. JPEG is one length-prefixed still per Talk. Control is JSON lines: `{"event":"button","state":"down"}`, `{"event":"gesture","name":"stamp"}`.
 
-## Hardware later
+## Hardware
 
-Jaw = RMS of the outgoing samples. Body = six canned gestures the model *names* (`GESTURE` JSON to the Pi; print now, servos later). Do not generate servo trajectories. See `ARCHITECTURE.md`.
+Face, power, and pins live in [`hardware/`](hardware/README.md): [BOM](hardware/BOM.md) and [wiring diagram](hardware/wiring.svg).
 
+Jaw = RMS of the outgoing samples. Body = six canned gestures the model *names* (`GESTURE` JSON to the Pi; the ESP32 turns a name into a PCA9685 pulse). Do not generate servo trajectories on the desktop. See `ARCHITECTURE.md`.
 
 ## Mayor voice
 
@@ -149,13 +150,11 @@ Measured on Framework Desktop (AMD Ryzen AI Max / Strix Halo), pipewire I/O, Pip
 
 `first_syllable ≈ stt + time_to_first_audio` after the kid stops talking.
 
-
 ## STT accuracy
 
 Default is `base.en` (clearer on a noisy porch). `tiny.en` is faster but mangled live lines like "trick or treat" → "check our tree".
 
 Porch bias: Whisper gets an `initial_prompt` / hotwords for candy/costume/pumpkin phrases, plus a light corrector for short near-misses. See issue #4.
-
 
 ## Porch run logs
 
@@ -165,7 +164,6 @@ Both sides tee to `logs/` (gitignored):
 - Pi client: `logs/crate-pi.log` (override with `--log-file` / `CRATE_LOG`)
 
 Pull them from the Framework Desktop / Pi without copy-paste.
-
 
 ## Vision timing (crate continuous)
 
