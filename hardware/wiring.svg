@@ -1,0 +1,130 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="980" viewBox="0 0 1400 980">
+  <style>
+    .bg { fill: #1c1916; }
+    .box { fill: #2a2622; stroke: #c4a574; stroke-width: 1.5; }
+    .box-ac { fill: #3a2824; stroke: #e07a5f; stroke-width: 1.5; }
+    .box-5v { fill: #243028; stroke: #81b29a; stroke-width: 1.5; }
+    .box-led { fill: #2c2618; stroke: #e9c46a; stroke-width: 1.5; }
+    .box-srv { fill: #242830; stroke: #7eb6d6; stroke-width: 1.5; }
+    .title { font: 600 18px "IBM Plex Sans", "Segoe UI", sans-serif; fill: #f4efe6; }
+    .label { font: 13px "IBM Plex Sans", "Segoe UI", sans-serif; fill: #e7dfd2; }
+    .small { font: 11px "IBM Plex Sans", "Segoe UI", sans-serif; fill: #b7aa98; }
+    .pin { font: 12px "IBM Plex Sans", "Segoe UI", sans-serif; fill: #f4efe6; }
+    .ac { stroke: #e07a5f; stroke-width: 2; fill: none; }
+    .v5 { stroke: #e9c46a; stroke-width: 2.25; fill: none; }
+    .gnd { stroke: #8a8175; stroke-width: 2; fill: none; }
+    .data { stroke: #f2cc8f; stroke-width: 1.75; fill: none; stroke-dasharray: 5 3; }
+    .uart { stroke: #b5838d; stroke-width: 1.75; fill: none; }
+    .i2c { stroke: #7eb6d6; stroke-width: 1.75; fill: none; }
+    .srv { stroke: #90c2e0; stroke-width: 1.75; fill: none; }
+    .cap { font: 11px "IBM Plex Sans", sans-serif; fill: #e9c46a; }
+  </style>
+  <rect class="bg" width="1400" height="980"/>
+  <text x="36" y="40" class="title">Porch greeter wiring — Pi 4, ESP32, three LED runs, servos</text>
+  <text x="36" y="62" class="small">120 V in one cord. Three bricks in one ventilated box. LED power never shared with servos or the Pi. Grounds tied at one point.</text>
+  <rect class="box-ac" x="36" y="88" width="200" height="88" rx="6"/>
+  <text x="52" y="114" class="label">120 V inlet</text>
+  <text x="52" y="134" class="small">cord grip, drip loop</text>
+  <text x="52" y="152" class="small">fuse ahead of the bricks</text>
+  <rect class="box-5v" x="280" y="88" width="230" height="100" rx="6"/>
+  <text x="296" y="114" class="label">LED brick</text>
+  <text x="296" y="134" class="small">Mean Well LRS-150-5</text>
+  <text x="296" y="152" class="small">5 V, 22 A · trim ~5.1 V</text>
+  <text x="296" y="170" class="small">15 A fuse on + out</text>
+  <rect class="box-5v" x="530" y="88" width="220" height="100" rx="6"/>
+  <text x="546" y="114" class="label">Servo brick</text>
+  <text x="546" y="134" class="small">5 V, 8–10 A</text>
+  <text x="546" y="152" class="small">8 A fuse on + out</text>
+  <text x="546" y="170" class="small">not shared with LEDs</text>
+  <rect class="box-5v" x="770" y="88" width="230" height="100" rx="6"/>
+  <text x="786" y="114" class="label">Pi brick</text>
+  <text x="786" y="134" class="small">official USB-C</text>
+  <text x="786" y="152" class="small">5.1 V, 3 A</text>
+  <text x="786" y="170" class="small">into the Pi only</text>
+  <rect class="box" x="1030" y="88" width="200" height="100" rx="6"/>
+  <text x="1046" y="114" class="label">40 mm fan</text>
+  <text x="1046" y="134" class="small">5 V, ~0.1 A</text>
+  <text x="1046" y="152" class="small">from LED brick +</text>
+  <text x="1046" y="170" class="small">blows across the three</text>
+  <path class="ac" d="M236 130 H280"/>
+  <path class="ac" d="M236 120 H250 V140 H530"/>
+  <path class="ac" d="M250 110 V90 H770 V130"/>
+  <rect class="box" x="770" y="240" width="280" height="200" rx="6"/>
+  <text x="786" y="268" class="label">Raspberry Pi 4</text>
+  <text x="786" y="292" class="pin">USB-C ← Pi brick</text>
+  <text x="786" y="314" class="pin">GPIO 14 TX → ESP32 RX 16</text>
+  <text x="786" y="336" class="pin">GPIO 15 RX ← ESP32 TX 17</text>
+  <text x="786" y="358" class="pin">GPIO GND → common ground</text>
+  <text x="786" y="386" class="small">audio out stays on the Pi</text>
+  <text x="786" y="406" class="small">no LED data, no servo pulses</text>
+  <path class="v5" d="M885 188 V240"/>
+  <rect class="box" x="280" y="240" width="300" height="250" rx="6"/>
+  <text x="296" y="268" class="label">ESP32 DevKit V1</text>
+  <text x="296" y="292" class="pin">5V pin ← LED brick terminal</text>
+  <text x="296" y="314" class="pin">GND → common ground</text>
+  <text x="296" y="336" class="pin">GPIO 16 RX ← Pi TX</text>
+  <text x="296" y="358" class="pin">GPIO 17 TX → Pi RX</text>
+  <text x="296" y="380" class="pin">GPIO 18 / 19 / 21 → shifter</text>
+  <text x="296" y="402" class="pin">GPIO 22 SDA, 23 SCL → PCA9685</text>
+  <text x="296" y="424" class="pin">3V3 pin → PCA9685 VCC</text>
+  <text x="296" y="466" class="small">470 µF at the 5V pin. Wi-Fi off.</text>
+  <path class="v5" d="M400 188 V220 H360 V240"/>
+  <rect class="box-led" x="280" y="530" width="300" height="150" rx="6"/>
+  <text x="296" y="556" class="label">74AHCT125</text>
+  <text x="296" y="578" class="pin">VCC ← LED 5 V · GND · OE to GND</text>
+  <text x="296" y="600" class="pin">A1 ← GPIO 18 mouth</text>
+  <text x="296" y="622" class="pin">A2 ← GPIO 19 eye L · A3 ← GPIO 21 eye R</text>
+  <text x="296" y="644" class="pin">Y1 Y2 Y3 out, 330 Ω each</text>
+  <text x="296" y="664" class="small">A4 spare. Do not use a MOSFET I2C shifter.</text>
+  <rect class="box-srv" x="640" y="530" width="280" height="160" rx="6"/>
+  <text x="656" y="556" class="label">PCA9685</text>
+  <text x="656" y="578" class="pin">VCC ← ESP32 3V3</text>
+  <text x="656" y="600" class="pin">V+ ← servo brick 5 V</text>
+  <text x="656" y="622" class="pin">GND → common ground</text>
+  <text x="656" y="644" class="pin">SDA/SCL ← GPIO 22 / 23</text>
+  <text x="656" y="666" class="pin">ch 0–3 → four servos, signal only</text>
+  <rect class="box-srv" x="980" y="530" width="250" height="160" rx="6"/>
+  <text x="996" y="556" class="label">Servos × 4</text>
+  <text x="996" y="578" class="pin">signal ← PCA9685 ch 0–3</text>
+  <text x="996" y="600" class="pin">+ ← servo brick, via the board V+</text>
+  <text x="996" y="622" class="pin">− → common ground</text>
+  <text x="996" y="650" class="small">brows, hat tip, moustache</text>
+  <text x="996" y="668" class="small">stall stays on this rail</text>
+  <rect class="box-led" x="36" y="730" width="360" height="150" rx="6"/>
+  <text x="52" y="756" class="label">Mouth strip</text>
+  <text x="52" y="778" class="pin">5 V both ends ← LED brick</text>
+  <text x="52" y="800" class="pin">DIN ← shifter Y1, 330 Ω</text>
+  <text x="52" y="822" class="pin">1000 µF at each injection</text>
+  <text x="52" y="850" class="small">~200–256 px, snaked. GND both ends.</text>
+  <rect class="box-led" x="420" y="730" width="250" height="150" rx="6"/>
+  <text x="436" y="756" class="label">Eye L</text>
+  <text x="436" y="778" class="pin">5 V ← LED brick</text>
+  <text x="436" y="800" class="pin">DIN ← shifter Y2</text>
+  <text x="436" y="822" class="pin">1000 µF at the feed</text>
+  <text x="436" y="850" class="small">12–20 px, own data line</text>
+  <rect class="box-led" x="690" y="730" width="250" height="150" rx="6"/>
+  <text x="706" y="756" class="label">Eye R</text>
+  <text x="706" y="778" class="pin">5 V ← LED brick</text>
+  <text x="706" y="800" class="pin">DIN ← shifter Y3</text>
+  <text x="706" y="822" class="pin">1000 µF at the feed</text>
+  <text x="706" y="850" class="small">same reel as the mouth</text>
+  <rect class="box" x="970" y="730" width="270" height="150" rx="6"/>
+  <text x="986" y="756" class="label">Common ground</text>
+  <text x="986" y="778" class="pin">LED brick GND</text>
+  <text x="986" y="800" class="pin">servo brick GND</text>
+  <text x="986" y="822" class="pin">ESP32, Pi, shifter, PCA9685</text>
+  <text x="986" y="850" class="small">one star point. Pi brick GND is</text>
+  <text x="986" y="866" class="small">already the Pi's ground.</text>
+  <path class="data" d="M360 680 V710 H180 V730"/>
+  <path class="data" d="M400 680 V700 H520 V730"/>
+  <path class="data" d="M430 680 V690 H790 V730"/>
+  <path class="uart" d="M580 340 H770"/>
+  <text x="640" y="332" class="small">UART 3.3 V</text>
+  <path class="i2c" d="M500 430 H620 V530"/>
+  <text x="530" y="470" class="small">I2C</text>
+  <path class="srv" d="M640 160 V200 H900 V530"/>
+  <text x="860" y="214" class="small">servo 5 V</text>
+  <text x="36" y="920" class="small">Solid amber: LED 5 V. Dashed amber: LED data after the shifter. Mauve: UART. Blue: I2C and servo signal. Grey: ground. Coral: 120 V.</text>
+  <text x="36" y="942" class="small">Power order: bricks on, then data. Data off before bricks. Do not hot-plug a strip into a live brick without the capacitor already across it.</text>
+  <text x="36" y="964" class="small">Four capacitors in service: mouth left, mouth right, eye L, eye R. Fifth at the ESP32 5 V pin if you used the 470 µF there. Rest are spares.</text>
+</svg>
