@@ -20,9 +20,9 @@ The ESP32 is the only device that pulses servos or clocks LEDs. Wi-Fi and Blueto
 | Eye R data | 21 |
 | I2C SDA / SCL to PCA9685 | 22 / 23 |
 
-PCA9685 channels: 0 left brow, 1 right brow, 2 hat tip, 3 spare (held neutral). Mouth length is `MOUTH_COLS` × `MOUTH_ROWS` (default 32×8, snaked). Each eye is its own strip, `EYE_LEDS` default 16 (keep it in 12–20). Do not chain the three data lines.
+PCA9685 channels: 0 left brow, 1 right brow, 2 hat tip, 3 mustache (center at rest; `twirl` swings it). Gestures: `tip`, `beam`, `reckon`, `chuckle`, `attend`, `twirl`. Mouth length is `MOUTH_COLS` × `MOUTH_ROWS` (default 32×8, snaked). Each eye is its own strip, `EYE_LEDS` default 16 (keep it in 12–20). Do not chain the three data lines.
 
-Amber only: base `R=255, G=80, B=0`. Speech brightness is the viseme mask times `rms`, capped at 40%. `FULL_WHITE_TEST` forces lit pixels to white for a bench check. Default is off. No blue channel.
+Amber only: base `R=255, G=80, B=0`. Speech brightness is the viseme mask times a floor plus loudness, still capped at 40%. `FULL_WHITE_TEST` forces lit pixels to white for a bench check. Default is off. No blue channel.
 
 If the UART is quiet for 2 seconds, or an `idle` line arrives, the mouth goes back to candle flicker and the eyes to a slow blink. A Pi reboot does not freeze the face. Unknown gesture names, including `stamp`, `wave`, `think`, `laugh`, `bow`, and `listen`, are ignored and do not stall the mouth.
 

@@ -34,7 +34,7 @@ def test_all_caps_calmed():
 def test_parse_strips_stamp_dialogue():
     line, g = parse_reply("Here you go. stamp\nGESTURE: stamp")
     assert "stamp" not in line.lower().split()
-    assert g == "tip"
+    assert g == "attend"
 
 
 def test_skeleton_story_not_distress_keyword():

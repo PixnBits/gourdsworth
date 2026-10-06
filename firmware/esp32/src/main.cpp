@@ -34,7 +34,7 @@ static constexpr uint8_t PCA_ADDR = 0x40;
 static const uint8_t CH_BROW_L = 0;
 static const uint8_t CH_BROW_R = 1;
 static const uint8_t CH_HAT = 2;
-static const uint8_t CH_SPARE = 3;
+static const uint8_t CH_MUSTACHE = 3;
 
 static const int ANG_LEVEL = 90;
 static const int ANG_UP = 58;
@@ -43,13 +43,19 @@ static const int ANG_IN_L = 124;
 static const int ANG_IN_R = 56;
 static const int ANG_HAT_REST = 90;
 static const int ANG_HAT_DOWN = 128;
+static const int ANG_MUSTACHE_REST = 90;
 
 static const uint32_t TIP_MS = 600;
+static const uint32_t TWIRL_MS = 900;
 static const uint32_t CHUCKLE_SHUT_MS = 220;
 static const uint32_t BLINK_EVERY_MS = 4500;
 static const uint32_t BLINK_SHUT_MS = 140;
 static const uint32_t LINK_QUIET_MS = 2000;
 static const uint8_t BRIGHT_CAP = 102;  // 40% of 255
+static const uint8_t SPEECH_FLOOR = 50;
+static const uint8_t SPEECH_SPAN = 52;  // floor + span reaches BRIGHT_CAP
+// typical Piper en_US-danny-low frame RMS peaks ~0.3-0.4
+static const float RMS_REF = 0.30f;
 
 static const int MOUTH_N = MOUTH_COLS * MOUTH_ROWS;
 
@@ -60,7 +66,9 @@ CRGB eyeR[EYE_LEDS];
 Adafruit_PWMServoDriver pca(PCA_ADDR);
 static bool servoOk = false;
 
-enum Pose : uint8_t { POSE_NEUTRAL, POSE_TIP, POSE_BEAM, POSE_RECKON, POSE_CHUCKLE, POSE_ATTEND };
+enum Pose : uint8_t {
+  POSE_NEUTRAL, POSE_TIP, POSE_BEAM, POSE_RECKON, POSE_CHUCKLE, POSE_ATTEND, POSE_TWIRL
+};
 enum EyeShape : uint8_t { EYE_OPEN, EYE_WIDE, EYE_HALF, EYE_SHUT };
 
 static Pose pose = POSE_NEUTRAL;
@@ -86,11 +94,14 @@ static int degToUs(int deg) {
 }
 
 static void writeUs(uint8_t channel, int us) {
-  if (!servoOk) return;
+  static int16_t lastTick[4] = {-1, -1, -1, -1};
+  if (!servoOk || channel > 3) return;
   if (us < 600) us = 600;
   if (us > 2400) us = 2400;
-  uint16_t tick = (uint16_t)((us * 4096L) / 20000L);
-  pca.setPWM(channel, 0, tick);
+  int16_t tick = (int16_t)((us * 4096L) / 20000L);
+  if (lastTick[channel] == tick) return;
+  lastTick[channel] = tick;
+  pca.setPWM(channel, 0, (uint16_t)tick);
 }
 
 static void writeDeg(uint8_t channel, int deg) {
@@ -138,7 +149,12 @@ static void renderMouthSpeech() {
   float rms = visemeRms;
   if (rms < 0.0f) rms = 0.0f;
   if (rms > 1.0f) rms = 1.0f;
-  uint8_t cap = (uint8_t)(rms * (float)BRIGHT_CAP + 0.5f);
+  float loud = rms / RMS_REF;
+  if (loud < 0.0f) loud = 0.0f;
+  if (loud > 1.0f) loud = 1.0f;
+  float capf = (float)SPEECH_FLOOR + loud * (float)SPEECH_SPAN;
+  if (capf > (float)BRIGHT_CAP) capf = (float)BRIGHT_CAP;
+  uint8_t cap = (uint8_t)(capf + 0.5f);
   for (int y = 0; y < MOUTH_ROWS; y++) {
     for (int x = 0; x < MOUTH_COLS; x++) {
       uint8_t mask = mouthMask(visemeId, x, y);
@@ -187,13 +203,30 @@ static void renderEye(CRGB* leds, int count, EyeShape shape, uint32_t now) {
   }
 }
 
+// 90 -> 60 -> 120 -> 60 -> 90, four equal linear segments.
+static int mustacheTwirlDeg(uint32_t dt) {
+  static const int fromDeg[4] = {90, 60, 120, 60};
+  static const int toDeg[4] = {60, 120, 60, 90};
+  if (dt >= TWIRL_MS) return ANG_MUSTACHE_REST;
+  uint32_t segMs = TWIRL_MS / 4;
+  uint32_t seg = dt / segMs;
+  if (seg > 3) seg = 3;
+  uint32_t into = dt - seg * segMs;
+  int span = toDeg[seg] - fromDeg[seg];
+  return fromDeg[seg] + (span * (int)into) / (int)segMs;
+}
+
 static void applyServos(uint32_t now) {
   if (pose == POSE_TIP && (uint32_t)(now - poseMs) >= TIP_MS) {
+    pose = POSE_NEUTRAL;
+  }
+  if (pose == POSE_TWIRL && (uint32_t)(now - poseMs) >= TWIRL_MS) {
     pose = POSE_NEUTRAL;
   }
   int browL = ANG_LEVEL;
   int browR = ANG_LEVEL;
   int hat = ANG_HAT_REST;
+  int mustache = ANG_MUSTACHE_REST;
   if (pose == POSE_TIP) {
     uint32_t dt = (uint32_t)(now - poseMs);
     if (dt > TIP_MS) dt = TIP_MS;
@@ -202,6 +235,9 @@ static void applyServos(uint32_t now) {
     hat = ANG_HAT_REST + ((ANG_HAT_DOWN - ANG_HAT_REST) * swing) / half;
     browL = ANG_LEVEL + ((ANG_DIP - ANG_LEVEL) * swing) / half;
     browR = browL;
+  } else if (pose == POSE_TWIRL) {
+    browL = ANG_UP;
+    mustache = mustacheTwirlDeg((uint32_t)(now - poseMs));
   } else if (pose == POSE_BEAM || pose == POSE_CHUCKLE) {
     browL = ANG_UP;
     browR = ANG_UP;
@@ -212,6 +248,7 @@ static void applyServos(uint32_t now) {
   writeDeg(CH_BROW_L, browL);
   writeDeg(CH_BROW_R, browR);
   writeDeg(CH_HAT, hat);
+  writeDeg(CH_MUSTACHE, mustache);
 }
 
 static void goIdle() {
@@ -258,6 +295,7 @@ static bool startPose(const char* name) {
   else if (strcmp(name, "reckon") == 0) next = POSE_RECKON;
   else if (strcmp(name, "chuckle") == 0) next = POSE_CHUCKLE;
   else if (strcmp(name, "attend") == 0) next = POSE_ATTEND;
+  else if (strcmp(name, "twirl") == 0) next = POSE_TWIRL;
   else return false;  // retired names included: do not stall the mouth
   pose = next;
   poseMs = millis();
@@ -337,12 +375,19 @@ void setup() {
   // begin() may call Wire.begin() with no pins, which would steal GPIO 21
   // (eye R) as the default SDA. Put SDA/SCL back on 22/23.
   Wire.begin(PIN_SDA, PIN_SCL);
-  servoOk = true;
-  pca.setPWMFreq(50);
-  writeDeg(CH_BROW_L, ANG_LEVEL);
-  writeDeg(CH_BROW_R, ANG_LEVEL);
-  writeDeg(CH_HAT, ANG_HAT_REST);
-  writeUs(CH_SPARE, 1500);
+  Wire.beginTransmission(PCA_ADDR);
+  servoOk = (Wire.endTransmission() == 0);
+  if (servoOk) {
+    pca.setPWMFreq(50);
+    writeDeg(CH_BROW_L, ANG_LEVEL);
+    writeDeg(CH_BROW_R, ANG_LEVEL);
+    writeDeg(CH_HAT, ANG_HAT_REST);
+    writeDeg(CH_MUSTACHE, ANG_MUSTACHE_REST);
+  } else {
+    Serial.println("pca9685 missing, servos off");
+  }
+  // 5 V LED rail, 4 A budget; branch fuses are 5 A.
+  FastLED.setMaxPowerInVoltsAndMilliamps(5, 4000);
   FastLED.addLeds<WS2812B, PIN_MOUTH, GRB>(mouth, MOUTH_N);
   FastLED.addLeds<WS2812B, PIN_EYE_L, GRB>(eyeL, EYE_LEDS);
   FastLED.addLeds<WS2812B, PIN_EYE_R, GRB>(eyeR, EYE_LEDS);

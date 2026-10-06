@@ -20,7 +20,7 @@ from gourdsworth.guardrails import parse_reply, sanitize_spoken  # noqa: E402
 from gourdsworth.net import ALLOWED_GESTURES, DEFAULT_GESTURE  # noqa: E402
 
 
-ALLOWED = ("tip", "beam", "reckon", "chuckle", "attend")
+ALLOWED = ("tip", "beam", "reckon", "chuckle", "attend", "twirl")
 RETIRED = ("stamp", "wave", "think", "laugh", "bow", "listen")
 
 
@@ -157,18 +157,28 @@ def test_face_dry_run_cli_prints_uart_lines():
     assert proc.stderr == "" or "Traceback" not in proc.stderr
 
 
+def test_twirl_is_parsed_and_forwarded():
+    line, gesture = parse_reply("Well now.\nGESTURE: twirl")
+    assert gesture == "twirl"
+    assert "twirl" not in line.lower()
+    obj = face_link.gesture_obj("twirl")
+    assert obj == {"op": "gesture", "name": "twirl"}
+    assert face_link.encode_line(obj) == b'{"op":"gesture","name":"twirl"}\n'
+
+
 def test_net_vocabulary_is_the_face_set():
     assert ALLOWED_GESTURES == frozenset(ALLOWED)
-    assert DEFAULT_GESTURE == "tip"
+    assert DEFAULT_GESTURE == "attend"
     assert set(RETIRED).isdisjoint(ALLOWED_GESTURES)
 
 
 def test_mayor_prompt_no_longer_lists_stamp():
     text = (_REPO / "prompts" / "mayor_system.txt").read_text(encoding="utf-8")
-    assert "Allowed gestures: tip, beam, reckon, chuckle, attend" in text
+    assert "Allowed gestures: tip, beam, reckon, chuckle, attend, twirl" in text
+    assert "mustache twirl" in text.lower()
     assert "GESTURE: tip" in text
     assert "hat postcards, not stamp-collecting" in text
-    assert "Never speak the words tip, beam, reckon, chuckle, or attend" in text
+    assert "Never speak the words tip, beam, reckon, chuckle, attend, or twirl" in text
     assert "stamp, wave, think, laugh, bow" not in text
     assert text.lower().count("stamp") == 1
     for word in ("wave", "think", "laugh", "bow", "listen"):
@@ -191,6 +201,8 @@ def test_firmware_is_esp32_classic_and_keeps_wifi_off():
         assert token in src
     for name in ALLOWED:
         assert f'"{name}"' in src
+    assert "CH_MUSTACHE" in src
+    assert "CH_SPARE" not in src
     assert "pong" in src
     assert "FULL_WHITE_TEST" in src
     assert "WiFi.begin" not in src

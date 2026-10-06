@@ -6,7 +6,7 @@ JSON line per command (newline terminated, 115200 8N1) on the UART the
 ESP32 already owns:
 
     {"op":"viseme","id":"rest|aa|ee|oh|mbp","rms":0.0}
-    {"op":"gesture","name":"tip|beam|reckon|chuckle|attend"}
+    {"op":"gesture","name":"tip|beam|reckon|chuckle|attend|twirl"}
     {"op":"idle"}
     {"op":"ping"}
 
@@ -27,7 +27,7 @@ import numpy as np
 BAUD = 115200
 VISEME_HZ = 30
 
-ALLOWED_GESTURES = ("tip", "beam", "reckon", "chuckle", "attend")
+ALLOWED_GESTURES = ("tip", "beam", "reckon", "chuckle", "attend", "twirl")
 RETIRED_GESTURES = ("stamp", "wave", "think", "laugh", "bow", "listen")
 
 # RMS bins. The upper edge belongs to the next shape, except 1.0 → aa.

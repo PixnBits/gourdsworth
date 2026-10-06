@@ -65,7 +65,7 @@ def strip_markdown(text: str) -> str:
 
 # Model sometimes emits "GESTURE: tip", "Gesture: tip", or even "Tip: tip".
 GESTURE_RE = re.compile(
-    r"(?:^|\s)(?:GESTURE|Gesture|gesture|Tip|Beam|Reckon|Chuckle|Attend|Wave|WAVE)\s*:\s*([A-Za-z]+)\b",
+    r"(?:^|\s)(?:GESTURE|Gesture|gesture|Tip|Beam|Reckon|Chuckle|Attend|Twirl|Wave|WAVE)\s*:\s*([A-Za-z]+)\b",
     re.I | re.M,
 )
 
@@ -147,7 +147,7 @@ def clip_spoken(line: str, max_words: int = 20) -> str:
 _GESTURE_WORDS = frozenset(
     {
         "stamp", "wave", "think", "laugh", "bow", "listen",
-        "tip", "beam", "reckon", "chuckle", "attend",
+        "tip", "beam", "reckon", "chuckle", "attend", "twirl",
     }
 )
 
@@ -211,14 +211,14 @@ def sanitize_spoken(line: str) -> str:
     if not line:
         return line
     line = re.sub(
-        r"^(?:GESTURE|Gesture|Wave|Stamp|Think|Laugh|Bow|Listen|Tip|Beam|Reckon|Chuckle|Attend)\s*[:.]\s*",
+        r"^(?:GESTURE|Gesture|Wave|Stamp|Think|Laugh|Bow|Listen|Tip|Beam|Reckon|Chuckle|Attend|Twirl)\s*[:.]\s*",
         "",
         line,
         flags=re.I,
     ).strip()
     # "...for you. stamp" / "...candy. Tip" — leaked tag after a sentence
     line = re.sub(
-        r"(?<=[.!?])\s+(?:stamp|wave|think|laugh|bow|listen|tip|beam|reckon|chuckle|attend)\s*[.!?]?\s*$",
+        r"(?<=[.!?])\s+(?:stamp|wave|think|laugh|bow|listen|tip|beam|reckon|chuckle|attend|twirl)\s*[.!?]?\s*$",
         "",
         line,
         flags=re.I,
@@ -257,7 +257,7 @@ def parse_reply(raw: str) -> tuple[str, str]:
         line = "Candy awaits, citizens."
     # Catch residual "Tip: tip" / "Gesture: beam" left as spoken text
     only_gesture = re.fullmatch(
-        r"(?:GESTURE|Gesture|gesture|Wave|WAVE|Tip|Beam|Reckon|Chuckle|Attend)\s*:\s*([A-Za-z]+)\s*",
+        r"(?:GESTURE|Gesture|gesture|Wave|WAVE|Tip|Beam|Reckon|Chuckle|Attend|Twirl)\s*:\s*([A-Za-z]+)\s*",
         line,
         flags=re.I,
     )

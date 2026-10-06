@@ -44,7 +44,7 @@ Control JSON (no payload)
     {"event":"button","state":"down"|"up"}
     {"event":"still"}                 # optional hint; JPEG may follow
     {"event":"listen"|"thinking"|"speaking"|"ready"}
-    {"event":"gesture","name":"tip"|"beam"|"reckon"|"chuckle"|"attend"}
+    {"event":"gesture","name":"tip"|"beam"|"reckon"|"chuckle"|"attend"|"twirl"}
     {"event":"play_done"}
     {"event":"bye"}
     {"event":"error","message":"..."}
@@ -84,8 +84,8 @@ UPLINK_CHUNK_SAMPLES = UPLINK_RATE * UPLINK_CHUNK_MS // 1000  # 1600
 UPLINK_CHUNK_BYTES = UPLINK_CHUNK_SAMPLES * 2  # 3200
 
 DOWNLINK_FORMAT = "f32le"
-ALLOWED_GESTURES = frozenset({"tip", "beam", "reckon", "chuckle", "attend"})
-DEFAULT_GESTURE = "tip"
+ALLOWED_GESTURES = frozenset({"tip", "beam", "reckon", "chuckle", "attend", "twirl"})
+DEFAULT_GESTURE = "attend"
 
 MAX_LINE = 16 * 1024
 MAX_PAYLOAD = 2 * 1024 * 1024

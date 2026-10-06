@@ -39,9 +39,9 @@ def test_parse_inline_gesture_same_line_tip():
     assert "candy" in line.lower() or "marvel" in line.lower()
 
 
-def test_parse_unknown_gesture_defaults_tip():
+def test_parse_unknown_gesture_defaults_attend():
     line, gesture = parse_reply("Hello citizens. GESTURE: moonwalk")
-    assert gesture == "tip"
+    assert gesture == "attend"
     assert "GESTURE" not in line.upper()
     assert "moonwalk" not in line.lower()
 
@@ -74,7 +74,7 @@ def test_clip_drops_dangling_where():
 
 def test_parse_wave_colon_leak():
     line, gesture = parse_reply("Wave: wave")
-    assert gesture == "tip"
+    assert gesture == "attend"
     assert "wave" not in line.lower()
     assert line  # some spoken fallback
 

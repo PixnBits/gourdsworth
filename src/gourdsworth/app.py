@@ -542,11 +542,11 @@ def _handle_turn(
     elif looks_tease(user_text) and canned.get("tease"):
         # Dry bureaucratic clapback — never roast the child (littles may be imitating).
         line = random.choice(canned["tease"])
-        gesture = random.choice(["tip", "beam", "reckon", "chuckle"])
+        gesture = random.choice(["tip", "beam", "reckon", "chuckle", "twirl"])
         metrics.used_canned = True
     elif (bk := match_backstory(user_text)) and canned.get("backstory", {}).get(bk):
         line = random.choice(canned["backstory"][bk])
-        gesture = random.choice(["reckon", "tip", "chuckle", "beam"])
+        gesture = random.choice(["reckon", "tip", "chuckle", "beam", "twirl"])
         metrics.used_canned = True
     elif not user_text:
         line = random.choice(canned["shy"])

@@ -20,7 +20,7 @@ JSON lines + length-prefixed binary (`n` then raw bytes). See
 | Pi → desktop | JPEG still, one frame on Talk |
 | Pi → desktop | `{"event":"button","state":"down"\|"up"}` |
 | desktop → Pi | TTS **f32le** (`{"event":"play","rate":…,"format":"f32le"}` + samples) |
-| desktop → Pi | `{"event":"gesture","name":"tip"\|"beam"\|"reckon"\|"chuckle"\|"attend"}` |
+| desktop → Pi | `{"event":"gesture","name":"tip"\|"beam"\|"reckon"\|"chuckle"\|"attend"\|"twirl"}` |
 
 ## Raspberry Pi OS deps
 
@@ -89,7 +89,7 @@ set, forwarded to the ESP32. The Pi does not pulse servos or clock LEDs.
 buffer into newline-terminated JSON for the ESP32 on the Pi's UART (GPIO 14
 TX / 15 RX, 115200 8N1, `/dev/serial0`). Commands are `viseme` (id
 `rest|aa|ee|oh|mbp` plus `rms` 0–1 at about 30 Hz), `gesture`
-(`tip`, `beam`, `reckon`, `chuckle`, `attend`), `idle` when playback ends,
+(`tip`, `beam`, `reckon`, `chuckle`, `attend`, `twirl`), `idle` when playback ends,
 and `ping`. Old names `stamp`, `wave`, `think`, `laugh`, `bow`, and `listen`
 are ignored and do not stall the mouth.
 

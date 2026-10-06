@@ -132,7 +132,7 @@ Uplink is 16 kHz mono signed 16-bit little-endian, 100 ms chunks (3200 bytes). D
 
 Face, power, and pins live in [`hardware/`](hardware/README.md): [BOM](hardware/BOM.md) and [wiring diagram](hardware/wiring.svg).
 
-Jaw = RMS of the outgoing samples, sent as a viseme id. The face plays five canned gestures the model *names* (`tip`, `beam`, `reckon`, `chuckle`, `attend`). The Pi forwards that name over UART; the ESP32 turns it into a PCA9685 pulse and clocks the LEDs. Do not generate servo trajectories on the desktop. See `ARCHITECTURE.md` and `firmware/esp32/README.md`.
+Jaw = RMS of the outgoing samples, sent as a viseme id. The face plays six canned gestures the model *names* (`tip`, `beam`, `reckon`, `chuckle`, `attend`, `twirl`). The Pi forwards that name over UART; the ESP32 turns it into a PCA9685 pulse and clocks the LEDs. Do not generate servo trajectories on the desktop. See `ARCHITECTURE.md` and `firmware/esp32/README.md`.
 
 ## Mayor voice
 
