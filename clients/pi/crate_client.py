@@ -643,6 +643,37 @@ def _playback_backend() -> str:
     return "sounddevice"
 
 
+def _env_ms(name: str, default: int) -> int:
+    """os.environ, then local.env, then default. Junk falls back; negatives clamp to 0."""
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        raw = _load_local_env().get(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return default
+    if value < 0:
+        return 0
+    return value
+
+
+def _bt_prime_ms() -> int:
+    return _env_ms("CRATE_BT_PRIME_MS", 180)
+
+
+def _face_latency_ms() -> int:
+    return _env_ms("CRATE_FACE_LATENCY_MS", 200)
+
+
+def _face_start_delay_s() -> float:
+    """Wait before the first viseme: BT prime only when pw prepends it, plus porch latency."""
+    prime_ms = _bt_prime_ms()
+    lead = prime_ms if _playback_backend() == "pw" and prime_ms > 0 else 0
+    return (lead + _face_latency_ms()) / 1000.0
+
+
 def _play_pcm_f32(samples, rate: int) -> None:
     """Play mono float32 PCM. Prefer pw-play for PipeWire/Bluetooth sinks."""
     global _PW_PLAY_PROC
@@ -652,7 +683,7 @@ def _play_pcm_f32(samples, rate: int) -> None:
     if samples.size == 0 or rate <= 0:
         return
     # Bluetooth A2DP often clips the first ~100ms — prime with short silence.
-    prime_ms = int(os.environ.get("CRATE_BT_PRIME_MS") or _load_local_env().get("CRATE_BT_PRIME_MS") or "180")
+    prime_ms = _bt_prime_ms()
     backend = _playback_backend()
     if backend == "pw" and prime_ms > 0:
         n_prime = max(1, int(rate * (prime_ms / 1000.0)))
@@ -807,7 +838,7 @@ def _play_tts(header: dict, payload: bytes | None) -> None:
     duration = float(samples.size) / float(play_rate) if play_rate else 0.0
     face = _FACE
     if face is not None:
-        face.begin_playback(samples, int(play_rate))
+        face.begin_playback(samples, int(play_rate), start_delay_s=_face_start_delay_s())
     # Play on this thread under the audio lock — never overlap sd.rec (double-free).
     try:
         try:

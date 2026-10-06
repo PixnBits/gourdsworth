@@ -516,6 +516,21 @@ def _handle_turn(
 
     gesture = DEFAULT_GESTURE
     line = ""
+    gesture_sent = False
+
+    def _send_gesture() -> None:
+        """Forward the pose once, as soon as this turn knows it."""
+        nonlocal gesture_sent
+        if gesture_sent:
+            return
+        gesture_sent = True
+        print(f"Gesture: {gesture}")
+        if gesture_fn is not None:
+            try:
+                gesture_fn(gesture)
+            except (ConnectionError, OSError) as exc:
+                print(f"  crate gesture send failed: {exc}")
+
     t_post_stt = perf_counter()
     vis = take_ready(vis_future)
     if vis is not None and vis.ok and vis.note:
@@ -591,7 +606,9 @@ def _handle_turn(
             gesture = DEFAULT_GESTURE
             metrics.used_canned = True
             early = None  # speak full canned below
-        elif early:
+        # Pose is known now — before the remainder is synthesized or played.
+        _send_gesture()
+        if early:
             # Speak only the not-yet-spoken tail (if any)
             rem = _speakable_remainder(line, early)
             if rem and speaker is not None and not typed:
@@ -608,12 +625,8 @@ def _handle_turn(
 
     metrics.words_out = len(line.split())
     print(f"Mayor: {line}")
-    print(f"Gesture: {gesture}")
-    if gesture_fn is not None:
-        try:
-            gesture_fn(gesture)
-        except (ConnectionError, OSError) as exc:
-            print(f"  crate gesture send failed: {exc}")
+    # Canned / shy / distress / tease / backstory / debug: still before audio.
+    _send_gesture()
 
     # Canned / no-early path: synthesize full line once
     if speaker is not None and (metrics.used_canned or not metrics.early_flush):

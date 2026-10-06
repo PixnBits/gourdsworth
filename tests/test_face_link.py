@@ -6,6 +6,7 @@ import json
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -15,6 +16,7 @@ _REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO / "clients" / "pi"))
 sys.path.insert(0, str(_REPO / "src"))
 
+import crate_client  # noqa: E402
 import face_link  # noqa: E402
 from gourdsworth.guardrails import parse_reply, sanitize_spoken  # noqa: E402
 from gourdsworth.net import ALLOWED_GESTURES, DEFAULT_GESTURE  # noqa: E402
@@ -47,13 +49,13 @@ def test_packet_encode_shapes():
     assert face_link.encode_line({"op": "idle"}) == b'{"op":"idle"}\n'
     viseme = face_link.viseme_obj(np.full(32, 0.5, dtype=np.float32))
     assert viseme["op"] == "viseme"
-    assert viseme["id"] == "oh"
+    assert viseme["id"] == "aa"
     assert viseme["rms"] == pytest.approx(0.5)
     assert set(viseme) == {"op", "id", "rms"}
     raw = face_link.encode_line(viseme)
     assert b"\n" in raw
     assert b"pixel" not in raw
-    assert json.loads(raw)["id"] == "oh"
+    assert json.loads(raw)["id"] == "aa"
 
 
 @pytest.mark.parametrize("name", ALLOWED)
@@ -89,14 +91,14 @@ def test_old_and_unknown_gestures_are_ignored(name):
     "level,ident",
     [
         (0.0, "rest"),
-        (0.0799, "rest"),
-        (0.08, "mbp"),
-        (0.2199, "mbp"),
-        (0.22, "ee"),
-        (0.4499, "ee"),
-        (0.45, "oh"),
-        (0.6999, "oh"),
-        (0.70, "aa"),
+        (0.0399, "rest"),
+        (0.04, "mbp"),
+        (0.0999, "mbp"),
+        (0.10, "ee"),
+        (0.1699, "ee"),
+        (0.17, "oh"),
+        (0.2399, "oh"),
+        (0.24, "aa"),
         (1.0, "aa"),
         (2.5, "aa"),
         (-0.4, "rest"),
@@ -128,7 +130,7 @@ def test_dry_run_text_has_gesture_and_pcm_and_no_retired_name():
     objs = [json.loads(line) for line in text.splitlines()]
     assert objs[0] == {"op": "ping"}
     assert objs[1] == {"op": "gesture", "name": "chuckle"}
-    assert any(obj["op"] == "viseme" and obj["id"] == "oh" for obj in objs)
+    assert any(obj["op"] == "viseme" and obj["id"] == "aa" for obj in objs)
     assert objs[-1] == {"op": "idle"}
     assert "stamp" not in text
     for old in RETIRED:
@@ -214,3 +216,154 @@ def test_firmware_is_esp32_classic_and_keeps_wifi_off():
         assert name in note
     assert "viseme" in note
     assert "pong" in note
+
+
+_MOUTH = ("rest", "mbp", "ee", "oh", "aa")
+
+
+def _danny_low_levels(n: int = 400, seed: int = 123) -> np.ndarray:
+    """Seeded lognormal near danny-low: median ~0.06, p90 ~0.21, max ~0.40."""
+    rng = np.random.default_rng(seed)
+    mu = float(np.log(0.06))
+    sigma = (float(np.log(0.21)) - mu) / 1.2815515655446004
+    return np.minimum(rng.lognormal(mu, sigma, size=n), 0.40)
+
+
+def _pcm_for_frame_rms(levels: np.ndarray, rate: int = 22050) -> np.ndarray:
+    hop = max(1, int(round(rate / face_link.VISEME_HZ)))
+    step = np.arange(hop, dtype=np.float64)
+    tone = np.sin(2.0 * np.pi * step / hop)
+    tone /= np.sqrt(np.mean(tone * tone))
+    frames = [(tone * float(level)).astype(np.float32) for level in levels]
+    return np.concatenate(frames)
+
+
+def _viseme_objs(samples: np.ndarray, rate: int = 22050) -> list[dict]:
+    objs = [json.loads(line) for line in face_link.playback_lines(samples, rate)]
+    return [obj for obj in objs if obj["op"] == "viseme"]
+
+
+def test_rms_normalizer_scales_loud_frames_and_does_not_amplify_silence():
+    norm = face_link.RmsNormalizer()
+    assert norm.normalize(0.0) == 0.0
+    assert norm.normalize(0.05) == pytest.approx(0.05)
+    assert norm.normalize(0.60) == pytest.approx(face_link.RMS_REF)
+    scaled = norm.normalize(0.05)
+    assert 0.0 < scaled < 0.05
+    for _ in range(30 * 20):
+        norm.normalize(0.0)
+    assert norm.peak >= face_link.RMS_REF
+    assert norm.normalize(0.05) == pytest.approx(0.05, abs=0.005)
+
+
+def test_danny_low_playback_uses_every_mouth_shape():
+    levels = _danny_low_levels()
+    assert 0.04 <= float(np.median(levels)) <= 0.09
+    assert 0.16 <= float(np.quantile(levels, 0.90)) <= 0.28
+    assert 0.32 <= float(np.max(levels)) <= 0.45
+    objs = _viseme_objs(_pcm_for_frame_rms(levels))
+    ids = [obj["id"] for obj in objs]
+    assert len(ids) == len(levels)
+    assert set(ids) == set(_MOUTH)
+    assert ids.count("rest") / len(ids) < 0.50
+    # The UART field stays the raw frame RMS. The ESP32 scales brightness itself.
+    assert max(obj["rms"] for obj in objs) == pytest.approx(float(np.max(levels)), abs=0.02)
+    assert max(obj["rms"] for obj in objs) > face_link.RMS_REF
+
+
+def test_louder_clipped_copy_still_uses_every_mouth_shape():
+    loud = np.clip(_pcm_for_frame_rms(_danny_low_levels()) * 2.0, -1.0, 1.0)
+    objs = _viseme_objs(loud.astype(np.float32))
+    ids = [obj["id"] for obj in objs]
+    assert set(ids) == set(_MOUTH)
+    assert max(obj["rms"] for obj in objs) > 0.5
+
+
+class _TimedPort(FakePort):
+    def __init__(self) -> None:
+        super().__init__()
+        self.times: list[float] = []
+
+    def write(self, data: bytes) -> int:
+        self.times.append(time.monotonic())
+        return super().write(data)
+
+
+def test_paced_playback_waits_out_start_delay():
+    port = _TimedPort()
+    link = face_link.FaceLink(serial=port, pace=True)
+    delay = 0.12
+    started = time.monotonic()
+    link.begin_playback(np.full(735, 0.2, dtype=np.float32), 22050, start_delay_s=delay)
+    deadline = started + 0.4
+    while not port.times and time.monotonic() < deadline:
+        time.sleep(0.005)
+    link.end_playback()
+    assert port.times, "no viseme was written"
+    assert port.times[0] - started >= delay - 0.02
+    assert time.monotonic() - started < 0.5
+
+
+def test_unpaced_playback_skips_start_delay():
+    port = FakePort()
+    link = face_link.FaceLink(serial=port, pace=False)
+    started = time.monotonic()
+    link.begin_playback(np.full(64, 0.2, dtype=np.float32), 22050, start_delay_s=0.4)
+    link.end_playback()
+    assert time.monotonic() - started < 0.3
+    assert b'"op":"viseme"' in port.buf
+
+
+def test_end_playback_interrupts_start_delay():
+    port = FakePort()
+    link = face_link.FaceLink(serial=port, pace=True)
+    started = time.monotonic()
+    link.begin_playback(np.full(735, 0.2, dtype=np.float32), 22050, start_delay_s=2.0)
+    time.sleep(0.04)
+    link.end_playback()
+    assert time.monotonic() - started < 0.4
+    assert b'"op":"viseme"' not in port.buf
+    assert b'"op":"idle"' in port.buf
+
+
+def test_face_start_delay_pw_includes_prime_other_backends_do_not(monkeypatch):
+    monkeypatch.setattr(crate_client, "_load_local_env", lambda: {})
+    monkeypatch.delenv("CRATE_FACE_LATENCY_MS", raising=False)
+    monkeypatch.delenv("CRATE_BT_PRIME_MS", raising=False)
+    monkeypatch.setenv("CRATE_PLAYBACK", "pw")
+    assert crate_client._face_start_delay_s() == pytest.approx(0.380)
+    monkeypatch.setenv("CRATE_PLAYBACK", "sounddevice")
+    assert crate_client._face_start_delay_s() == pytest.approx(0.200)
+    monkeypatch.setenv("CRATE_PLAYBACK", "pw")
+    monkeypatch.setenv("CRATE_BT_PRIME_MS", "0")
+    assert crate_client._face_start_delay_s() == pytest.approx(0.200)
+
+
+def test_face_start_delay_env_override_bad_value_and_negative(monkeypatch):
+    monkeypatch.setattr(
+        crate_client,
+        "_load_local_env",
+        lambda: {"CRATE_FACE_LATENCY_MS": "10", "CRATE_BT_PRIME_MS": "10"},
+    )
+    monkeypatch.setenv("CRATE_PLAYBACK", "pw")
+    monkeypatch.setenv("CRATE_FACE_LATENCY_MS", "40")
+    monkeypatch.setenv("CRATE_BT_PRIME_MS", "20")
+    assert crate_client._face_start_delay_s() == pytest.approx(0.060)
+
+    monkeypatch.delenv("CRATE_FACE_LATENCY_MS", raising=False)
+    monkeypatch.delenv("CRATE_BT_PRIME_MS", raising=False)
+    monkeypatch.setenv("CRATE_PLAYBACK", "sd")
+    assert crate_client._face_start_delay_s() == pytest.approx(0.010)
+
+    monkeypatch.setenv("CRATE_FACE_LATENCY_MS", "lots")
+    monkeypatch.setenv("CRATE_PLAYBACK", "sounddevice")
+    assert crate_client._face_start_delay_s() == pytest.approx(0.200)
+
+    monkeypatch.setenv("CRATE_PLAYBACK", "pw")
+    monkeypatch.setenv("CRATE_FACE_LATENCY_MS", "-15")
+    monkeypatch.setenv("CRATE_BT_PRIME_MS", "100")
+    assert crate_client._face_start_delay_s() == pytest.approx(0.100)
+
+    monkeypatch.setenv("CRATE_BT_PRIME_MS", "bogus")
+    monkeypatch.setenv("CRATE_FACE_LATENCY_MS", "0")
+    assert crate_client._face_start_delay_s() == pytest.approx(0.180)

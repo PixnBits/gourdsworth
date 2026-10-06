@@ -18,6 +18,7 @@ retired body set, are dropped so the mouth keeps moving.
 from __future__ import annotations
 
 import json
+import math
 import sys
 import threading
 import time
@@ -30,13 +31,18 @@ VISEME_HZ = 30
 ALLOWED_GESTURES = ("tip", "beam", "reckon", "chuckle", "attend", "twirl")
 RETIRED_GESTURES = ("stamp", "wave", "think", "laugh", "bow", "listen")
 
-# RMS bins. The upper edge belongs to the next shape, except 1.0 → aa.
+# Loud frames of a danny-low voice sit near RMS_REF. The upper edge belongs
+# to the next shape, except 1.0 → aa. rest < 0.04 <= mbp < 0.10 <= ee < 0.17
+# <= oh < 0.24 <= aa.
 _RMS_BINS = (
-    (0.08, "rest"),
-    (0.22, "mbp"),
-    (0.45, "ee"),
-    (0.70, "oh"),
+    (0.04, "rest"),
+    (0.10, "mbp"),
+    (0.17, "ee"),
+    (0.24, "oh"),
 )
+
+RMS_REF = 0.30
+_PEAK_TAU_S = 3.0
 
 
 def clamp_rms(value: float) -> float:
@@ -51,6 +57,30 @@ def clamp_rms(value: float) -> float:
     if rms > 1.0:
         return 1.0
     return rms
+
+
+class RmsNormalizer:
+    """Scale frame RMS onto RMS_REF. The peak rises instantly and decays slowly.
+
+    The peak never falls below RMS_REF, so silence is not amplified into a shape.
+    Binned level is ``rms * (RMS_REF / peak)``.
+    """
+
+    def __init__(self, ref: float = RMS_REF, tau_s: float = _PEAK_TAU_S) -> None:
+        self.ref = ref if ref > 0 else RMS_REF
+        self.tau_s = tau_s if tau_s > 0 else _PEAK_TAU_S
+        self.peak = self.ref
+
+    def normalize(self, rms: float) -> float:
+        level = clamp_rms(rms)
+        if level > self.peak:
+            self.peak = level
+        scaled = level * (self.ref / self.peak)
+        decay = math.exp(-(1.0 / VISEME_HZ) / self.tau_s)
+        self.peak = self.ref + (self.peak - self.ref) * decay
+        if self.peak < self.ref:
+            self.peak = self.ref
+        return scaled
 
 
 def viseme_id_for_rms(rms: float) -> str:
@@ -72,9 +102,11 @@ def encode_line(obj: dict) -> bytes:
     return (json.dumps(obj, separators=(",", ":")) + "\n").encode("utf-8")
 
 
-def viseme_obj(samples) -> dict:
-    rms = round(rms_of(samples), 4)
-    return {"op": "viseme", "id": viseme_id_for_rms(rms), "rms": rms}
+def viseme_obj(samples, normalizer: RmsNormalizer | None = None) -> dict:
+    raw = rms_of(samples)
+    rms = round(raw, 4)
+    level = raw if normalizer is None else normalizer.normalize(raw)
+    return {"op": "viseme", "id": viseme_id_for_rms(level), "rms": rms}
 
 
 def gesture_obj(name: str | None) -> dict | None:
@@ -91,9 +123,12 @@ def playback_lines(samples, rate: int) -> list[str]:
     if arr.size == 0 or rate <= 0:
         return [encode_line({"op": "idle"}).decode("utf-8")]
     hop = max(1, int(round(rate / VISEME_HZ)))
+    normalizer = RmsNormalizer()
     lines = []
     for start in range(0, int(arr.size), hop):
-        lines.append(encode_line(viseme_obj(arr[start : start + hop])).decode("utf-8"))
+        lines.append(
+            encode_line(viseme_obj(arr[start : start + hop], normalizer)).decode("utf-8")
+        )
     lines.append(encode_line({"op": "idle"}).decode("utf-8"))
     return lines
 
@@ -123,6 +158,8 @@ class FaceLink:
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        # One peak across buffers so a loud voice stays scaled for the turn.
+        self._rms = RmsNormalizer()
 
     def close(self) -> None:
         self.end_playback()
@@ -153,7 +190,7 @@ class FaceLink:
         for line in playback_lines(samples, rate):
             self.write_obj(json.loads(line))
 
-    def begin_playback(self, samples, rate: int) -> None:
+    def begin_playback(self, samples, rate: int, *, start_delay_s: float = 0.0) -> None:
         self.end_playback()
         arr = np.array(np.asarray(samples, dtype=np.float32).reshape(-1), copy=True)
         rate = int(rate) if rate else 0
@@ -161,7 +198,7 @@ class FaceLink:
         stop = self._stop
         self._thread = threading.Thread(
             target=self._paced,
-            args=(arr, rate, stop),
+            args=(arr, rate, stop, float(start_delay_s or 0.0)),
             name="face-viseme",
             daemon=True,
         )
@@ -176,8 +213,17 @@ class FaceLink:
         self._thread = None
         self.write_obj({"op": "idle"})
 
-    def _paced(self, samples: np.ndarray, rate: int, stop: threading.Event) -> None:
+    def _paced(
+        self,
+        samples: np.ndarray,
+        rate: int,
+        stop: threading.Event,
+        start_delay_s: float = 0.0,
+    ) -> None:
         if samples.size == 0 or rate <= 0:
+            return
+        # pace=False stays instant for tests. stop.wait so end_playback cuts in.
+        if self.pace and start_delay_s > 0.0 and stop.wait(start_delay_s):
             return
         hop = max(1, int(round(rate / VISEME_HZ)))
         started = time.monotonic()
@@ -186,7 +232,7 @@ class FaceLink:
         for start in range(0, n, hop):
             if stop.is_set():
                 return
-            self.write_obj(viseme_obj(samples[start : start + hop]))
+            self.write_obj(viseme_obj(samples[start : start + hop], self._rms))
             sent += min(hop, n - start)
             if not self.pace:
                 continue

@@ -1,4 +1,5 @@
 from gourdsworth.guardrails import looks_distress, model_went_dark, parse_reply
+from gourdsworth.net import DEFAULT_GESTURE
 
 
 def test_distress():
@@ -84,3 +85,49 @@ def test_parse_gesture_only_line():
     assert gesture == "chuckle"
     assert "gesture" not in line.lower()
     assert "chuckle" not in line.lower()
+
+
+def _assert_words_in_order(line: str, *words: str) -> None:
+    low = line.lower()
+    pos = -1
+    for word in words:
+        found = low.find(word, pos + 1)
+        assert found > pos, (word, line)
+        pos = found
+
+
+def test_prose_tip_colon_is_not_a_gesture():
+    line, gesture = parse_reply("Here's a tip: share your candy.")
+    assert gesture == DEFAULT_GESTURE
+    _assert_words_in_order(line, "tip", "share")
+    assert "candy" in line.lower()
+
+
+def test_prose_beam_and_attend_labels_are_kept():
+    cases = (
+        ("Beam: the lantern is lit, citizens.", ("beam", "lantern", "lit", "citizens")),
+        ("Citizens, beam: the lantern is lit.", ("citizens", "beam", "lantern", "lit")),
+        ("Attend: the town meeting starts at noon.", ("attend", "town", "meeting", "noon")),
+        (
+            "Citizens, attend: the town meeting starts at noon.",
+            ("citizens", "attend", "town", "meeting", "noon"),
+        ),
+    )
+    for raw, words in cases:
+        line, gesture = parse_reply(raw)
+        assert gesture == DEFAULT_GESTURE
+        _assert_words_in_order(line, *words)
+
+
+def test_gesture_tag_keeps_prose_tip_sentence():
+    line, gesture = parse_reply("Here's a tip: share your candy.\nGESTURE: beam")
+    assert gesture == "beam"
+    _assert_words_in_order(line, "tip", "share", "candy")
+    assert "gesture" not in line.lower()
+
+
+def test_line_label_tip_tip_is_a_gesture():
+    line, gesture = parse_reply("Splendid costume.\nTip: tip")
+    assert gesture == "tip"
+    assert line == "Splendid costume."
+    assert "tip" not in line.lower()

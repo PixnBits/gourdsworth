@@ -93,6 +93,11 @@ TX / 15 RX, 115200 8N1, `/dev/serial0`). Commands are `viseme` (id
 and `ping`. Old names `stamp`, `wave`, `think`, `laugh`, `bow`, and `listen`
 are ignored and do not stall the mouth.
 
+`CRATE_FACE_LATENCY_MS` (default 200) delays the first viseme so the mouth
+does not lead the speaker. PipeWire playback also waits out `CRATE_BT_PRIME_MS`,
+because that backend prepends a silence prime. Porch-tunable: raise
+`CRATE_FACE_LATENCY_MS` if the mouth leads the JBL, lower it if the mouth lags.
+
 ```bash
 PYTHONPATH=src python clients/pi/crate_client.py --face-dry-run
 PYTHONPATH=src python clients/pi/crate_client.py --face-port /dev/serial0 --host 127.0.0.1 --no-camera
