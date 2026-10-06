@@ -65,6 +65,7 @@ def test_remainder_after():
 
 
 def test_parse_then_speak_never_says_gesture():
-    line, gesture = parse_reply("A fine young citizen! GESTURE: stamp")
-    assert gesture == "stamp"
+    line, gesture = parse_reply("A fine young citizen! GESTURE: attend")
+    assert gesture == "attend"
     assert "gesture" not in line.lower()
+    assert "attend" not in line.lower()

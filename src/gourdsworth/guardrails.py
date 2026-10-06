@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import re
 
+from gourdsworth.net import ALLOWED_GESTURES, DEFAULT_GESTURE
+
 BANNED = re.compile(
     r"\b("
     r"kill|murder|blood|gore|guts|stab|gun|knife|bomb|"
@@ -61,26 +63,58 @@ def strip_markdown(text: str) -> str:
     return " ".join(text.split())
 
 
-# Model sometimes emits "GESTURE: wave", "Gesture: wave", or even "Wave: wave".
+# Retired names are stripped so they are not spoken, but they are not poses.
+_RETIRED_GESTURES = frozenset({"stamp", "wave", "think", "laugh", "bow", "listen"})
+_GESTURE_WORDS = frozenset(ALLOWED_GESTURES) | _RETIRED_GESTURES
+
+
+def _gesture_alt(names: frozenset[str] = _GESTURE_WORDS) -> str:
+    return "|".join(re.escape(name) for name in sorted(names, key=len, reverse=True))
+
+
+_GESTURE_ALT = _gesture_alt()
+
+# Prompt tag anywhere: "GESTURE: beam". The next word is the name, allowed or not.
 GESTURE_RE = re.compile(
-    r"(?:^|\s)(?:GESTURE|Gesture|gesture|Wave|WAVE)\s*:\s*([A-Za-z]+)\b",
+    r"\bGESTURE[ \t]*:[ \t]*([A-Za-z]+)\b",
+    re.I,
+)
+# A whole line that is only a gesture label plus a known name: "Tip: tip".
+# "Beam: the lantern is lit" is prose — the word after the colon is not a name.
+_GESTURE_LINE_RE = re.compile(
+    rf"^[ \t]*(?:{_GESTURE_ALT})[ \t]*:[ \t]*({_GESTURE_ALT})[ \t]*$",
     re.I | re.M,
 )
-ALLOWED_GESTURES = frozenset({"stamp", "wave", "think", "laugh", "bow", "listen"})
+_ONLY_GESTURE_RE = re.compile(
+    rf"[ \t]*(?:GESTURE|{_GESTURE_ALT})[ \t]*:[ \t]*({_GESTURE_ALT})[ \t]*[.!?]?[ \t]*",
+    re.I,
+)
 
 
 def _extract_gesture(raw: str) -> tuple[str, str]:
-    """Return (text_without_gesture, gesture_name). Default gesture is stamp."""
-    gesture = "stamp"
-    matches = list(GESTURE_RE.finditer(raw or ""))
-    if matches:
-        name = matches[-1].group(1).strip().lower()
-        if name in ALLOWED_GESTURES:
-            gesture = name
-        # Strip all GESTURE tags from spoken text
-        cleaned = GESTURE_RE.sub(" ", raw or "")
-    else:
-        cleaned = raw or ""
+    """Return (text_without_gesture, gesture_name). Unknown names become the default."""
+    text = raw or ""
+    gesture = DEFAULT_GESTURE
+    spans: list[tuple[int, int, str]] = []
+    for match in GESTURE_RE.finditer(text):
+        spans.append((match.start(), match.end(), match.group(1)))
+    for match in _GESTURE_LINE_RE.finditer(text):
+        spans.append((match.start(), match.end(), match.group(1)))
+    if not spans:
+        return text, gesture
+    spans.sort()
+    kept: list[tuple[int, int, str]] = []
+    for start, end, name in spans:
+        if kept and start < kept[-1][1]:
+            continue
+        kept.append((start, end, name))
+    # The last tag wins. An unknown or retired name stays the default.
+    key = kept[-1][2].strip().lower()
+    if key in ALLOWED_GESTURES:
+        gesture = key
+    cleaned = text
+    for start, end, _name in reversed(kept):
+        cleaned = cleaned[:start] + " " + cleaned[end:]
     return cleaned, gesture
 
 
@@ -143,10 +177,6 @@ def clip_spoken(line: str, max_words: int = 20) -> str:
 
 
 
-_GESTURE_WORDS = frozenset({"stamp", "wave", "think", "laugh", "bow", "listen"})
-
-
-
 def finish_spoken(line: str) -> str:
     """Avoid hanging mid-thought endings like '...Candy:'."""
     line = (line or "").strip()
@@ -196,23 +226,32 @@ def scrub_relationship_words(line: str) -> str:
 def sanitize_spoken(line: str) -> str:
     """Strip leaked gesture *tags*, not English verbs like "stamp" / "wave".
 
-    Keep mid-sentence English verbs ("I'll cheer you on"). Only drop:
-    - leading Gesture:/Wave:/Stamp: prefixes
+    Keep mid-sentence English ("I'll stamp that", "attend the bowl") and a
+    prose label ("Beam: the lantern is lit"). Only drop:
+    - a leading "Wave." style prefix
+    - a line that is only "Tip: tip"
     - a gesture word dangling after sentence-end punctuation
     - a lone ALL-CAPS gesture token, or a whole utterance that is just one
     """
     line = (line or "").strip()
     if not line:
         return line
+    # "Wave. You're..." is a leaked tag. "Beam: the lantern is lit" is prose.
     line = re.sub(
-        r"^(?:GESTURE|Gesture|Wave|Stamp|Think|Laugh|Bow|Listen)\s*[:.]\s*",
+        rf"^(?:GESTURE|{_GESTURE_ALT})\s*\.\s*",
         "",
         line,
         flags=re.I,
     ).strip()
-    # "...for you. stamp" / "...candy. Wave" — leaked tag after a sentence
     line = re.sub(
-        r"(?<=[.!?])\s+(?:stamp|wave|think|laugh|bow|listen)\s*[.!?]?\s*$",
+        rf"^(?:GESTURE|{_GESTURE_ALT})\s*:\s*(?:{_GESTURE_ALT})\s*[.!?]?$",
+        "",
+        line,
+        flags=re.I,
+    ).strip()
+    # "...for you. stamp" / "...candy. Tip" — leaked tag after a sentence
+    line = re.sub(
+        rf"(?<=[.!?])\s+(?:{_GESTURE_ALT})\s*[.!?]?\s*$",
         "",
         line,
         flags=re.I,
@@ -246,15 +285,11 @@ def parse_reply(raw: str) -> tuple[str, str]:
     line = clip_spoken(line, max_words=20)
     line = sanitize_spoken(line)
     line = finish_spoken(line)
-    # If the model only emitted a gesture tag, don't speak "Wave: wave"
+    # If the model only emitted a gesture tag, don't speak "Tip: tip"
     if not line:
         line = "Candy awaits, citizens."
-    # Catch residual "Wave: wave" / "Gesture: stamp" left as spoken text
-    only_gesture = re.fullmatch(
-        r"(?:GESTURE|Gesture|gesture|Wave|WAVE)\s*:\s*([A-Za-z]+)\s*",
-        line,
-        flags=re.I,
-    )
+    # Residual line that is only a label plus a known gesture name ("Tip: tip").
+    only_gesture = _ONLY_GESTURE_RE.fullmatch(line)
     if only_gesture:
         name = only_gesture.group(1).strip().lower()
         if name in ALLOWED_GESTURES:

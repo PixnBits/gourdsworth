@@ -158,7 +158,7 @@ def test_net_module_has_no_disk_or_tempfile_api():
     assert ".jpg" not in text or "JPEG" in text
 
 
-def _start_echo(gesture: str = "stamp") -> tuple[CrateListener, threading.Thread]:
+def _start_echo(gesture: str = "tip") -> tuple[CrateListener, threading.Thread]:
     listener = CrateListener("127.0.0.1", 0)
 
     def server() -> None:
@@ -183,7 +183,7 @@ def test_tcp_loopback_fake_client_talk_roundtrip(tmp_path, monkeypatch):
     monkeypatch.setenv("TEMP", str(tmp_path))
     monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
 
-    listener, thread = _start_echo(gesture="wave")
+    listener, thread = _start_echo(gesture="beam")
     try:
         sock = socket.create_connection(("127.0.0.1", listener.port), timeout=3)
         client = CrateConnection(sock)
@@ -230,7 +230,7 @@ def test_tcp_loopback_fake_client_talk_roundtrip(tmp_path, monkeypatch):
 
             gest = client.wait_event("gesture", timeout=3)
             assert gest is not None
-            assert gest[0]["name"] == "wave"
+            assert gest[0]["name"] == "beam"
             assert gest[0]["name"] in ALLOWED_GESTURES
             ready2 = client.wait_event("ready", timeout=3)
             assert ready2 is not None
