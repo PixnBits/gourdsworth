@@ -1,0 +1,7 @@
+# Light test-only set (no models, no audio hardware).
+# Must not grow heavy deps.
+pytest>=8.0
+numpy>=2.0.0
+pyyaml>=6.0.2
+requests>=2.32.0
+soundfile>=0.13.0
