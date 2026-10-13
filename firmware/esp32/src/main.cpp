@@ -4,6 +4,7 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <WiFi.h>
+#include <Preferences.h>
 #include <Adafruit_PWMServoDriver.h>
 
 #define FASTLED_ALLOW_INTERRUPTS 0
@@ -51,13 +52,29 @@ static const uint32_t CHUCKLE_SHUT_MS = 220;
 static const uint32_t BLINK_EVERY_MS = 4500;
 static const uint32_t BLINK_SHUT_MS = 140;
 static const uint32_t LINK_QUIET_MS = 2000;
-static const uint8_t BRIGHT_CAP = 102;  // 40% of 255
+// Default cap is 40% of 255. Speech still tops out at floor+span (102) and
+// is then clamped to the runtime cap, so a higher cap does not brighten speech.
+static const uint8_t DEFAULT_BRIGHT_CAP = 102;
+static const uint8_t DEFAULT_BASE_R = 255;
+static const uint8_t DEFAULT_BASE_G = 140;
+static const uint8_t DEFAULT_BASE_B = 20;
 static const uint8_t SPEECH_FLOOR = 50;
-static const uint8_t SPEECH_SPAN = 52;  // floor + span reaches BRIGHT_CAP
+static const uint8_t SPEECH_SPAN = 52;  // floor + span reaches the default cap
 // typical Piper en_US-danny-low frame RMS peaks ~0.3-0.4
 static const float RMS_REF = 0.30f;
 
 static const int MOUTH_N = MOUTH_COLS * MOUTH_ROWS;
+static const int FACE_N = MOUTH_N + EYE_LEDS + EYE_LEDS;
+static const int MAX_SWATCHES = 16;
+
+static uint8_t baseR = DEFAULT_BASE_R;
+static uint8_t baseG = DEFAULT_BASE_G;
+static uint8_t baseB = DEFAULT_BASE_B;
+static uint8_t brightCap = DEFAULT_BRIGHT_CAP;
+static bool testMode = false;
+
+static Preferences prefs;
+static const char* PREF_NS = "face";
 
 CRGB mouth[MOUTH_N];
 CRGB eyeL[EYE_LEDS];
@@ -77,8 +94,10 @@ static char visemeId[8] = "rest";
 static float visemeRms = 0.0f;
 static bool visemeLive = false;
 static uint32_t lastUartMs = 0;
-static char lineBuf[160];
-static uint8_t lineLen = 0;
+// 16 full-scale swatches encode to about 232 bytes. 512 leaves room for the NUL.
+static char lineBuf[512];
+static uint16_t lineLen = 0;
+static bool lineDrop = false;
 
 static void radioOff() {
   WiFi.persistent(false);
@@ -108,12 +127,18 @@ static void writeDeg(uint8_t channel, int deg) {
   writeUs(channel, degToUs(deg));
 }
 
-static CRGB amber(uint8_t scale) {
+// Normal-mode pixels. scale is 0–255 and is limited to the brightness cap.
+// Test mode does not call this: those pixels are the exact commanded RGB.
+static CRGB faceColor(uint8_t scale) {
 #if FULL_WHITE_TEST
   if (scale == 0) return CRGB::Black;
   return CRGB(255, 255, 255);
 #else
-  return CRGB(scale, (uint8_t)(((uint16_t)scale * 80) / 255), 0);
+  if (scale > brightCap) scale = brightCap;
+  return CRGB(
+      (uint8_t)(((uint16_t)scale * baseR) / 255),
+      (uint8_t)(((uint16_t)scale * baseG) / 255),
+      (uint8_t)(((uint16_t)scale * baseB) / 255));
 #endif
 }
 
@@ -153,13 +178,13 @@ static void renderMouthSpeech() {
   if (loud < 0.0f) loud = 0.0f;
   if (loud > 1.0f) loud = 1.0f;
   float capf = (float)SPEECH_FLOOR + loud * (float)SPEECH_SPAN;
-  if (capf > (float)BRIGHT_CAP) capf = (float)BRIGHT_CAP;
+  if (capf > (float)brightCap) capf = (float)brightCap;
   uint8_t cap = (uint8_t)(capf + 0.5f);
   for (int y = 0; y < MOUTH_ROWS; y++) {
     for (int x = 0; x < MOUTH_COLS; x++) {
       uint8_t mask = mouthMask(visemeId, x, y);
       uint8_t scale = (uint8_t)(((uint16_t)cap * mask) / 255);
-      mouth[mouthIndex(x, y)] = amber(scale);
+      mouth[mouthIndex(x, y)] = faceColor(scale);
     }
   }
 }
@@ -174,7 +199,7 @@ static void renderMouthFlicker(uint32_t now) {
       int dy = y - (MOUTH_ROWS / 2);
       if (dy < 0) dy = -dy;
       bool on = (dx + dy * 2) < 8;
-      mouth[mouthIndex(x, y)] = on ? amber(bri) : CRGB::Black;
+      mouth[mouthIndex(x, y)] = on ? faceColor(bri) : CRGB::Black;
     }
   }
 }
@@ -194,12 +219,12 @@ static bool blinkClosed(uint32_t now, EyeShape shape) {
 static void renderEye(CRGB* leds, int count, EyeShape shape, uint32_t now) {
   bool shut = blinkClosed(now, shape);
   uint8_t bri = 80;
-  if (shape == EYE_WIDE) bri = BRIGHT_CAP;
+  if (shape == EYE_WIDE) bri = brightCap;
   else if (shape == EYE_HALF) bri = 70;
   for (int i = 0; i < count; i++) {
     bool on = !shut;
     if (on && shape == EYE_HALF) on = i >= (count / 2);
-    leds[i] = on ? amber(bri) : CRGB::Black;
+    leds[i] = on ? faceColor(bri) : CRGB::Black;
   }
 }
 
@@ -288,6 +313,123 @@ static bool copyFloat(const char* src, const char* key, float* out) {
   return true;
 }
 
+static bool isDelim(char c) {
+  return c == 0 || c == ',' || c == '}' || c == ']' || c == ' ' || c == '\t';
+}
+
+// Integer field. Missing key → false. Present but not a bare integer → false
+// and *bad set, so the caller can drop the whole line.
+static bool copyLong(const char* src, const char* key, long* out, bool* bad) {
+  char pat[20];
+  snprintf(pat, sizeof(pat), "\"%s\"", key);
+  const char* p = strstr(src, pat);
+  if (!p) return false;
+  p += strlen(pat);
+  while (*p == ' ' || *p == '\t' || *p == ':') p++;
+  char* end = nullptr;
+  long value = strtol(p, &end, 10);
+  if (end == p || !isDelim(*end)) {
+    *bad = true;
+    return false;
+  }
+  *out = value;
+  return true;
+}
+
+static bool copyU8(const char* src, const char* key, uint8_t* out) {
+  bool bad = false;
+  long value = 0;
+  if (!copyLong(src, key, &value, &bad) || bad) return false;
+  if (value < 0 || value > 255) return false;
+  *out = (uint8_t)value;
+  return true;
+}
+
+static void loadPrefs() {
+  if (!prefs.begin(PREF_NS, true)) return;
+  baseR = prefs.getUChar("r", DEFAULT_BASE_R);
+  baseG = prefs.getUChar("g", DEFAULT_BASE_G);
+  baseB = prefs.getUChar("b", DEFAULT_BASE_B);
+  brightCap = prefs.getUChar("cap", DEFAULT_BRIGHT_CAP);
+  prefs.end();
+}
+
+static void savePrefs() {
+  if (!prefs.begin(PREF_NS, false)) {
+    Serial.println("face prefs save failed");
+    return;
+  }
+  prefs.putUChar("r", baseR);
+  prefs.putUChar("g", baseG);
+  prefs.putUChar("b", baseB);
+  prefs.putUChar("cap", brightCap);
+  prefs.end();
+}
+
+static void clearFace() {
+  fill_solid(mouth, MOUTH_N, CRGB::Black);
+  fill_solid(eyeL, EYE_LEDS, CRGB::Black);
+  fill_solid(eyeR, EYE_LEDS, CRGB::Black);
+}
+
+// Wire order: mouth[0..MOUTH_N), eye L, eye R. Same split as swatch_layout().
+static void paintRange(int start, int count, uint8_t r, uint8_t g, uint8_t b) {
+  CRGB color(r, g, b);
+  for (int i = 0; i < count; i++) {
+    int idx = start + i;
+    if (idx < MOUTH_N) mouth[idx] = color;
+    else if (idx < MOUTH_N + EYE_LEDS) eyeL[idx - MOUTH_N] = color;
+    else eyeR[idx - MOUTH_N - EYE_LEDS] = color;
+  }
+}
+
+static void beginTest() {
+  if (testMode) return;
+  clearFace();
+  testMode = true;
+}
+
+// Earlier groups take the remainder so counts differ by at most one.
+// 10 LEDs into 3 groups → 4, 3, 3.
+static bool paintSwatches(const uint8_t* rgb, int n) {
+  if (n < 1 || n > MAX_SWATCHES || n > FACE_N) return false;
+  beginTest();
+  int base = FACE_N / n;
+  int extra = FACE_N % n;
+  int start = 0;
+  for (int i = 0; i < n; i++) {
+    int count = base + (i < extra ? 1 : 0);
+    paintRange(start, count, rgb[i * 3], rgb[i * 3 + 1], rgb[i * 3 + 2]);
+    start += count;
+  }
+  return true;
+}
+
+static bool parseRgb(const char* src, uint8_t* out, int maxTriples, int* nOut) {
+  const char* p = strstr(src, "\"rgb\"");
+  if (!p) return false;
+  p = strchr(p, '[');
+  if (!p) return false;
+  p++;
+  int n = 0;
+  int limit = maxTriples * 3;
+  while (*p && *p != ']') {
+    while (*p == ' ' || *p == '\t' || *p == ',') p++;
+    if (*p == ']') break;
+    if (*p == '-') return false;
+    if (*p == '+') p++;
+    char* end = nullptr;
+    long value = strtol(p, &end, 10);
+    if (end == p || value < 0 || value > 255 || !isDelim(*end)) return false;
+    if (n >= limit) return false;
+    out[n++] = (uint8_t)value;
+    p = end;
+  }
+  if (*p != ']' || n == 0 || (n % 3) != 0) return false;
+  *nOut = n / 3;
+  return true;
+}
+
 static bool startPose(const char* name) {
   Pose next;
   if (strcmp(name, "tip") == 0) next = POSE_TIP;
@@ -303,12 +445,69 @@ static bool startPose(const char* name) {
 }
 
 static void handleLine(const char* line) {
-  char op[16];
+  // "set_brightness_cap" is 19 characters; keep the buffer larger than that.
+  char op[32];
   if (!copyField(line, "op", op, sizeof(op))) return;
   if (strcmp(op, "ping") == 0) {
     Serial2.print("{\"op\":\"pong\"}\n");
     return;
   }
+  if (strcmp(op, "set_color") == 0) {
+    uint8_t r, g, b;
+    if (!copyU8(line, "r", &r) || !copyU8(line, "g", &g) || !copyU8(line, "b", &b)) return;
+    if (r == baseR && g == baseG && b == baseB) return;
+    baseR = r;
+    baseG = g;
+    baseB = b;
+    savePrefs();
+    return;
+  }
+  if (strcmp(op, "set_brightness_cap") == 0) {
+    uint8_t cap;
+    if (!copyU8(line, "cap", &cap)) return;
+    if (cap == brightCap) return;
+    brightCap = cap;
+    savePrefs();
+    return;
+  }
+  if (strcmp(op, "test_fill") == 0) {
+    uint8_t r, g, b;
+    if (!copyU8(line, "r", &r) || !copyU8(line, "g", &g) || !copyU8(line, "b", &b)) return;
+    bool bad = false;
+    long start = 0;
+    long count = 0;
+    bool hasStart = copyLong(line, "start", &start, &bad);
+    bool hasCount = copyLong(line, "count", &count, &bad);
+    if (bad || hasStart != hasCount) return;
+    if (!hasStart) {
+      start = 0;
+      count = FACE_N;
+    } else if (start < 0 || count < 1 || start > FACE_N || count > FACE_N ||
+               start + count > FACE_N) {
+      return;
+    }
+    beginTest();
+    // Exact RGB. Not multiplied by the brightness cap. The 4 A limit still
+    // applies inside FastLED.show().
+    paintRange((int)start, (int)count, r, g, b);
+    return;
+  }
+  if (strcmp(op, "test_swatches") == 0) {
+    uint8_t n = 0;
+    if (!copyU8(line, "n", &n)) return;
+    uint8_t rgb[MAX_SWATCHES * 3];
+    int parsed = 0;
+    if (!parseRgb(line, rgb, MAX_SWATCHES, &parsed)) return;
+    if (parsed != (int)n) return;
+    paintSwatches(rgb, parsed);
+    return;
+  }
+  if (strcmp(op, "test_exit") == 0) {
+    testMode = false;
+    return;
+  }
+  // Gestures and mouth frames must not paint over a test pattern.
+  if (testMode) return;
   if (strcmp(op, "idle") == 0) {
     goIdle();
     return;
@@ -343,13 +542,18 @@ static void pollUart() {
     lastUartMs = millis();
     if (c == '\r') continue;
     if (c != '\n') {
-      if (lineLen + 1 < sizeof(lineBuf)) lineBuf[lineLen++] = c;
-      else lineLen = 0;
+      if (lineDrop || lineLen + 1 >= sizeof(lineBuf)) {
+        lineDrop = true;
+        lineLen = 0;
+      } else {
+        lineBuf[lineLen++] = c;
+      }
       continue;
     }
     lineBuf[lineLen] = 0;
-    if (lineLen > 0) handleLine(lineBuf);
+    if (!lineDrop && lineLen > 0) handleLine(lineBuf);
     lineLen = 0;
+    lineDrop = false;
   }
   if ((uint32_t)(millis() - lastUartMs) >= LINK_QUIET_MS) {
     visemeLive = false;
@@ -359,6 +563,7 @@ static void pollUart() {
 
 static void render(uint32_t now) {
   applyServos(now);
+  if (testMode) return;
   if (visemeLive) renderMouthSpeech();
   else renderMouthFlicker(now);
   EyeShape shape = eyeShape(now);
@@ -369,6 +574,7 @@ static void render(uint32_t now) {
 void setup() {
   radioOff();
   Serial.begin(115200);
+  loadPrefs();
   Serial2.begin(115200, SERIAL_8N1, PIN_RX, PIN_TX);
   Wire.begin(PIN_SDA, PIN_SCL);
   pca.begin();
@@ -394,7 +600,7 @@ void setup() {
   FastLED.clear(true);
   goIdle();
   lastUartMs = millis();
-  Serial.println("face up, wifi off");
+  Serial.printf("face up, wifi off, colour %u,%u,%u cap %u\n", baseR, baseG, baseB, brightCap);
 }
 
 void loop() {

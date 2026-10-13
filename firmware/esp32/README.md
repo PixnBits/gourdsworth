@@ -22,9 +22,33 @@ The ESP32 is the only device that pulses servos or clocks LEDs. Wi-Fi and Blueto
 
 PCA9685 channels: 0 left brow, 1 right brow, 2 hat tip, 3 mustache (center at rest; `twirl` swings it). Gestures: `tip`, `beam`, `reckon`, `chuckle`, `attend`, `twirl`. Mouth is one 8×32 panel, `MOUTH_COLS` × `MOUTH_ROWS` (32×8, 256 px) on GPIO 18. `mouthIndex()` snakes 32-pixel rows (even rows left to right, odd rows right to left). Many 8×32 panels snake in 8-pixel columns instead, so light a test pattern first and change `mouthIndex()` if the mouth is mirrored or scrambled. Each eye is its own run, `EYE_LEDS` 16, GPIO 19 and 21. Do not chain the three data lines.
 
-Amber only: base `R=255, G=80, B=0`. Speech and idle brightness stay capped at 40%. `FULL_WHITE_TEST` forces lit pixels to white for a bench check (on the order of 6 A before the cap). Default is off. `FastLED.setMaxPowerInVoltsAndMilliamps(5, 4000)` holds the LED rail at 4 A. No blue channel.
+Base colour defaults to yellow-gold `R=255, G=140, B=20`. Speech brightness is still `50 + loudness * 52`, then clamped to the brightness cap (default 102, 40% of 255). A higher cap does not brighten speech past 102. Wide eyes use the cap. Every other normal-mode scale is also limited to the cap; at 102 that does not change flicker or a resting eye, because those levels were already below 102. `FULL_WHITE_TEST` still forces normal-mode lit pixels to white for a bench check (on the order of 6 A before the power limit). Default is off. `FastLED.setMaxPowerInVoltsAndMilliamps(5, 4000)` holds the LED rail at 4 A.
 
-If the UART is quiet for 2 seconds, or an `idle` line arrives, the mouth goes back to candle flicker and the eyes to a slow blink. A Pi reboot does not freeze the face. Unknown gesture names, including `stamp`, `wave`, `think`, `laugh`, `bow`, and `listen`, are ignored and do not stall the mouth.
+`set_color` and `set_brightness_cap` are stored in NVS namespace `face` (keys `r`, `g`, `b`, `cap`) and loaded in `setup` before the first frame.
+
+## UART lines
+
+One JSON object per line, 115200 8N1, no checksum. The same quoted-key scan that reads `op` reads the new fields. A bad field drops the line.
+
+| op | fields | effect |
+|---|---|---|
+| `ping` | | reply `{"op":"pong"}` |
+| `idle` | | candle flicker, neutral pose. Ignored in test mode |
+| `gesture` | `name` | one of `tip`, `beam`, `reckon`, `chuckle`, `attend`, `twirl`. Ignored in test mode |
+| `viseme` | `id`, `rms` | mouth shape. Ignored in test mode |
+| `set_color` | `r`, `g`, `b` (0–255) | base colour, saved |
+| `set_brightness_cap` | `cap` (0–255) | normal-mode cap, saved |
+| `test_fill` | `r`, `g`, `b`, optional `start`, `count` | enter test mode and paint exact RGB |
+| `test_swatches` | `n`, `rgb` (flat triples) | `n` contiguous groups, each one colour. `n` is 1–16 |
+| `test_exit` | | leave test mode; the next frame is the normal face |
+
+LED index 0 is `mouth[0]` in FastLED wire order, then the left eye (16), then the right eye (16). `test_fill` with no range paints all of them. With `start` and `count` it paints `[start, start+count)`. The first test command clears the face to black; a later range fill leaves the other test pixels alone.
+
+Swatch groups use the same split as `swatch_layout` in `clients/pi/face_link.py`: earlier groups get one extra LED when the count does not divide. 10 LEDs into 3 groups is 4, 3, 3. `n` must match the number of RGB triples. A mismatch is ignored.
+
+Test-mode pixels are the commanded RGB. They do not pass through the brightness cap and they ignore `FULL_WHITE_TEST`. The 4 A limit still applies at `FastLED.show()`, so a full-bright frame can be scaled down evenly. Hue relationships inside one frame stay put.
+
+If the UART is quiet for 2 seconds, or an `idle` line arrives, the mouth goes back to candle flicker and the eyes to a slow blink. A quiet link does not leave test mode, and an `idle` line is ignored while test mode is on, so the swatches stay until `test_exit`. A Pi reboot does not freeze the face. Unknown gesture names, including `stamp`, `wave`, `think`, `laugh`, `bow`, and `listen`, are ignored and do not stall the mouth.
 
 ## Flash
 
