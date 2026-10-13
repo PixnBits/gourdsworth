@@ -7,8 +7,13 @@ averages each swatch ROI, and scores CIEDE2000 against the target. A coarse
 grid runs first, then a small cube around the winner. ``--apply`` stores the
 winner with ``set_color``, which the firmware keeps in NVS.
 
-Camera, face link, and the v4l2 runner are arguments so a test can drive the
-search without hardware.
+One ROI is one colour. Swatch groups follow LED wire order, so a left-to-right
+split of that ROI measures the wrong LEDs. ``--swatches N`` opts into the split.
+After each command the script waits, drains grabs that have finished past that
+wait, and samples a per-pixel median. It never reads the serial port.
+
+Camera, face link, the clock, sleep, and the v4l2 runner are arguments so a
+test can drive the search without hardware.
 """
 
 from __future__ import annotations
@@ -32,10 +37,43 @@ DEFAULT_GRID_R = (255, 220, 180)
 DEFAULT_GRID_G = (40, 80, 120, 160, 200)
 DEFAULT_GRID_B = (0, 20, 40)
 DEFAULT_REFINE = (16, 8)
-DEFAULT_SWATCHES = 8
-DEFAULT_EXPOSURE = 250
-DEFAULT_SETTLE_S = 0.2
+# One ROI shows one colour. Wire order is not left-to-right in the image,
+# so the old default of 8 measured slot position instead of the swatch.
+DEFAULT_SWATCHES = 1
+# Manual exposure_absolute in 100 µs units. The CLI default is "auto".
+DEFAULT_EXPOSURE = 1000
+DEFAULT_SETTLE_S = 0.25
+DEFAULT_DRAIN_FRAMES = 3
+DEFAULT_MEDIAN_FRAMES = 3
+DEFAULT_WIDTH = 640
+DEFAULT_HEIGHT = 480
+# Frames dropped once after open, before the size is recorded.
+WARMUP_FRAMES = 10
+# Reads per grab. The last one is the frame after the LEDs have updated.
+GRAB_READS = 5
+# 0–255. At or above this, a lit ROI is real signal. Below it, the capture is black.
+MIN_ROI_MEAN = 2.0
+# exposure_absolute ladder used by --exposure auto. Every rung is measured.
+EXPOSURE_LADDER = (250, 500, 1000, 2000)
+# Highest ROI max-channel mean that is still a legal exposure pick.
+EXPOSURE_MEAN_CAP = 200.0
+# A channel clips when this fraction of ROI pixels is at or above CLIP_LEVEL.
+CLIP_LEVEL = 250
+CLIP_FRACTION_MAX = 0.02
+# Off-versus-on and ramp-end rise, in summed channel means (0–765).
+SANITY_RISE = 15.0
+SANITY_TOLERANCE_ABS = 3.0
+SANITY_TOLERANCE_FRAC = 0.05
+SANITY_RAMP_SCALES = (0.0, 0.25, 0.5, 0.75, 1.0)
+# One mid orange held in every slot while auto exposure is measured.
+MID_SWATCH = (220, 120, 20)
+# Bright fill used only to prove the camera can see the face before the search.
+PROBE_RGB = (255, 180, 40)
 POWER_LIMIT_MA = 4000
+BLACK_FRAME_MSG = (
+    "camera frames are black / ROI mean ~0; check --camera, --roi, --exposure"
+)
+SANITY_MSG = "frames look stale/lagging or the exposure is bad/clipped"
 
 # sRGB (D65) linear-RGB to XYZ. Row sums are the D65 white point below.
 _RGB_TO_XYZ = np.array(
@@ -50,7 +88,7 @@ _WHITE = np.array([0.95047, 1.0, 1.08883], dtype=np.float64)
 _EPS = 216.0 / 24389.0
 _KAPPA = 24389.0 / 27.0
 
-# 5×7 glyphs, high bit on the left. Enough for "255,140,20" and "dE 1.23".
+# 5×7 glyphs, high bit on the left. Enough for "255,140,20", "dE 1.23", "P", "C", "%".
 _FONT = {
     "0": (0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E),
     "1": (0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E),
@@ -68,12 +106,15 @@ _FONT = {
     "-": (0x00, 0x00, 0x00, 0x1F, 0x00, 0x00, 0x00),
     "d": (0x01, 0x01, 0x0D, 0x13, 0x11, 0x11, 0x0F),
     "E": (0x1F, 0x10, 0x1E, 0x10, 0x10, 0x10, 0x1F),
+    "P": (0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10),
+    "C": (0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E),
+    "%": (0x19, 0x1A, 0x04, 0x04, 0x0B, 0x13, 0x13),
 }
 
 SHEET_COLS = 6
 SHEET_MARGIN = 4
-CELL_W = 156
-CELL_H = 82
+CELL_W = 172
+CELL_H = 116
 CELL_GAP = 6
 SWATCH_H = 46
 
@@ -84,6 +125,22 @@ class Sample:
     measured_rgb: tuple[float, float, float]
     delta_e: float
     stage: str
+    peak_rgb: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    clip_fraction: tuple[float, float, float] = (0.0, 0.0, 0.0)
+
+
+@dataclass(frozen=True)
+class ExposureRung:
+    exposure: int
+    max_channel_mean: float
+    clip_fraction: tuple[float, float, float]
+
+
+@dataclass(frozen=True)
+class ExposurePick:
+    chosen: int
+    rungs: tuple[ExposureRung, ...] = ()
+    all_clipped: bool = False
 
 
 @dataclass(frozen=True)
@@ -94,6 +151,8 @@ class CalibResult:
     measured_rgb: tuple[float, float, float]
     samples: tuple[Sample, ...]
     applied: bool = False
+    sanity: dict | None = None
+    exposure: ExposurePick | None = None
 
 
 def srgb_to_lab(rgb) -> np.ndarray:
@@ -194,8 +253,8 @@ def split_roi_horizontal(roi: Sequence[int], n: int) -> list[tuple[int, int, int
     return [(x + start, y, count, h) for start, count in face_link.swatch_layout(w, n)]
 
 
-def mean_rgb(image: np.ndarray, roi: Sequence[int]) -> tuple[float, float, float]:
-    """Mean sRGB of an OpenCV BGR frame inside ``roi`` (x, y, w, h)."""
+def _crop_bgr(image: np.ndarray, roi: Sequence[int]) -> np.ndarray:
+    """Float BGR crop of ``roi`` (x, y, w, h). Raises when the box misses the frame."""
     frame = np.asarray(image)
     if frame.ndim != 3 or frame.shape[2] < 3:
         raise ValueError("frame must be HxWx3 BGR")
@@ -204,10 +263,199 @@ def mean_rgb(image: np.ndarray, roi: Sequence[int]) -> tuple[float, float, float
         raise ValueError("roi has no area")
     height, width = frame.shape[:2]
     if x < 0 or y < 0 or x + w > width or y + h > height:
-        raise ValueError(f"roi {(x, y, w, h)} is outside {width}x{height}")
-    crop = np.asarray(frame[y : y + h, x : x + w, :3], dtype=np.float64)
+        raise ValueError(
+            f"roi {(x, y, w, h)} falls outside the {width}x{height} frame; "
+            "check --roi, --width, and --height"
+        )
+    return np.asarray(frame[y : y + h, x : x + w, :3], dtype=np.float64)
+
+
+def mean_rgb(image: np.ndarray, roi: Sequence[int]) -> tuple[float, float, float]:
+    """Mean sRGB of an OpenCV BGR frame inside ``roi`` (x, y, w, h)."""
+    crop = _crop_bgr(image, roi)
     mean_bgr = crop.reshape(-1, 3).mean(axis=0)
     return (float(mean_bgr[2]), float(mean_bgr[1]), float(mean_bgr[0]))
+
+
+def roi_measurement(image: np.ndarray, roi: Sequence[int]) -> dict:
+    """Mean, per-channel peak, and clip fraction (pixels >= ``CLIP_LEVEL``) in sRGB order."""
+    crop = _crop_bgr(image, roi)
+    channels = (crop[:, :, 2], crop[:, :, 1], crop[:, :, 0])
+    return {
+        "mean": tuple(float(channel.mean()) for channel in channels),
+        "peak": tuple(float(channel.max()) for channel in channels),
+        "clip": tuple(float(np.mean(channel >= CLIP_LEVEL)) for channel in channels),
+    }
+
+
+def ensure_rois_fit(frame: np.ndarray, rois: Sequence[Sequence[int]]) -> None:
+    """Raise when an ROI does not lie inside the grabbed frame.
+
+    Coordinates are in the capture's pixel space. A box measured on a
+    640×480 preview does not land on a 1920×1080 frame.
+    """
+    image = np.asarray(frame)
+    if image.ndim < 2:
+        raise ValueError("frame has no size")
+    height, width = (int(image.shape[0]), int(image.shape[1]))
+    for roi in rois:
+        # mean_rgb raises the same out-of-frame error and checks the channels.
+        mean_rgb(image, roi)
+
+
+def _roi_pixel_mean(frame: np.ndarray, roi: Sequence[int]) -> float:
+    red, green, blue = mean_rgb(frame, roi)
+    return (red + green + blue) / 3.0
+
+
+def _clock_of(clock: Callable[[], float] | None) -> Callable[[], float]:
+    return time.monotonic if clock is None else clock
+
+
+def _sleep_of(sleep: Callable[[float], None] | None) -> Callable[[float], None]:
+    return time.sleep if sleep is None else sleep
+
+
+def _as_count(value, label: str, *, minimum: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{label} must be an integer")
+    if value < minimum:
+        raise ValueError(f"{label} must be >= {minimum}")
+    return value
+
+
+def capture_settled(
+    camera,
+    *,
+    command_time: float,
+    settle_s: float,
+    drain_frames: int = DEFAULT_DRAIN_FRAMES,
+    median_frames: int = DEFAULT_MEDIAN_FRAMES,
+    clock: Callable[[], float] | None = None,
+    sleep: Callable[[float], None] | None = None,
+) -> np.ndarray:
+    """Sleep, drop grabs that finished after the settle deadline, then take a median.
+
+    ``command_time`` and ``clock`` are seconds from the same injectable clock.
+    A grab counts toward ``drain_frames`` when ``clock()`` after it returns is
+    at or after ``command_time + settle_s``. The sample is the per-pixel median
+    of the next ``median_frames`` grabs. Only ``camera.grab`` is called.
+    """
+    now = _clock_of(clock)
+    pause = _sleep_of(sleep)
+    settle = float(settle_s)
+    if settle < 0:
+        raise ValueError("settle must be >= 0")
+    drain_n = _as_count(drain_frames, "drain frames", minimum=0)
+    median_n = _as_count(median_frames, "median frames", minimum=1)
+    if settle > 0:
+        pause(settle)
+    ready = float(command_time) + settle
+    drained = 0
+    spins = 0
+    # A frozen clock must fail instead of spinning. Real monotonic time moves.
+    limit = drain_n + 10000
+    while drained < drain_n:
+        camera.grab()
+        spins += 1
+        if float(now()) >= ready:
+            drained += 1
+        elif spins > limit:
+            raise RuntimeError(
+                "settle clock did not advance; frames never finished after the command"
+            )
+    frames = [np.asarray(camera.grab()) for _ in range(median_n)]
+    stacked = np.stack([np.asarray(frame, dtype=np.float64) for frame in frames], axis=0)
+    median = np.median(stacked, axis=0)
+    return np.clip(np.rint(median), 0, 255).astype(np.uint8)
+
+
+def _scale_rgb(rgb: Sequence[int], scale: float) -> tuple[int, int, int]:
+    scaled = []
+    for channel in rgb:
+        value = int(round(float(channel) * float(scale)))
+        scaled.append(min(255, max(0, value)))
+    return (scaled[0], scaled[1], scaled[2])
+
+
+def _combine_rois(frame: np.ndarray, rois: Sequence[Sequence[int]]) -> dict:
+    """Average means across ROIs. Peak and clip fraction take the hottest ROI."""
+    if not rois:
+        raise ValueError("need at least one ROI")
+    measurements = [roi_measurement(frame, roi) for roi in rois]
+    count = float(len(measurements))
+    mean = tuple(
+        sum(item["mean"][channel] for item in measurements) / count for channel in range(3)
+    )
+    peak = tuple(max(item["peak"][channel] for item in measurements) for channel in range(3))
+    clip = tuple(max(item["clip"][channel] for item in measurements) for channel in range(3))
+    brightness = sum(sum(item["mean"]) for item in measurements) / count
+    return {
+        "measured_rgb": mean,
+        "peak_rgb": peak,
+        "clip_fraction": clip,
+        "brightness": float(brightness),
+    }
+
+
+def _exposure_stats(frame: np.ndarray, rois: Sequence[Sequence[int]]) -> tuple[float, tuple[float, float, float]]:
+    measurements = [roi_measurement(frame, roi) for roi in rois]
+    max_mean = max(max(item["mean"]) for item in measurements)
+    clip = tuple(max(item["clip"][channel] for item in measurements) for channel in range(3))
+    return float(max_mean), clip
+
+
+def _clipped(clip: Sequence[float]) -> bool:
+    return any(float(channel) > CLIP_FRACTION_MAX for channel in clip)
+
+
+def _ramp_tolerance(previous: float) -> float:
+    return max(SANITY_TOLERANCE_ABS, SANITY_TOLERANCE_FRAC * abs(float(previous)))
+
+
+def _colour_list(triple) -> list[float]:
+    return [round(float(channel), 4) for channel in triple]
+
+
+def _reading_payload(rgb: Sequence[int], measurement: dict, *, scale: float | None = None) -> dict:
+    payload = {
+        "rgb": [int(channel) for channel in rgb],
+        "measured_rgb": _colour_list(measurement["measured_rgb"]),
+        "peak_rgb": _colour_list(measurement["peak_rgb"]),
+        "clip_fraction": [round(float(channel), 6) for channel in measurement["clip_fraction"]],
+        "brightness": round(float(measurement["brightness"]), 4),
+    }
+    if scale is not None:
+        payload["scale"] = float(scale)
+    return payload
+
+
+def check_signal(frame: np.ndarray, rois: Sequence[Sequence[int]]) -> None:
+    """Raise when the camera delivered black or an ROI missed the glow.
+
+    A 140×30 swatch on a 640×480 frame averages under ``MIN_ROI_MEAN`` even
+    when the LED is bright, so a dark surround is not a black frame. The
+    frame is black when its mean and its brightest pixel are both under the
+    floor. Each ROI is black when its pixel mean is under the floor.
+    """
+    image = np.asarray(frame)
+    if image.size == 0 or image.ndim < 2:
+        raise RuntimeError(BLACK_FRAME_MSG)
+    frame_mean = float(image.mean())
+    frame_peak = float(image.max())
+    frame_black = frame_mean < MIN_ROI_MEAN and frame_peak < MIN_ROI_MEAN
+    roi_mean = min(_roi_pixel_mean(image, roi) for roi in rois)
+    if frame_black or roi_mean < MIN_ROI_MEAN:
+        raise RuntimeError(
+            f"{BLACK_FRAME_MSG} (frame mean {frame_mean:.2f}, roi mean {roi_mean:.2f})"
+        )
+
+
+def samples_lack_signal(samples: Sequence[Sample]) -> bool:
+    """True when every swatch's brightest channel mean is under the floor."""
+    if not samples:
+        return True
+    return all(max(sample.measured_rgb) < MIN_ROI_MEAN for sample in samples)
 
 
 def candidate_grid(
@@ -262,6 +510,32 @@ def _chunks(items: Sequence[tuple[int, int, int]], size: int):
         yield list(items[start : start + size])
 
 
+def _show(
+    link,
+    colours: Sequence[Sequence[int]],
+    camera,
+    *,
+    settle_s: float,
+    drain_frames: int,
+    median_frames: int,
+    clock: Callable[[], float],
+    sleep: Callable[[float], None],
+) -> np.ndarray:
+    """Paint ``colours`` and return the settled median frame. Never reads serial."""
+    command_time = float(clock())
+    if not link.test_swatches(colours):
+        raise RuntimeError("face link did not accept swatches")
+    return capture_settled(
+        camera,
+        command_time=command_time,
+        settle_s=settle_s,
+        drain_frames=drain_frames,
+        median_frames=median_frames,
+        clock=clock,
+        sleep=sleep,
+    )
+
+
 def _evaluate_frame(
     link,
     camera,
@@ -274,15 +548,25 @@ def _evaluate_frame(
     *,
     real_n: int,
     settle_s: float,
+    drain_frames: int,
+    median_frames: int,
+    clock: Callable[[], float],
     sleep: Callable[[float], None],
 ) -> None:
     if not batch:
         return
-    if not link.test_swatches(batch):
-        raise RuntimeError("face link did not accept swatches")
-    if settle_s > 0:
-        sleep(settle_s)
-    frame = camera.grab()
+    # The ESP32 answers none of these lines. The write is fire-and-forget.
+    frame = _show(
+        link,
+        batch,
+        camera,
+        settle_s=settle_s,
+        drain_frames=drain_frames,
+        median_frames=median_frames,
+        clock=clock,
+        sleep=sleep,
+    )
+    ensure_rois_fit(frame, rois)
     if len(rois) == 1:
         regions = split_roi_horizontal(rois[0], len(batch))
     elif len(rois) == len(batch):
@@ -293,10 +577,92 @@ def _evaluate_frame(
         key = (int(colour[0]), int(colour[1]), int(colour[2]))
         if key in scored:
             continue
-        measured = mean_rgb(frame, roi)
+        stats = roi_measurement(frame, roi)
+        measured = stats["mean"]
         delta = delta_e_2000(srgb_to_lab(measured), target_lab)
-        scored[key] = Sample(rgb=key, measured_rgb=measured, delta_e=delta, stage=stage)
+        scored[key] = Sample(
+            rgb=key,
+            measured_rgb=measured,
+            delta_e=delta,
+            stage=stage,
+            peak_rgb=stats["peak"],
+            clip_fraction=stats["clip"],
+        )
         order.append(key)
+
+
+def _sanity_sweep(
+    link,
+    camera,
+    rois: Sequence[tuple[int, int, int, int]],
+    target: tuple[int, int, int],
+    frame_n: int,
+    *,
+    settle_s: float,
+    drain_frames: int,
+    median_frames: int,
+    clock: Callable[[], float],
+    sleep: Callable[[float], None],
+) -> dict:
+    """Off versus the target, then a ramp. Brightness is the sum of channel means.
+
+    Green through the orange shell sits near 1, so a green check false-fails a
+    lit face. A failed sweep means the frames are stale or the exposure is bad.
+    """
+
+    def measure(colour: tuple[int, int, int]) -> dict:
+        frame = _show(
+            link,
+            (colour,) * frame_n,
+            camera,
+            settle_s=settle_s,
+            drain_frames=drain_frames,
+            median_frames=median_frames,
+            clock=clock,
+            sleep=sleep,
+        )
+        ensure_rois_fit(frame, rois)
+        return _combine_rois(frame, rois)
+
+    off_colour = (0, 0, 0)
+    off = measure(off_colour)
+    on = measure(target)
+    rise = float(on["brightness"]) - float(off["brightness"])
+    if rise < SANITY_RISE:
+        raise RuntimeError(
+            f"{SANITY_MSG} (off brightness {off['brightness']:.2f}, "
+            f"on brightness {on['brightness']:.2f}, rise {rise:.2f})"
+        )
+    ramp_steps = []
+    for scale in SANITY_RAMP_SCALES:
+        colour = _scale_rgb(target, scale)
+        ramp_steps.append((scale, colour, measure(colour)))
+    brightnesses = [float(step[2]["brightness"]) for step in ramp_steps]
+    for previous, current in zip(brightnesses, brightnesses[1:]):
+        tolerance = _ramp_tolerance(previous)
+        if current < previous - tolerance:
+            rendered = ", ".join(f"{value:.2f}" for value in brightnesses)
+            raise RuntimeError(
+                f"{SANITY_MSG} (ramp brightness {rendered} is not non-decreasing "
+                f"within {tolerance:.2f})"
+            )
+    span = brightnesses[-1] - brightnesses[0]
+    if span < SANITY_RISE:
+        raise RuntimeError(
+            f"{SANITY_MSG} (ramp rose {span:.2f}, need at least {SANITY_RISE:.0f})"
+        )
+    return {
+        "threshold": SANITY_RISE,
+        "tolerance_abs": SANITY_TOLERANCE_ABS,
+        "tolerance_fraction": SANITY_TOLERANCE_FRAC,
+        "off": _reading_payload(off_colour, off),
+        "on": _reading_payload(target, on),
+        "rise": round(rise, 4),
+        "ramp": [
+            _reading_payload(colour, measurement, scale=scale)
+            for scale, colour, measurement in ramp_steps
+        ],
+    }
 
 
 def _best(scored: dict[tuple[int, int, int], Sample], order: Sequence[tuple[int, int, int]]):
@@ -313,17 +679,27 @@ def calibrate(
     candidates: Sequence[Sequence[int]] | None = None,
     swatches: int = DEFAULT_SWATCHES,
     refine_steps: Sequence[int] = DEFAULT_REFINE,
-    settle_s: float = 0.0,
+    settle_s: float = DEFAULT_SETTLE_S,
     sleep: Callable[[float], None] | None = None,
+    clock: Callable[[], float] | None = None,
+    drain_frames: int = DEFAULT_DRAIN_FRAMES,
+    median_frames: int = DEFAULT_MEDIAN_FRAMES,
+    skip_sanity: bool = False,
 ) -> CalibResult:
     """Show candidates, score them, refine, then leave test mode.
 
-    One ROI is split horizontally to match each frame. More than one ROI
-    fixes the swatch count at that length; a short final frame repeats its
-    last colour in the unused slots and does not score the repeats.
+    One ROI is one swatch unless ``swatches`` says otherwise. More than one
+    ROI fixes the swatch count at that length; a short final frame repeats
+    its last colour in the unused slots and does not score the repeats.
+    Samples are medians of grabs that finished after the settle wait.
     """
-    if sleep is None:
-        sleep = time.sleep
+    pause = _sleep_of(sleep)
+    now = _clock_of(clock)
+    drain_n = _as_count(drain_frames, "drain frames", minimum=0)
+    median_n = _as_count(median_frames, "median frames", minimum=1)
+    settle = float(settle_s)
+    if settle < 0:
+        raise ValueError("settle must be >= 0")
     regions = [tuple(int(v) for v in roi) for roi in rois]
     if not regions:
         raise ValueError("need at least one ROI")
@@ -356,13 +732,21 @@ def calibrate(
     scored: dict[tuple[int, int, int], Sample] = {}
     order: list[tuple[int, int, int]] = []
 
+    timing = dict(
+        settle_s=settle,
+        drain_frames=drain_n,
+        median_frames=median_n,
+        clock=now,
+        sleep=pause,
+    )
+
     def run_pass(colours: Sequence[tuple[int, int, int]], stage: str) -> None:
         if len(regions) == 1:
             pending = [colour for colour in colours if colour not in scored]
             for chunk in _chunks(pending, frame_n):
                 _evaluate_frame(
                     link, camera, chunk, regions, stage, target_lab, scored, order,
-                    real_n=len(chunk), settle_s=settle_s, sleep=sleep,
+                    real_n=len(chunk), **timing,
                 )
             return
         for chunk in _chunks(list(colours), frame_n):
@@ -372,10 +756,21 @@ def calibrate(
                 shown = chunk + [chunk[-1]] * (frame_n - real)
             _evaluate_frame(
                 link, camera, shown, regions, stage, target_lab, scored, order,
-                real_n=real, settle_s=settle_s, sleep=sleep,
+                real_n=real, **timing,
             )
 
     try:
+        # Light every slot, then look. A black grab here is the camera or the
+        # ROI, and the coarse grid would only record zeros.
+        probe = _show(link, (PROBE_RGB,) * frame_n, camera, **timing)
+        ensure_rois_fit(probe, regions)
+        check_signal(probe, regions)
+        sanity = None
+        if not skip_sanity:
+            sanity = _sanity_sweep(
+                link, camera, regions, target, frame_n, **timing,
+            )
+
         run_pass(pool, "coarse")
         if not scored:
             raise RuntimeError("calibration scored no swatches")
@@ -388,12 +783,15 @@ def calibrate(
             best = _best(scored, order)
         winner = scored[best]
         samples = tuple(scored[key] for key in order)
+        if samples_lack_signal(samples):
+            raise RuntimeError(BLACK_FRAME_MSG)
         return CalibResult(
             target_rgb=target,
             best_rgb=winner.rgb,
             delta_e=winner.delta_e,
             measured_rgb=winner.measured_rgb,
             samples=samples,
+            sanity=sanity,
         )
     finally:
         try:
@@ -443,10 +841,129 @@ def lock_camera_controls(device: str, exposure: int, run) -> list[str]:
     return applied
 
 
-class CvCamera:
-    """One OpenCV capture. Two reads, 1920×1080 request, buffer of one frame."""
+def _swatch_count(rois: Sequence[Sequence[int]], swatches: int) -> int:
+    count = len(rois) if len(rois) > 1 else int(swatches)
+    if count < 1:
+        count = 1
+    if count > face_link.MAX_SWATCHES:
+        count = face_link.MAX_SWATCHES
+    return count
 
-    def __init__(self, index: int = 0) -> None:
+
+def _choose_exposure(rungs: Sequence[ExposureRung]) -> tuple[int, bool]:
+    """Highest legal mean wins. Every clipped rung falls back to the lowest."""
+    if not rungs:
+        raise ValueError("exposure ladder is empty")
+    eligible = [
+        rung
+        for rung in rungs
+        if not _clipped(rung.clip_fraction) and rung.max_channel_mean <= EXPOSURE_MEAN_CAP
+    ]
+    if eligible:
+        best = max(eligible, key=lambda rung: (rung.max_channel_mean, -rung.exposure))
+        return best.exposure, False
+    if all(_clipped(rung.clip_fraction) for rung in rungs):
+        lowest = min(rungs, key=lambda rung: rung.exposure)
+        return lowest.exposure, True
+    # Unclipped but hotter than the cap: keep the dimmest of those.
+    open_rungs = [rung for rung in rungs if not _clipped(rung.clip_fraction)]
+    best = min(open_rungs, key=lambda rung: (rung.max_channel_mean, rung.exposure))
+    return best.exposure, False
+
+
+def pick_exposure(
+    device: str,
+    camera,
+    link,
+    rois: Sequence[Sequence[int]],
+    run,
+    *,
+    swatches: int = DEFAULT_SWATCHES,
+    settle_s: float = DEFAULT_SETTLE_S,
+    sleep: Callable[[float], None] | None = None,
+    clock: Callable[[], float] | None = None,
+    drain_frames: int = DEFAULT_DRAIN_FRAMES,
+    median_frames: int = DEFAULT_MEDIAN_FRAMES,
+    ladder: Sequence[int] = EXPOSURE_LADDER,
+) -> ExposurePick:
+    """Measure every exposure rung and keep the brightest one that is not clipped.
+
+    A rung whose clip fraction is over ``CLIP_FRACTION_MAX`` on any channel
+    is out. Among the rest, the highest ROI max-channel mean that is still
+    at most ``EXPOSURE_MEAN_CAP`` wins. If every rung is clipped, the lowest
+    exposure is kept and a warning is printed. Each rung uses the same settle
+    and drain as a swatch sample. The ESP32 sends no reply.
+    """
+    pause = _sleep_of(sleep)
+    now = _clock_of(clock)
+    steps = tuple(int(step) for step in ladder)
+    if not steps or any(isinstance(step, bool) or step < 1 for step in steps):
+        raise ValueError("exposure ladder is empty")
+    regions = [tuple(int(v) for v in roi) for roi in rois]
+    if not regions:
+        raise ValueError("need at least one ROI")
+    settle = float(settle_s)
+    if settle < 0:
+        raise ValueError("settle must be >= 0")
+    drain_n = _as_count(drain_frames, "drain frames", minimum=0)
+    median_n = _as_count(median_frames, "median frames", minimum=1)
+    count = _swatch_count(regions, swatches)
+    try:
+        if not link.test_swatches((MID_SWATCH,) * count):
+            raise RuntimeError("face link did not accept swatches")
+        rungs: list[ExposureRung] = []
+        applied: int | None = None
+        for step in steps:
+            lock_camera_controls(device, step, run)
+            applied = step
+            command_time = float(now())
+            frame = capture_settled(
+                camera,
+                command_time=command_time,
+                settle_s=settle,
+                drain_frames=drain_n,
+                median_frames=median_n,
+                clock=now,
+                sleep=pause,
+            )
+            ensure_rois_fit(frame, regions)
+            level, clip = _exposure_stats(frame, regions)
+            rungs.append(ExposureRung(exposure=step, max_channel_mean=level, clip_fraction=clip))
+        chosen, all_clipped = _choose_exposure(rungs)
+        if all_clipped:
+            print(
+                f"exposure ladder is clipped on every rung; using {chosen}",
+                file=sys.stderr,
+            )
+        if chosen != applied:
+            lock_camera_controls(device, chosen, run)
+        return ExposurePick(chosen=chosen, rungs=tuple(rungs), all_clipped=all_clipped)
+    finally:
+        try:
+            if not link.test_exit():
+                print("  test_exit was not written", file=sys.stderr)
+        except Exception:
+            print("  test_exit failed", file=sys.stderr)
+
+
+class CvCamera:
+    """One OpenCV capture at 640×480, warmed up, with a flushed grab.
+
+    The BRIO at 1920×1080 on the Pi returns black or stale frames, and the
+    ROI was measured on a 640×480 picture. ``frame_size`` is the real
+    ``(width, height)`` after the warm-up reads.
+    """
+
+    def __init__(
+        self,
+        index: int = 0,
+        width: int = DEFAULT_WIDTH,
+        height: int = DEFAULT_HEIGHT,
+    ) -> None:
+        width_i = int(width)
+        height_i = int(height)
+        if isinstance(width, bool) or isinstance(height, bool) or width_i < 1 or height_i < 1:
+            raise ValueError("width and height must be positive")
         try:
             import cv2
         except ImportError as exc:
@@ -456,22 +973,29 @@ class CvCamera:
             self._cap.release()
             self._cap = None
             raise RuntimeError(f"camera {index} could not be opened")
-        self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
-        self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+        self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, width_i)
+        self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height_i)
         try:
             self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         except Exception:
             pass
+        seen = None
+        for _ in range(WARMUP_FRAMES):
+            ok, frame = self._cap.read()
+            if ok and frame is not None:
+                seen = frame
+        self.frame_size = _frame_size(seen, self._cap, cv2, width_i, height_i)
 
     def grab(self) -> np.ndarray:
         if self._cap is None:
             raise RuntimeError("camera is closed")
         ok = False
         frame = None
-        for _ in range(2):
+        for _ in range(GRAB_READS):
             ok, frame = self._cap.read()
         if not ok or frame is None:
             raise RuntimeError("camera produced no frame")
+        self.frame_size = (int(frame.shape[1]), int(frame.shape[0]))
         return frame
 
     def close(self) -> None:
@@ -479,6 +1003,17 @@ class CvCamera:
         self._cap = None
         if cap is not None:
             cap.release()
+
+
+def _frame_size(frame, cap, cv2, width: int, height: int) -> tuple[int, int]:
+    if frame is not None and getattr(frame, "ndim", 0) >= 2:
+        return (int(frame.shape[1]), int(frame.shape[0]))
+    try:
+        got_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+        got_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    except Exception:
+        got_w, got_h = 0, 0
+    return (got_w or width, got_h or height)
 
 
 def _blit(image: np.ndarray, x: int, y: int, text: str, colour: tuple[int, int, int], scale: int = 2) -> None:
@@ -534,8 +1069,12 @@ def render_contact_sheet(samples: Sequence[Sample], best_rgb: Sequence[int]) -> 
             image[y : y + SWATCH_H, x : x + 2] = (255, 255, 255)
             image[y : y + SWATCH_H, x + CELL_W - 2 : x + CELL_W] = (255, 255, 255)
         commanded = f"{sample.rgb[0]},{sample.rgb[1]},{sample.rgb[2]}"
+        peak = tuple(int(round(channel)) for channel in sample.peak_rgb)
+        clip_pct = 100.0 * max(float(channel) for channel in sample.clip_fraction)
         _blit(image, x + 4, y + SWATCH_H + 2, commanded, ink)
         _blit(image, x + 4, y + SWATCH_H + 18, f"dE {sample.delta_e:.2f}", ink)
+        _blit(image, x + 4, y + SWATCH_H + 34, f"P {peak[0]},{peak[1]},{peak[2]}", ink)
+        _blit(image, x + 4, y + SWATCH_H + 50, f"C {clip_pct:.1f}%", ink)
     return image
 
 
@@ -557,11 +1096,29 @@ def write_png(path: Path, image: np.ndarray) -> None:
     path.write_bytes(png)
 
 
+def _exposure_payload(pick: ExposurePick | None) -> dict | None:
+    if pick is None:
+        return None
+    return {
+        "chosen": int(pick.chosen),
+        "all_clipped": bool(pick.all_clipped),
+        "rungs": [
+            {
+                "exposure": int(rung.exposure),
+                "max_channel_mean": round(float(rung.max_channel_mean), 4),
+                "clip_fraction": [round(float(channel), 6) for channel in rung.clip_fraction],
+                "clipped": _clipped(rung.clip_fraction),
+            }
+            for rung in pick.rungs
+        ],
+    }
+
+
 def result_payload(result: CalibResult) -> dict:
     def colour(triple) -> list[float]:
         return [round(float(channel), 4) for channel in triple]
 
-    return {
+    payload = {
         "target_rgb": list(result.target_rgb),
         "best_rgb": list(result.best_rgb),
         "delta_e": round(float(result.delta_e), 4),
@@ -573,12 +1130,20 @@ def result_payload(result: CalibResult) -> dict:
             {
                 "rgb": list(sample.rgb),
                 "measured_rgb": colour(sample.measured_rgb),
+                "peak_rgb": colour(sample.peak_rgb),
+                "clip_fraction": [round(float(channel), 6) for channel in sample.clip_fraction],
                 "delta_e": round(float(sample.delta_e), 4),
                 "stage": sample.stage,
             }
             for sample in result.samples
         ],
     }
+    if result.sanity is not None:
+        payload["sanity"] = result.sanity
+    exposure = _exposure_payload(result.exposure)
+    if exposure is not None:
+        payload["exposure"] = exposure
+    return payload
 
 
 def save_result(directory: Path, result: CalibResult, *, clock=None) -> tuple[Path, Path]:
@@ -611,6 +1176,19 @@ def _parse_roi(text: str) -> tuple[int, int, int, int]:
     return x, y, w, h
 
 
+def _parse_exposure(text: str) -> int | None:
+    """``None`` means auto. An integer is a manual exposure_absolute value."""
+    raw = str(text).strip().lower()
+    if raw == "auto":
+        return None
+    if not raw.isdigit():
+        raise ValueError(f"exposure must be a positive integer or 'auto', got {text!r}")
+    value = int(raw)
+    if value < 1:
+        raise ValueError(f"exposure must be a positive integer or 'auto', got {text!r}")
+    return value
+
+
 def _parse_refine(text: str) -> tuple[int, ...]:
     stripped = text.strip().lower()
     if stripped in ("", "none", "0"):
@@ -635,17 +1213,42 @@ def main(
     run=None,
     clock=None,
     sleep: Callable[[float], None] | None = None,
+    now: Callable[[], float] | None = None,
 ) -> int:
     parser = argparse.ArgumentParser(description="Calibrate the face colour through the shell")
     parser.add_argument("--port", default="", help="UART the ESP32 face is on, for example /dev/serial0")
     parser.add_argument("--camera", type=int, default=0, help="OpenCV camera index")
     parser.add_argument("--device", default="/dev/video0", help="v4l2 device for the exposure lock")
+    parser.add_argument("--width", type=int, default=DEFAULT_WIDTH, help="capture width, default 640")
+    parser.add_argument("--height", type=int, default=DEFAULT_HEIGHT, help="capture height, default 480")
     parser.add_argument("--roi", action="append", required=True, help="x,y,w,h. Repeat once per swatch, or pass one ROI to split")
-    parser.add_argument("--swatches", type=int, default=DEFAULT_SWATCHES, help="swatches per frame when one ROI is split")
+    parser.add_argument(
+        "--swatches",
+        type=int,
+        default=DEFAULT_SWATCHES,
+        help="with one ROI, left-to-right swatch count (default 1; groups follow LED wire order)",
+    )
     parser.add_argument("--target", default="255,120,0", help="sRGB the camera should see")
-    parser.add_argument("--exposure", type=int, default=DEFAULT_EXPOSURE, help="manual exposure_absolute (100 µs units)")
-    parser.add_argument("--settle", type=float, default=DEFAULT_SETTLE_S, help="seconds to wait after each swatch frame")
+    parser.add_argument(
+        "--exposure",
+        default="auto",
+        help="auto (default), or manual exposure_absolute in 100 µs units",
+    )
+    parser.add_argument("--settle", type=float, default=DEFAULT_SETTLE_S, help="seconds to wait after each swatch command")
+    parser.add_argument(
+        "--drain-frames",
+        type=int,
+        default=DEFAULT_DRAIN_FRAMES,
+        help="grabs to drop after settle once they finish past the command time",
+    )
+    parser.add_argument(
+        "--median-frames",
+        type=int,
+        default=DEFAULT_MEDIAN_FRAMES,
+        help="grabs combined as a per-pixel median for each sample",
+    )
     parser.add_argument("--apply", action="store_true", help="store the winner on the ESP32")
+    parser.add_argument("--skip-sanity", action="store_true", help="skip the off/on and ramp brightness sweep")
     parser.add_argument("--skip-v4l2", action="store_true", help="do not try to lock exposure and white balance")
     parser.add_argument("--logs", default="logs", help="directory for the JSON result and contact sheet")
     parser.add_argument("--grid-r", default="", help="comma-separated red candidates")
@@ -673,19 +1276,55 @@ def main(
         else:
             candidates = candidate_grid()
         steps = _parse_refine(args.refine)
+        exposure = _parse_exposure(args.exposure)
+        if args.width < 1 or args.height < 1:
+            raise ValueError("width and height must be positive")
+        _as_count(args.drain_frames, "drain frames", minimum=0)
+        _as_count(args.median_frames, "median frames", minimum=1)
+        if args.settle < 0:
+            raise ValueError("settle must be >= 0")
+        if args.swatches < 1 or args.swatches > face_link.MAX_SWATCHES:
+            raise ValueError(f"swatch count must be 1..{face_link.MAX_SWATCHES}")
+        runner = subprocess.run if run is None else run
+        timing_clock = _clock_of(now)
 
-        if not args.skip_v4l2:
-            lock_camera_controls(args.device, args.exposure, subprocess.run if run is None else run)
+        # A fixed exposure is locked before the stream starts. Auto has to
+        # see frames, so the camera opens first and the ladder runs below.
+        exposure_pick = None
+        if not args.skip_v4l2 and exposure is not None:
+            lock_camera_controls(args.device, exposure, runner)
+            exposure_pick = ExposurePick(chosen=int(exposure))
 
         if camera is None:
-            camera = CvCamera(args.camera)
+            camera = CvCamera(args.camera, width=args.width, height=args.height)
             owned_camera = True
+        frame_size = getattr(camera, "frame_size", None)
+        if frame_size is not None:
+            frame_w, frame_h = (int(frame_size[0]), int(frame_size[1]))
+            blank = np.zeros((frame_h, frame_w, 3), dtype=np.uint8)
+            ensure_rois_fit(blank, rois)
+
         if link is None:
             link = face_link.open_face(args.port)
             owned_link = True
             if link is None:
                 print("face UART did not open", file=sys.stderr)
                 return 2
+
+        if not args.skip_v4l2 and exposure is None:
+            exposure_pick = pick_exposure(
+                args.device,
+                camera,
+                link,
+                rois,
+                runner,
+                swatches=args.swatches,
+                settle_s=float(args.settle),
+                sleep=sleep,
+                clock=timing_clock,
+                drain_frames=args.drain_frames,
+                median_frames=args.median_frames,
+            )
 
         result = calibrate(
             link=link,
@@ -697,6 +1336,10 @@ def main(
             refine_steps=steps,
             settle_s=float(args.settle),
             sleep=sleep,
+            clock=timing_clock,
+            drain_frames=args.drain_frames,
+            median_frames=args.median_frames,
+            skip_sanity=bool(args.skip_sanity),
         )
         applied = False
         if args.apply:
@@ -711,6 +1354,8 @@ def main(
             measured_rgb=result.measured_rgb,
             samples=result.samples,
             applied=applied,
+            sanity=result.sanity,
+            exposure=exposure_pick,
         )
         json_path, image_path = save_result(Path(args.logs), result, clock=clock)
         red, green, blue = result.best_rgb

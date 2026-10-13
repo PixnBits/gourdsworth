@@ -19,15 +19,25 @@ The Pi writes one JSON line per command at 115200 8N1: `{"op":"viseme","id":"res
 
 The stored face colour defaults to yellow-gold `255,140,20`. A brightness cap (default 102, about 40%) limits normal speech and eye levels. Both are saved on the ESP32 and reloaded at boot. Test mode paints exact RGB and does not apply that cap, so a swatch is the colour that was commanded. The firmware still holds the LED rail at 4 A, which can dim a very bright frame evenly. Gestures and mouth frames are ignored until test mode exits, so they do not paint over the swatches.
 
-Put the camera on the lit face. One `--roi x,y,w,h` is split left to right into the swatch count (default 8), in the same order as the LED groups: mouth wire order, then the left eye, then the right eye. Pass `--roi` once per swatch to place the regions yourself. The default target is sRGB `255,120,0`. The script locks exposure and white balance with `v4l2-ctl` when it can (manual exposure, temperature 4000 K) and keeps going if a control name is missing.
+Put the camera on the lit face. Capture is 640×480, the same frame the ROI was measured on. `--width` and `--height` override that (defaults 640 and 480). The script asks the camera for that size, drops about ten warm-up frames, and each grab reads a few buffered frames. `frame_size` is the size the camera actually delivered. An ROI that falls outside that frame is an error. The default target is sRGB `255,120,0`.
+
+Swatch groups follow LED wire order: mouth, then the left eye, then the right eye. A left-to-right split of one camera ROI reads a different LED in each slot, so the measured red channel follows the slot and the colour is lost. One `--roi x,y,w,h` therefore uses one swatch. The whole face shows one colour and the ROI is that colour. `--swatches N` opts into a left-to-right split of that single ROI. Pass `--roi` once per group when each group needs its own box.
+
+After each swatch command the script waits `--settle` (default 0.25 s), then grabs and drops frames until at least `--drain-frames` (default 3) have finished after the command time plus that wait, then takes the per-pixel median of `--median-frames` (default 3) grabs. It never reads the serial port. The ESP32 does not reply to these lines.
+
+Before the coarse pass the script lights a bright probe. If that frame is black, or an ROI mean is under about 2 on the 0–255 scale, it stops. Unless `--skip-sanity` is set, it then checks that the camera is following the LEDs. Off `(0,0,0)` versus the target must raise ROI total brightness (the sum of the channel means) by at least 15. A ramp of the target at 0, 0.25, 0.5, 0.75, and 1 must stay non-decreasing within max(3, 5%) and the last step minus the first must clear that same rise. Total brightness is the signal, because the orange shell filters green down to about 1 and a green-only check would reject a good frame. If the sweep fails, the frames look stale or lagging, or the exposure is bad or clipped, and the script stops. The same black check runs after the search: when every swatch's brightest channel is under that floor, it stops. Either way it leaves test mode and does not store a colour. A dark surround around a small lit ROI is fine; the ROI itself has to show the glow. The sweep values are stored in the JSON.
+
+`--exposure` defaults to `auto`. With v4l2, auto lights a mid swatch and measures 250, 500, 1000, then 2000 (100 µs units) with the same settle and drain. A step whose clip fraction is over 0.02 on any channel is rejected. Among the rest it keeps the step with the highest ROI max-channel mean that is still at most 200. If every step is clipped it keeps the lowest and warns. The per-step stats are stored in the JSON. `--exposure 1000` locks that manual value instead (1000 is the built-in manual exposure). `--skip-v4l2` leaves the camera's own auto exposure. White balance is locked to 4000 K when v4l2 works, trying both the old and the new control names, and a missing name is skipped.
 
 ```bash
 python3 clients/pi/face_calibrate.py \
   --port /dev/serial0 \
   --camera 0 \
   --device /dev/video0 \
-  --roi 400,300,960,200 \
+  --width 640 \
+  --height 480 \
+  --roi 230,300,140,30 \
   --apply
 ```
 
-`--apply` writes the winning RGB with `set_color` after leaving test mode. Without it, the face returns to its previous colour. The JSON result and a labelled contact sheet go in `logs/` (that directory is not committed). `--exposure 250` is the manual exposure in 100 µs units. `--refine none` skips the local search.
+`--apply` writes the winning RGB with `set_color` after leaving test mode. A black capture or a failed sanity sweep does not, and the process exits nonzero. Without `--apply`, the face returns to its previous colour. The JSON result and a labelled contact sheet go in `logs/` (that directory is not committed). `--refine none` skips the local search.
