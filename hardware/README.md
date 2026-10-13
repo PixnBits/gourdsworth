@@ -19,15 +19,21 @@ The Pi writes one JSON line per command at 115200 8N1: `{"op":"viseme","id":"res
 
 The stored face colour defaults to yellow-gold `255,140,20`. A brightness cap (default 102, about 40%) limits normal speech and eye levels. Both are saved on the ESP32 and reloaded at boot. Test mode paints exact RGB and does not apply that cap, so a swatch is the colour that was commanded. The firmware still holds the LED rail at 4 A, which can dim a very bright frame evenly. Gestures and mouth frames are ignored until test mode exits, so they do not paint over the swatches.
 
-Put the camera on the lit face. One `--roi x,y,w,h` is split left to right into the swatch count (default 8), in the same order as the LED groups: mouth wire order, then the left eye, then the right eye. Pass `--roi` once per swatch to place the regions yourself. The default target is sRGB `255,120,0`. The script locks exposure and white balance with `v4l2-ctl` when it can (manual exposure, temperature 4000 K) and keeps going if a control name is missing.
+Put the camera on the lit face. Capture is 640×480, the same frame the ROI was measured on. `--width` and `--height` override that (defaults 640 and 480). The script asks the camera for that size, drops about ten warm-up frames, and on each grab reads a few buffered frames so the still is from after the LEDs change. `frame_size` is the size the camera actually delivered. An ROI that falls outside that frame is an error. One `--roi x,y,w,h` is split left to right into the swatch count (default 8), in the same order as the LED groups: mouth wire order, then the left eye, then the right eye. Pass `--roi` once per swatch to place the regions yourself. The default target is sRGB `255,120,0`.
+
+Before the coarse pass the script lights the face and grabs once. If that frame is black, or an ROI mean is under about 2 on the 0–255 scale, it stops. The same check runs after the search: when every swatch's brightest channel is under that floor, it stops. Either way it leaves test mode and does not store a colour. A dark surround around a small lit ROI is fine; the ROI itself has to show the glow. The ESP32 does not reply to these lines, so the script never waits on a read.
+
+`--exposure` defaults to `auto`. With v4l2, auto lights a mid swatch and tries 250, 500, 1000, then 2000 (100 µs units). It keeps the first step whose ROI max channel sits between 40 and 230. If none do, it keeps the largest step that is not saturated. `--exposure 1000` locks that manual value instead (1000 is the built-in manual exposure). `--skip-v4l2` leaves the camera's own auto exposure. White balance is locked to 4000 K when v4l2 works, trying both the old and the new control names, and a missing name is skipped.
 
 ```bash
 python3 clients/pi/face_calibrate.py \
   --port /dev/serial0 \
   --camera 0 \
   --device /dev/video0 \
-  --roi 400,300,960,200 \
+  --width 640 \
+  --height 480 \
+  --roi 230,300,140,30 \
   --apply
 ```
 
-`--apply` writes the winning RGB with `set_color` after leaving test mode. Without it, the face returns to its previous colour. The JSON result and a labelled contact sheet go in `logs/` (that directory is not committed). `--exposure 250` is the manual exposure in 100 µs units. `--refine none` skips the local search.
+`--apply` writes the winning RGB with `set_color` after leaving test mode. A black capture does not, and the process exits nonzero. Without `--apply`, the face returns to its previous colour. The JSON result and a labelled contact sheet go in `logs/` (that directory is not committed). `--refine none` skips the local search.

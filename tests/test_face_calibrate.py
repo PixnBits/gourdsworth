@@ -351,9 +351,10 @@ def test_multi_roi_pads_a_short_frame_and_keeps_alignment():
     )
     assert result.best_rgb == (10, 20, 30)
     assert result.delta_e == pytest.approx(0.0, abs=1e-6)
-    assert seen[0] == [(1, 2, 3), (10, 20, 30)]
-    assert seen[1][0] == (4, 5, 6)
-    assert len(seen[1]) == 2
+    assert seen[0] == [cal.PROBE_RGB, cal.PROBE_RGB]
+    assert seen[1] == [(1, 2, 3), (10, 20, 30)]
+    assert seen[2][0] == (4, 5, 6)
+    assert len(seen[2]) == 2
     assert len(result.samples) == 3
 
 

@@ -33,9 +33,29 @@ DEFAULT_GRID_G = (40, 80, 120, 160, 200)
 DEFAULT_GRID_B = (0, 20, 40)
 DEFAULT_REFINE = (16, 8)
 DEFAULT_SWATCHES = 8
-DEFAULT_EXPOSURE = 250
+# Manual exposure_absolute in 100 µs units. The CLI default is "auto".
+DEFAULT_EXPOSURE = 1000
 DEFAULT_SETTLE_S = 0.2
+DEFAULT_WIDTH = 640
+DEFAULT_HEIGHT = 480
+# Frames dropped once after open, before the size is recorded.
+WARMUP_FRAMES = 10
+# Reads per grab. The last one is the frame after the LEDs have updated.
+GRAB_READS = 5
+# 0–255. At or above this, a lit ROI is real signal. Below it, the capture is black.
+MIN_ROI_MEAN = 2.0
+# exposure_absolute ladder used by --exposure auto. First hit inside the window wins.
+EXPOSURE_LADDER = (250, 500, 1000, 2000)
+EXPOSURE_MEAN_LOW = 40.0
+EXPOSURE_MEAN_HIGH = 230.0
+# One mid orange held in every slot while auto exposure is measured.
+MID_SWATCH = (220, 120, 20)
+# Bright fill used only to prove the camera can see the face before the search.
+PROBE_RGB = (255, 180, 40)
 POWER_LIMIT_MA = 4000
+BLACK_FRAME_MSG = (
+    "camera frames are black / ROI mean ~0; check --camera, --roi, --exposure"
+)
 
 # sRGB (D65) linear-RGB to XYZ. Row sums are the D65 white point below.
 _RGB_TO_XYZ = np.array(
@@ -204,10 +224,68 @@ def mean_rgb(image: np.ndarray, roi: Sequence[int]) -> tuple[float, float, float
         raise ValueError("roi has no area")
     height, width = frame.shape[:2]
     if x < 0 or y < 0 or x + w > width or y + h > height:
-        raise ValueError(f"roi {(x, y, w, h)} is outside {width}x{height}")
+        raise ValueError(
+            f"roi {(x, y, w, h)} falls outside the {width}x{height} frame; "
+            "check --roi, --width, and --height"
+        )
     crop = np.asarray(frame[y : y + h, x : x + w, :3], dtype=np.float64)
     mean_bgr = crop.reshape(-1, 3).mean(axis=0)
     return (float(mean_bgr[2]), float(mean_bgr[1]), float(mean_bgr[0]))
+
+
+def ensure_rois_fit(frame: np.ndarray, rois: Sequence[Sequence[int]]) -> None:
+    """Raise when an ROI does not lie inside the grabbed frame.
+
+    Coordinates are in the capture's pixel space. A box measured on a
+    640×480 preview does not land on a 1920×1080 frame.
+    """
+    image = np.asarray(frame)
+    if image.ndim < 2:
+        raise ValueError("frame has no size")
+    height, width = (int(image.shape[0]), int(image.shape[1]))
+    for roi in rois:
+        # mean_rgb raises the same out-of-frame error and checks the channels.
+        mean_rgb(image, roi)
+
+
+def _roi_pixel_mean(frame: np.ndarray, roi: Sequence[int]) -> float:
+    red, green, blue = mean_rgb(frame, roi)
+    return (red + green + blue) / 3.0
+
+
+def roi_max_channel_mean(frame: np.ndarray, rois: Sequence[Sequence[int]]) -> float:
+    """Largest per-channel mean inside any ROI. Exposure uses this level."""
+    if not rois:
+        raise ValueError("need at least one ROI")
+    return max(max(mean_rgb(frame, roi)) for roi in rois)
+
+
+def check_signal(frame: np.ndarray, rois: Sequence[Sequence[int]]) -> None:
+    """Raise when the camera delivered black or an ROI missed the glow.
+
+    A 140×30 swatch on a 640×480 frame averages under ``MIN_ROI_MEAN`` even
+    when the LED is bright, so a dark surround is not a black frame. The
+    frame is black when its mean and its brightest pixel are both under the
+    floor. Each ROI is black when its pixel mean is under the floor.
+    """
+    image = np.asarray(frame)
+    if image.size == 0 or image.ndim < 2:
+        raise RuntimeError(BLACK_FRAME_MSG)
+    frame_mean = float(image.mean())
+    frame_peak = float(image.max())
+    frame_black = frame_mean < MIN_ROI_MEAN and frame_peak < MIN_ROI_MEAN
+    roi_mean = min(_roi_pixel_mean(image, roi) for roi in rois)
+    if frame_black or roi_mean < MIN_ROI_MEAN:
+        raise RuntimeError(
+            f"{BLACK_FRAME_MSG} (frame mean {frame_mean:.2f}, roi mean {roi_mean:.2f})"
+        )
+
+
+def samples_lack_signal(samples: Sequence[Sample]) -> bool:
+    """True when every swatch's brightest channel mean is under the floor."""
+    if not samples:
+        return True
+    return all(max(sample.measured_rgb) < MIN_ROI_MEAN for sample in samples)
 
 
 def candidate_grid(
@@ -278,11 +356,13 @@ def _evaluate_frame(
 ) -> None:
     if not batch:
         return
+    # The ESP32 answers none of these lines. The write is fire-and-forget.
     if not link.test_swatches(batch):
         raise RuntimeError("face link did not accept swatches")
     if settle_s > 0:
         sleep(settle_s)
     frame = camera.grab()
+    ensure_rois_fit(frame, rois)
     if len(rois) == 1:
         regions = split_roi_horizontal(rois[0], len(batch))
     elif len(rois) == len(batch):
@@ -376,6 +456,16 @@ def calibrate(
             )
 
     try:
+        # Light every slot, then look. A black grab here is the camera or the
+        # ROI, and the coarse grid would only record zeros.
+        if not link.test_swatches((PROBE_RGB,) * frame_n):
+            raise RuntimeError("face link did not accept swatches")
+        if settle_s > 0:
+            sleep(settle_s)
+        probe = camera.grab()
+        ensure_rois_fit(probe, regions)
+        check_signal(probe, regions)
+
         run_pass(pool, "coarse")
         if not scored:
             raise RuntimeError("calibration scored no swatches")
@@ -388,6 +478,8 @@ def calibrate(
             best = _best(scored, order)
         winner = scored[best]
         samples = tuple(scored[key] for key in order)
+        if samples_lack_signal(samples):
+            raise RuntimeError(BLACK_FRAME_MSG)
         return CalibResult(
             target_rgb=target,
             best_rgb=winner.rgb,
@@ -443,10 +535,93 @@ def lock_camera_controls(device: str, exposure: int, run) -> list[str]:
     return applied
 
 
-class CvCamera:
-    """One OpenCV capture. Two reads, 1920×1080 request, buffer of one frame."""
+def _swatch_count(rois: Sequence[Sequence[int]], swatches: int) -> int:
+    count = len(rois) if len(rois) > 1 else int(swatches)
+    if count < 1:
+        count = 1
+    if count > face_link.MAX_SWATCHES:
+        count = face_link.MAX_SWATCHES
+    return count
 
-    def __init__(self, index: int = 0) -> None:
+
+def pick_exposure(
+    device: str,
+    camera,
+    link,
+    rois: Sequence[Sequence[int]],
+    run,
+    *,
+    swatches: int = DEFAULT_SWATCHES,
+    settle_s: float = 0.0,
+    sleep: Callable[[float], None] | None = None,
+    ladder: Sequence[int] = EXPOSURE_LADDER,
+) -> int:
+    """Lock a manual exposure by lighting one mid swatch and walking a short ladder.
+
+    The first step whose ROI max-channel mean sits in
+    ``EXPOSURE_MEAN_LOW`` .. ``EXPOSURE_MEAN_HIGH`` wins. Otherwise the
+    largest step that did not saturate wins. The ESP32 sends no reply;
+    the swatch write is not followed by a read.
+    """
+    if sleep is None:
+        sleep = time.sleep
+    steps = tuple(int(step) for step in ladder)
+    if not steps or any(step < 1 for step in steps):
+        raise ValueError("exposure ladder is empty")
+    regions = [tuple(int(v) for v in roi) for roi in rois]
+    if not regions:
+        raise ValueError("need at least one ROI")
+    count = _swatch_count(regions, swatches)
+    try:
+        if not link.test_swatches((MID_SWATCH,) * count):
+            raise RuntimeError("face link did not accept swatches")
+        chosen: int | None = None
+        largest_nonsat: int | None = None
+        applied: int | None = None
+        for step in steps:
+            lock_camera_controls(device, step, run)
+            applied = step
+            if settle_s > 0:
+                sleep(settle_s)
+            frame = camera.grab()
+            ensure_rois_fit(frame, regions)
+            level = roi_max_channel_mean(frame, regions)
+            if EXPOSURE_MEAN_LOW <= level <= EXPOSURE_MEAN_HIGH:
+                chosen = step
+                break
+            if level <= EXPOSURE_MEAN_HIGH:
+                largest_nonsat = step
+        if chosen is None:
+            chosen = largest_nonsat if largest_nonsat is not None else steps[0]
+        if chosen != applied:
+            lock_camera_controls(device, chosen, run)
+        return chosen
+    finally:
+        try:
+            if not link.test_exit():
+                print("  test_exit was not written", file=sys.stderr)
+        except Exception:
+            print("  test_exit failed", file=sys.stderr)
+
+
+class CvCamera:
+    """One OpenCV capture at 640×480, warmed up, with a flushed grab.
+
+    The BRIO at 1920×1080 on the Pi returns black or stale frames, and the
+    ROI was measured on a 640×480 picture. ``frame_size`` is the real
+    ``(width, height)`` after the warm-up reads.
+    """
+
+    def __init__(
+        self,
+        index: int = 0,
+        width: int = DEFAULT_WIDTH,
+        height: int = DEFAULT_HEIGHT,
+    ) -> None:
+        width_i = int(width)
+        height_i = int(height)
+        if isinstance(width, bool) or isinstance(height, bool) or width_i < 1 or height_i < 1:
+            raise ValueError("width and height must be positive")
         try:
             import cv2
         except ImportError as exc:
@@ -456,22 +631,29 @@ class CvCamera:
             self._cap.release()
             self._cap = None
             raise RuntimeError(f"camera {index} could not be opened")
-        self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
-        self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+        self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, width_i)
+        self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height_i)
         try:
             self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         except Exception:
             pass
+        seen = None
+        for _ in range(WARMUP_FRAMES):
+            ok, frame = self._cap.read()
+            if ok and frame is not None:
+                seen = frame
+        self.frame_size = _frame_size(seen, self._cap, cv2, width_i, height_i)
 
     def grab(self) -> np.ndarray:
         if self._cap is None:
             raise RuntimeError("camera is closed")
         ok = False
         frame = None
-        for _ in range(2):
+        for _ in range(GRAB_READS):
             ok, frame = self._cap.read()
         if not ok or frame is None:
             raise RuntimeError("camera produced no frame")
+        self.frame_size = (int(frame.shape[1]), int(frame.shape[0]))
         return frame
 
     def close(self) -> None:
@@ -479,6 +661,17 @@ class CvCamera:
         self._cap = None
         if cap is not None:
             cap.release()
+
+
+def _frame_size(frame, cap, cv2, width: int, height: int) -> tuple[int, int]:
+    if frame is not None and getattr(frame, "ndim", 0) >= 2:
+        return (int(frame.shape[1]), int(frame.shape[0]))
+    try:
+        got_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+        got_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    except Exception:
+        got_w, got_h = 0, 0
+    return (got_w or width, got_h or height)
 
 
 def _blit(image: np.ndarray, x: int, y: int, text: str, colour: tuple[int, int, int], scale: int = 2) -> None:
@@ -611,6 +804,19 @@ def _parse_roi(text: str) -> tuple[int, int, int, int]:
     return x, y, w, h
 
 
+def _parse_exposure(text: str) -> int | None:
+    """``None`` means auto. An integer is a manual exposure_absolute value."""
+    raw = str(text).strip().lower()
+    if raw == "auto":
+        return None
+    if not raw.isdigit():
+        raise ValueError(f"exposure must be a positive integer or 'auto', got {text!r}")
+    value = int(raw)
+    if value < 1:
+        raise ValueError(f"exposure must be a positive integer or 'auto', got {text!r}")
+    return value
+
+
 def _parse_refine(text: str) -> tuple[int, ...]:
     stripped = text.strip().lower()
     if stripped in ("", "none", "0"):
@@ -640,10 +846,16 @@ def main(
     parser.add_argument("--port", default="", help="UART the ESP32 face is on, for example /dev/serial0")
     parser.add_argument("--camera", type=int, default=0, help="OpenCV camera index")
     parser.add_argument("--device", default="/dev/video0", help="v4l2 device for the exposure lock")
+    parser.add_argument("--width", type=int, default=DEFAULT_WIDTH, help="capture width, default 640")
+    parser.add_argument("--height", type=int, default=DEFAULT_HEIGHT, help="capture height, default 480")
     parser.add_argument("--roi", action="append", required=True, help="x,y,w,h. Repeat once per swatch, or pass one ROI to split")
     parser.add_argument("--swatches", type=int, default=DEFAULT_SWATCHES, help="swatches per frame when one ROI is split")
     parser.add_argument("--target", default="255,120,0", help="sRGB the camera should see")
-    parser.add_argument("--exposure", type=int, default=DEFAULT_EXPOSURE, help="manual exposure_absolute (100 µs units)")
+    parser.add_argument(
+        "--exposure",
+        default="auto",
+        help="auto (default), or manual exposure_absolute in 100 µs units",
+    )
     parser.add_argument("--settle", type=float, default=DEFAULT_SETTLE_S, help="seconds to wait after each swatch frame")
     parser.add_argument("--apply", action="store_true", help="store the winner on the ESP32")
     parser.add_argument("--skip-v4l2", action="store_true", help="do not try to lock exposure and white balance")
@@ -673,19 +885,43 @@ def main(
         else:
             candidates = candidate_grid()
         steps = _parse_refine(args.refine)
+        exposure = _parse_exposure(args.exposure)
+        if args.width < 1 or args.height < 1:
+            raise ValueError("width and height must be positive")
+        runner = subprocess.run if run is None else run
 
-        if not args.skip_v4l2:
-            lock_camera_controls(args.device, args.exposure, subprocess.run if run is None else run)
+        # A fixed exposure is locked before the stream starts. Auto has to
+        # see frames, so the camera opens first and the ladder runs below.
+        if not args.skip_v4l2 and exposure is not None:
+            lock_camera_controls(args.device, exposure, runner)
 
         if camera is None:
-            camera = CvCamera(args.camera)
+            camera = CvCamera(args.camera, width=args.width, height=args.height)
             owned_camera = True
+        frame_size = getattr(camera, "frame_size", None)
+        if frame_size is not None:
+            frame_w, frame_h = (int(frame_size[0]), int(frame_size[1]))
+            blank = np.zeros((frame_h, frame_w, 3), dtype=np.uint8)
+            ensure_rois_fit(blank, rois)
+
         if link is None:
             link = face_link.open_face(args.port)
             owned_link = True
             if link is None:
                 print("face UART did not open", file=sys.stderr)
                 return 2
+
+        if not args.skip_v4l2 and exposure is None:
+            pick_exposure(
+                args.device,
+                camera,
+                link,
+                rois,
+                runner,
+                swatches=args.swatches,
+                settle_s=float(args.settle),
+                sleep=sleep,
+            )
 
         result = calibrate(
             link=link,
