@@ -123,6 +123,7 @@ def test_lit_frames_pass_the_guard_and_can_apply(tmp_path):
             "--grid-b", "0",
             "--refine", "none",
             "--settle", "0",
+            "--skip-sanity",
         ],
         link=link,
         camera=LitStripCamera(),
@@ -171,6 +172,7 @@ def test_samples_that_measure_black_skip_apply(tmp_path, capsys):
             "--grid-b", "30",
             "--refine", "none",
             "--settle", "0",
+            "--skip-sanity",
         ],
         link=link,
         camera=ProbeThenBlack(),
@@ -341,7 +343,7 @@ def _exposure_camera(levels: dict[int, int]):
     return Cam(), run, state
 
 
-def test_exposure_auto_picks_the_first_usable_step_and_falls_back():
+def test_exposure_auto_picks_the_brightest_unclipped_rung_under_the_cap():
     port, link = _link()
     camera, run, state = _exposure_camera({250: 10, 500: 80, 1000: 140, 2000: 250})
     chosen = cal.pick_exposure(
@@ -354,20 +356,25 @@ def test_exposure_auto_picks_the_first_usable_step_and_falls_back():
         settle_s=0.0,
         sleep=lambda _seconds: None,
     )
-    assert chosen == 500
-    assert state["exp"] == 500
+    assert chosen.chosen == 1000
+    assert chosen.all_clipped is False
+    assert [rung.exposure for rung in chosen.rungs] == [250, 500, 1000, 2000]
+    assert chosen.rungs[-1].clip_fraction[0] == pytest.approx(1.0)
+    assert state["exp"] == 1000
     joined = [" ".join(cmd) for cmd in state["commands"]]
     assert any("exposure_time_absolute=500" in line for line in joined)
     assert any("exposure_absolute=500" in line for line in joined)
+    assert any("exposure_absolute=1000" in line for line in joined)
+    assert any("exposure_absolute=2000" in line for line in joined)
     assert any("auto_exposure=1" in line for line in joined)
     assert any("exposure_auto=1" in line for line in joined)
-    assert not any("exposure_absolute=1000" in line for line in joined)
     ops = _ops(port)
     assert "test_swatches" in ops
     assert ops[-1] == "test_exit"
     assert port.reads == 0
 
-    port_b, link_b = _link()
+    # 240 is under the clip level and over the mean cap, so 500 still wins.
+    _port_b, link_b = _link()
     camera_b, run_b, state_b = _exposure_camera({250: 5, 500: 15, 1000: 240, 2000: 255})
     fallback = cal.pick_exposure(
         "/dev/video0",
@@ -379,14 +386,15 @@ def test_exposure_auto_picks_the_first_usable_step_and_falls_back():
         settle_s=0.0,
         sleep=lambda _seconds: None,
     )
-    assert fallback == 500
+    assert fallback.chosen == 500
     assert state_b["exp"] == 500
 
-    port_c, link_c = _link()
-    camera_c, run_c, state_c = _exposure_camera({250: 240, 500: 250, 1000: 255, 2000: 255})
-    saturated = cal.pick_exposure(
+    # The only unclipped rung is hotter than the cap. Keep it.
+    _port_c, link_c = _link()
+    _camera_c, run_c, state_c = _exposure_camera({250: 240, 500: 250, 1000: 255, 2000: 255})
+    hot = cal.pick_exposure(
         "/dev/video0",
-        camera_c,
+        _camera_c,
         link_c,
         [(0, 0, 40, 30)],
         run_c,
@@ -394,7 +402,8 @@ def test_exposure_auto_picks_the_first_usable_step_and_falls_back():
         settle_s=0.0,
         sleep=lambda _seconds: None,
     )
-    assert saturated == 250
+    assert hot.chosen == 250
+    assert hot.all_clipped is False
     assert state_c["exp"] == 250
 
 
@@ -412,6 +421,7 @@ def test_main_auto_exposure_uses_the_ladder(tmp_path):
             "--grid-b", "0",
             "--refine", "none",
             "--settle", "0",
+            "--skip-sanity",
             "--target", "90,90,90",
         ],
         link=link,
@@ -421,8 +431,12 @@ def test_main_auto_exposure_uses_the_ladder(tmp_path):
         sleep=lambda _seconds: None,
     )
     assert code == 0
-    assert state["exp"] == 500
-    assert (tmp_path / "face-cal-19700101-000000.json").is_file()
+    assert state["exp"] == 1000
+    saved = json.loads((tmp_path / "face-cal-19700101-000000.json").read_text(encoding="utf-8"))
+    assert saved["exposure"]["chosen"] == 1000
+    assert [rung["exposure"] for rung in saved["exposure"]["rungs"]] == [250, 500, 1000, 2000]
+    assert saved["exposure"]["rungs"][-1]["clipped"] is True
+    assert saved["exposure"]["rungs"][2]["clipped"] is False
     assert "set_color" not in _ops(port)
 
 
@@ -446,6 +460,7 @@ def test_skip_v4l2_leaves_auto_exposure(tmp_path):
             "--grid-b", "0",
             "--refine", "none",
             "--settle", "0",
+            "--skip-sanity",
         ],
         link=link,
         camera=LitStripCamera(),
@@ -455,3 +470,375 @@ def test_skip_v4l2_leaves_auto_exposure(tmp_path):
     assert code == 0
     assert calls == []
     assert port.reads == 0
+
+
+def _swatch_colours(port: FakePort) -> list[tuple[int, int, int]]:
+    found = None
+    for line in bytes(port.buf).decode("utf-8").splitlines():
+        decoded = face_link.decode_line(line)
+        if decoded and decoded["op"] == "test_swatches":
+            rgb = decoded["rgb"]
+            found = [tuple(rgb[i : i + 3]) for i in range(0, len(rgb), 3)]
+    if found is None:
+        raise AssertionError("no swatch line was written")
+    return found
+
+
+def _paint(rgb: tuple[int, int, int], width: int = 16, height: int = 16) -> np.ndarray:
+    image = np.zeros((height, width, 3), dtype=np.uint8)
+    image[:, :, 2] = rgb[0]
+    image[:, :, 1] = rgb[1]
+    image[:, :, 0] = rgb[2]
+    return image
+
+
+class _Clock:
+    def __init__(self) -> None:
+        self.t = 0.0
+
+    def __call__(self) -> float:
+        return self.t
+
+    def sleep(self, seconds: float) -> None:
+        self.t += float(seconds)
+
+
+class _EchoCamera:
+    """The ROI shows the latest swatch command."""
+
+    def __init__(self, port: FakePort, width: int = 16, height: int = 16) -> None:
+        self.port = port
+        self.width = width
+        self.height = height
+
+    def grab(self) -> np.ndarray:
+        return _paint(_swatch_colours(self.port)[0], self.width, self.height)
+
+
+class _LagCamera:
+    """The previous command stays up for ``lag`` grabs after each new command."""
+
+    def __init__(self, port: FakePort, lag: int) -> None:
+        self.port = port
+        self.lag = lag
+        self.current: tuple | None = None
+        self.previous: tuple[int, int, int] = (80, 80, 80)
+        self.left = 0
+        self.stale_grabs = 0
+
+    def grab(self) -> np.ndarray:
+        colours = tuple(tuple(colour) for colour in _swatch_colours(self.port))
+        if colours != self.current:
+            if self.current is not None:
+                self.previous = self.current[0]
+            self.current = colours
+            self.left = self.lag
+        if self.left > 0:
+            self.left -= 1
+            show = self.previous
+            self.stale_grabs += 1
+        else:
+            show = self.current[0]
+        return _paint(show)
+
+
+def test_clip_fraction_counts_pixels_at_or_above_250():
+    image = np.zeros((10, 10, 3), dtype=np.uint8)
+    image[0, :, 2] = 250  # 10 of 100 red pixels
+    image[1, :3, 1] = 255  # 3 green pixels
+    stats = cal.roi_measurement(image, (0, 0, 10, 10))
+    assert stats["clip"][0] == pytest.approx(0.1)
+    assert stats["clip"][1] == pytest.approx(0.03)
+    assert stats["clip"][2] == pytest.approx(0.0)
+    assert stats["peak"] == pytest.approx((250.0, 255.0, 0.0))
+    assert stats["mean"][0] == pytest.approx(25.0)
+
+
+def test_capture_drains_frames_that_finish_before_settle_then_medians():
+    clock = _Clock()
+    seen = []
+
+    class Cam:
+        def __init__(self) -> None:
+            self.n = 0
+
+        def grab(self):
+            clock.t += 0.1
+            self.n += 1
+            seen.append(clock.t)
+            level = {6: 10, 7: 100, 8: 11}.get(self.n, 1)
+            return np.full((2, 2, 3), level, dtype=np.uint8)
+
+    frame = cal.capture_settled(
+        Cam(),
+        command_time=0.0,
+        settle_s=0.25,
+        drain_frames=3,
+        median_frames=3,
+        clock=clock,
+        sleep=lambda _seconds: None,
+    )
+    # 0.1 and 0.2 finish before the deadline and do not count as drain frames.
+    assert seen == pytest.approx([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8])
+    assert int(frame[0, 0, 0]) == 11
+
+
+def test_one_command_lag_is_fixed_by_the_drain(tmp_path):
+    assert cal.DEFAULT_DRAIN_FRAMES == 3
+    assert cal.DEFAULT_MEDIAN_FRAMES == 3
+    assert cal.DEFAULT_SETTLE_S == pytest.approx(0.25)
+    assert cal.DEFAULT_SWATCHES == 1
+    port, link = _link()
+    timer = _Clock()
+    camera = _LagCamera(port, lag=cal.DEFAULT_DRAIN_FRAMES)
+    code = cal.main(
+        [
+            "--roi", "0,0,16,16",
+            "--target", "255,120,0",
+            "--apply",
+            "--skip-v4l2",
+            "--logs", str(tmp_path),
+            "--grid-r", "255,10",
+            "--grid-g", "120,20",
+            "--grid-b", "0,30",
+            "--refine", "none",
+            "--settle", "0.25",
+        ],
+        link=link,
+        camera=camera,
+        clock=lambda: __import__("time").gmtime(0),
+        now=timer,
+        sleep=timer.sleep,
+    )
+    assert code == 0
+    assert camera.stale_grabs > 0
+    ops = _ops(port)
+    assert ops[-2] == "test_exit"
+    assert ops[-1] == "set_color"
+    saved = json.loads((tmp_path / "face-cal-19700101-000000.json").read_text(encoding="utf-8"))
+    assert saved["best_rgb"] == [255, 120, 0]
+    assert saved["measured_rgb"] == pytest.approx([255.0, 120.0, 0.0])
+    assert saved["samples"][0]["peak_rgb"][0] == pytest.approx(255.0)
+    assert saved["samples"][0]["clip_fraction"][0] == pytest.approx(1.0)
+    winner = next(sample for sample in saved["samples"] if sample["rgb"] == [255, 120, 0])
+    assert winner["clip_fraction"][0] == pytest.approx(1.0)
+    assert port.reads == 0
+    frames = []
+    for line in bytes(port.buf).decode("utf-8").splitlines():
+        decoded = face_link.decode_line(line)
+        if decoded and decoded["op"] == "test_swatches":
+            frames.append(decoded["n"])
+    assert frames[0] == 1
+    assert all(count == 1 for count in frames)
+
+
+def test_stale_camera_fails_sanity_without_set_color(tmp_path, capsys):
+    port, link = _link()
+
+    class Stale:
+        def grab(self) -> np.ndarray:
+            return np.full((16, 16, 3), 40, dtype=np.uint8)
+
+    code = cal.main(
+        [
+            "--roi", "0,0,16,16",
+            "--apply",
+            "--skip-v4l2",
+            "--logs", str(tmp_path),
+            "--grid-r", "255",
+            "--grid-g", "120",
+            "--grid-b", "0",
+            "--refine", "none",
+            "--settle", "0",
+            "--target", "255,120,0",
+        ],
+        link=link,
+        camera=Stale(),
+        sleep=lambda _seconds: None,
+    )
+    assert code != 0
+    assert cal.SANITY_MSG in capsys.readouterr().err
+    ops = _ops(port)
+    assert "set_color" not in ops
+    assert ops[-1] == "test_exit"
+    assert port.reads == 0
+    assert list(tmp_path.glob("face-cal-*")) == []
+
+
+def test_green_filter_passes_sanity_on_total_brightness(tmp_path):
+    """Orange plastic leaves G near 1. Brightness still rises with the red channel."""
+    port, link = _link()
+
+    class GreenFilter:
+        def __init__(self, serial: FakePort) -> None:
+            self.serial = serial
+
+        def grab(self) -> np.ndarray:
+            red, _green, blue = _swatch_colours(self.serial)[0]
+            green = 1 if red + blue > 0 else 0
+            return _paint((red, green, blue))
+
+    code = cal.main(
+        [
+            "--roi", "0,0,16,16",
+            "--apply",
+            "--skip-v4l2",
+            "--logs", str(tmp_path),
+            "--grid-r", "255",
+            "--grid-g", "120",
+            "--grid-b", "0",
+            "--refine", "none",
+            "--settle", "0",
+            "--target", "255,120,0",
+        ],
+        link=link,
+        camera=GreenFilter(port),
+        clock=lambda: __import__("time").gmtime(0),
+        sleep=lambda _seconds: None,
+    )
+    assert code == 0
+    saved = json.loads((tmp_path / "face-cal-19700101-000000.json").read_text(encoding="utf-8"))
+    assert saved["applied"] is True
+    assert saved["sanity"]["on"]["measured_rgb"][1] == pytest.approx(1.0)
+    assert saved["sanity"]["rise"] >= 15
+    ramp = [step["brightness"] for step in saved["sanity"]["ramp"]]
+    assert ramp[-1] - ramp[0] >= 15
+    assert all(current + 1e-6 >= previous for previous, current in zip(ramp, ramp[1:]))
+    assert all(step["measured_rgb"][1] <= 1.0 for step in saved["sanity"]["ramp"])
+    assert _ops(port)[-1] == "set_color"
+    assert port.reads == 0
+
+
+def test_one_roi_defaults_to_a_single_swatch_and_the_flag_opts_in(tmp_path):
+    port, link = _link()
+    code = cal.main(
+        [
+            "--roi", "0,0,16,16",
+            "--skip-v4l2",
+            "--skip-sanity",
+            "--settle", "0",
+            "--logs", str(tmp_path),
+            "--grid-r", "255",
+            "--grid-g", "120",
+            "--grid-b", "0",
+            "--refine", "none",
+        ],
+        link=link,
+        camera=_EchoCamera(port),
+        sleep=lambda _seconds: None,
+    )
+    assert code == 0
+    counts = []
+    for line in bytes(port.buf).decode("utf-8").splitlines():
+        decoded = face_link.decode_line(line)
+        if decoded and decoded["op"] == "test_swatches":
+            counts.append(decoded["n"])
+    assert counts[0] == 1
+    assert all(count == 1 for count in counts)
+
+    port_n, link_n = _link()
+    code_n = cal.main(
+        [
+            "--roi", "0,0,40,10",
+            "--swatches", "4",
+            "--skip-v4l2",
+            "--skip-sanity",
+            "--settle", "0",
+            "--logs", str(tmp_path),
+            "--grid-r", "10",
+            "--grid-g", "20",
+            "--grid-b", "30",
+            "--refine", "none",
+        ],
+        link=link_n,
+        camera=_EchoCamera(port_n, width=40, height=10),
+        sleep=lambda _seconds: None,
+    )
+    assert code_n == 0
+    probe = None
+    for line in bytes(port_n.buf).decode("utf-8").splitlines():
+        decoded = face_link.decode_line(line)
+        if decoded and decoded["op"] == "test_swatches":
+            probe = decoded
+            break
+    assert probe is not None and probe["n"] == 4
+
+
+def test_exposure_rejects_a_clipped_rung_and_skips_the_first(capsys):
+    """The old rule would have kept 250, the first mean inside 40..230."""
+    port, link = _link()
+    state = {"exp": None, "commands": []}
+
+    class Cam:
+        def grab(self) -> np.ndarray:
+            image = np.full((20, 20, 3), 40, dtype=np.uint8)
+            if state["exp"] == 500:
+                image[:] = 100
+                image.reshape(-1, 3)[:8] = 255  # 8/400 = 0.02, still legal
+            elif state["exp"] == 1000:
+                image[:] = 150
+                image.reshape(-1, 3)[:9] = 255  # just over 0.02
+            elif state["exp"] == 2000:
+                image[:] = 255
+            return image
+
+    def run(cmd, **kwargs):
+        state["commands"].append(list(cmd))
+        ctrl = cmd[-1]
+        if "exposure_absolute=" in ctrl or "exposure_time_absolute=" in ctrl:
+            state["exp"] = int(ctrl.rsplit("=", 1)[-1])
+        return SimpleNamespace(returncode=0, stderr="")
+
+    chosen = cal.pick_exposure(
+        "/dev/video0",
+        Cam(),
+        link,
+        [(0, 0, 20, 20)],
+        run,
+        swatches=1,
+        settle_s=0.0,
+        sleep=lambda _seconds: None,
+    )
+    assert chosen.chosen == 500
+    by_exp = {rung.exposure: rung for rung in chosen.rungs}
+    assert by_exp[250].max_channel_mean == pytest.approx(40.0)
+    assert by_exp[500].clip_fraction[0] == pytest.approx(0.02)
+    assert by_exp[1000].clip_fraction[0] > 0.02
+    assert _clipped_rung(by_exp[1000])
+    assert state["exp"] == 500
+    joined = [" ".join(cmd) for cmd in state["commands"]]
+    assert any("exposure_absolute=2000" in line for line in joined)
+    assert port.reads == 0
+
+    port_all, link_all = _link()
+    seen = {"exp": None}
+
+    class Hot:
+        def grab(self) -> np.ndarray:
+            return np.full((8, 8, 3), 255, dtype=np.uint8)
+
+    def run_all(cmd, **kwargs):
+        ctrl = cmd[-1]
+        if "exposure_absolute=" in ctrl or "exposure_time_absolute=" in ctrl:
+            seen["exp"] = int(ctrl.rsplit("=", 1)[-1])
+        return SimpleNamespace(returncode=0, stderr="")
+
+    clipped = cal.pick_exposure(
+        "/dev/video0",
+        Hot(),
+        link_all,
+        [(0, 0, 8, 8)],
+        run_all,
+        swatches=1,
+        settle_s=0.0,
+        sleep=lambda _seconds: None,
+        ladder=(2000, 500),
+    )
+    assert clipped.all_clipped is True
+    assert clipped.chosen == 500
+    assert seen["exp"] == 500
+    assert "clipped on every rung" in capsys.readouterr().err
+
+
+def _clipped_rung(rung) -> bool:
+    return any(channel > 0.02 for channel in rung.clip_fraction)

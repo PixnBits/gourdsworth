@@ -321,15 +321,23 @@ def test_search_finds_orange_shell_preimage_and_exits_test_mode():
     assert camera.grabs >= 2
 
 
+def _swatch_frames(raw: bytes) -> list[list[tuple[int, int, int]]]:
+    frames = []
+    for line in raw.decode("utf-8").splitlines():
+        decoded = face_link.decode_line(line)
+        if decoded and decoded["op"] == "test_swatches":
+            rgb = decoded["rgb"]
+            frames.append([tuple(rgb[i : i + 3]) for i in range(0, len(rgb), 3)])
+    return frames
+
+
 def test_multi_roi_pads_a_short_frame_and_keeps_alignment():
     port = FakePort()
     link = face_link.FaceLink(serial=port, pace=False)
-    seen = []
 
     class FixedCamera:
         def grab(self):
             colours = _last_swatches(port.buf)
-            seen.append(colours)
             image = np.zeros((10, 40, 3), dtype=np.uint8)
             # Two explicit ROIs, not a horizontal split of one box.
             for slot, rgb in zip(((0, 0, 10, 10), (20, 0, 10, 10)), colours):
@@ -351,11 +359,13 @@ def test_multi_roi_pads_a_short_frame_and_keeps_alignment():
     )
     assert result.best_rgb == (10, 20, 30)
     assert result.delta_e == pytest.approx(0.0, abs=1e-6)
-    assert seen[0] == [cal.PROBE_RGB, cal.PROBE_RGB]
-    assert seen[1] == [(1, 2, 3), (10, 20, 30)]
-    assert seen[2][0] == (4, 5, 6)
-    assert len(seen[2]) == 2
+    frames = _swatch_frames(port.buf)
+    assert frames[0] == [cal.PROBE_RGB, cal.PROBE_RGB]
+    assert [(1, 2, 3), (10, 20, 30)] in frames
+    assert [(4, 5, 6), (4, 5, 6)] in frames
+    assert all(len(frame) == 2 for frame in frames)
     assert len(result.samples) == 3
+    assert result.sanity["rise"] >= 15
 
 
 def test_v4l2_tries_both_names_and_continues_after_failure():
@@ -426,6 +436,10 @@ def test_main_apply_writes_winner_and_saves_sheet(tmp_path):
     assert saved["applied"] is True
     assert saved["test_mode_bypasses_brightness_cap"] is True
     assert saved["power_limit_milliamps"] == 4000
+    assert saved["sanity"]["rise"] >= 15
+    assert saved["exposure"]["chosen"] == 250
+    assert "peak_rgb" in saved["samples"][0]
+    assert "clip_fraction" in saved["samples"][0]
     sheet = (tmp_path / "face-cal-19700101-000000.png").read_bytes()
     assert sheet.startswith(b"\x89PNG\r\n\x1a\n")
     assert sheet[12:16] == b"IHDR"
@@ -438,6 +452,24 @@ def test_main_apply_writes_winner_and_saves_sheet(tmp_path):
     x, y = cal.cell_origin(0)
     centre = image[y + cal.SWATCH_H // 2, x + cal.CELL_W // 2]
     assert tuple(int(v) for v in centre) == target
+    labelled = cal.Sample(
+        rgb=_TRUE,
+        measured_rgb=tuple(float(c) for c in target),
+        delta_e=0.0,
+        stage="refine",
+        peak_rgb=(250.0, 10.0, 4.0),
+        clip_fraction=(0.25, 0.0, 0.0),
+    )
+    sheet = cal.render_contact_sheet([labelled], _TRUE)
+    label = sheet[y + cal.SWATCH_H + 50 : y + cal.SWATCH_H + 64, x : x + 80]
+    assert int(label.max()) > 200
+
+
+def test_label_font_draws_peak_and_clip_glyphs():
+    for char in "PC%":
+        image = np.zeros((8, 8, 3), dtype=np.uint8)
+        cal._blit(image, 0, 0, char, (255, 255, 255), scale=1)
+        assert int(image.sum()) > 0, char
 
 
 def test_refine_around_clamps_and_skips_the_centre():
