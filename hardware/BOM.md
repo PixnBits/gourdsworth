@@ -55,7 +55,7 @@ Spare shifter input A4 ties to GND. Tie OE4 to GND or to VCC. An unused input mu
 | 1 | Fused IEC inlet (C14 with fuse drawer) or a fused switch | ~3 A slow-blow (time-delay), ahead of all three bricks. |
 | 1 | Terminal cover or closed enclosure | Over the LRS screw terminals. No exposed 120 V. |
 
-Under ~1.5 A typical at the 40% amber cap. A full-white bench test (`FULL_WHITE_TEST=1`) is about 6 A, which the firmware holds down: `FastLED.setMaxPowerInVoltsAndMilliamps(5, 4000)` caps the LED rail at 4 A.
+Under ~1.5 A typical at the 40% brightness cap. A full-white bench test (`FULL_WHITE_TEST=1`) is about 6 A, which the firmware holds down: `FastLED.setMaxPowerInVoltsAndMilliamps(5, 4000)` caps the LED rail at 4 A.
 
 The box stays under cover, off the ground, out of sprinkler spray and direct afternoon sun. Drip loop on every cable that enters.
 

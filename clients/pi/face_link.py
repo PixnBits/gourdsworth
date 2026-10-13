@@ -9,24 +9,46 @@ ESP32 already owns:
     {"op":"gesture","name":"tip|beam|reckon|chuckle|attend|twirl"}
     {"op":"idle"}
     {"op":"ping"}
+    {"op":"set_color","r":255,"g":140,"b":20}
+    {"op":"set_brightness_cap","cap":102}
+    {"op":"test_fill","r":255,"g":120,"b":0}
+    {"op":"test_fill","r":255,"g":120,"b":0,"start":0,"count":16}
+    {"op":"test_swatches","n":2,"rgb":[255,0,0,0,255,0]}
+    {"op":"test_exit"}
 
 ``rms`` is 0.0–1.0 from the downlink PCM this process is playing. A gesture
 line names a pose. It never carries pixels. Unknown names, including the
 retired body set, are dropped so the mouth keeps moving.
+
+Colour commands use the same newline-terminated JSON. There is no checksum.
+Test fills write exact RGB on the device (the brightness cap is not applied).
+The ESP32 still enforces its 4 A FastLED limit. While test mode is on, the
+firmware drops idle, gesture, and viseme lines.
 """
 
 from __future__ import annotations
 
 import json
 import math
+import numbers
 import sys
 import threading
 import time
+from collections.abc import Sequence
 
 import numpy as np
 
 BAUD = 115200
 VISEME_HZ = 30
+
+# Default geometry in firmware/esp32/src/main.cpp. A build that changes
+# MOUTH_COLS, MOUTH_ROWS, or EYE_LEDS has to change these too.
+MOUTH_LEDS = 32 * 8
+EYE_LEDS = 16
+FACE_LEDS = MOUTH_LEDS + EYE_LEDS * 2
+MAX_SWATCHES = 16
+# main.cpp lineBuf is 512 bytes including the NUL. The newline is not stored.
+LINE_MAX = 511
 
 ALLOWED_GESTURES = ("tip", "beam", "reckon", "chuckle", "attend", "twirl")
 RETIRED_GESTURES = ("stamp", "wave", "think", "laugh", "bow", "listen")
@@ -102,6 +124,234 @@ def encode_line(obj: dict) -> bytes:
     return (json.dumps(obj, separators=(",", ":")) + "\n").encode("utf-8")
 
 
+def as_u8(value) -> int:
+    """Integer in 0..255. Bool is rejected (it is an int subclass)."""
+    if isinstance(value, bool) or not isinstance(value, numbers.Integral):
+        raise ValueError(f"expected integer 0..255, got {value!r}")
+    number = int(value)
+    if number < 0 or number > 255:
+        raise ValueError(f"expected integer 0..255, got {value!r}")
+    return number
+
+
+def _as_count(value, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, numbers.Integral):
+        raise ValueError(f"{label} must be an integer")
+    return int(value)
+
+
+def swatch_layout(num_leds: int, n: int) -> list[tuple[int, int]]:
+    """Split ``num_leds`` into ``n`` contiguous ``(start, count)`` groups.
+
+    Earlier groups receive one extra LED when the count does not divide
+    evenly, so the counts differ by at most one. 10 LEDs into 3 groups
+    is ``(0, 4), (4, 3), (7, 3)``. The firmware paints swatches the same way.
+    """
+    leds = _as_count(num_leds, "num_leds")
+    count = _as_count(n, "n")
+    if leds < 1 or count < 1 or count > leds:
+        raise ValueError(f"cannot split {leds} LEDs into {count} swatches")
+    base, extra = divmod(leds, count)
+    spans: list[tuple[int, int]] = []
+    start = 0
+    for index in range(count):
+        width = base + (1 if index < extra else 0)
+        spans.append((start, width))
+        start += width
+    return spans
+
+
+def set_color(r: int, g: int, b: int) -> dict:
+    """Persisted base face colour. The mouth still scales this by viseme level."""
+    return {"op": "set_color", "r": as_u8(r), "g": as_u8(g), "b": as_u8(b)}
+
+
+def set_brightness_cap(cap: int) -> dict:
+    """Persisted normal-mode brightness cap. Test fills do not use it."""
+    return {"op": "set_brightness_cap", "cap": as_u8(cap)}
+
+
+def test_fill(
+    r: int,
+    g: int,
+    b: int,
+    start: int | None = None,
+    count: int | None = None,
+    *,
+    num_leds: int = FACE_LEDS,
+) -> dict:
+    """Exact RGB fill of every LED, or of ``[start, start+count)``.
+
+    The device bypasses the brightness cap for this pixel write.
+    """
+    if (start is None) != (count is None):
+        raise ValueError("start and count are set together")
+    obj = {"op": "test_fill", "r": as_u8(r), "g": as_u8(g), "b": as_u8(b)}
+    if start is None or count is None:
+        return obj
+    start_i = _as_count(start, "start")
+    count_i = _as_count(count, "count")
+    leds = _as_count(num_leds, "num_leds")
+    if start_i < 0 or count_i < 1 or start_i > leds or count_i > leds or start_i + count_i > leds:
+        raise ValueError(f"fill [{start_i}, {count_i}) is outside 0..{leds}")
+    obj["start"] = start_i
+    obj["count"] = count_i
+    return obj
+
+
+def test_swatches(colors: Sequence[Sequence[int]], *, num_leds: int = FACE_LEDS) -> dict:
+    """N side-by-side swatches. ``colors`` is a sequence of RGB triples.
+
+    At most ``MAX_SWATCHES``, and not more groups than LEDs. ``rgb`` is a
+    flat list of channels so the firmware can scan it without a JSON library.
+    """
+    if not colors:
+        raise ValueError("need at least one swatch")
+    if len(colors) > MAX_SWATCHES:
+        raise ValueError(f"at most {MAX_SWATCHES} swatches")
+    leds = _as_count(num_leds, "num_leds")
+    if len(colors) > leds:
+        raise ValueError(f"more swatches than LEDs ({leds})")
+    rgb: list[int] = []
+    for colour in colors:
+        if len(tuple(colour)) != 3:
+            raise ValueError("each swatch needs three channels")
+        rgb.extend(as_u8(channel) for channel in colour)
+    return {"op": "test_swatches", "n": len(colors), "rgb": rgb}
+
+
+def test_exit() -> dict:
+    """Leave test mode and resume the normal face on the next frame."""
+    return {"op": "test_exit"}
+
+
+def _quoted(line: str, key: str) -> str | None:
+    pat = f'"{key}"'
+    index = line.find(pat)
+    if index < 0:
+        return None
+    pos = index + len(pat)
+    while pos < len(line) and line[pos] in " \t:":
+        pos += 1
+    if pos >= len(line) or line[pos] != '"':
+        return None
+    pos += 1
+    end = line.find('"', pos)
+    if end < 0:
+        return None
+    value = line[pos:end]
+    return value or None
+
+
+def _long_field(line: str, key: str) -> tuple[bool, int | None]:
+    """Return ``(present, value)``. A present but illegal token raises ValueError."""
+    pat = f'"{key}"'
+    index = line.find(pat)
+    if index < 0:
+        return False, None
+    pos = index + len(pat)
+    while pos < len(line) and line[pos] in " \t:":
+        pos += 1
+    if pos < len(line) and line[pos] == "+":
+        pos += 1
+    start = pos
+    if pos < len(line) and line[pos] == "-":
+        pos += 1
+    while pos < len(line) and line[pos].isdigit():
+        pos += 1
+    if pos == start or (line[start] == "-" and pos == start + 1):
+        raise ValueError(f"bad integer for {key}")
+    if pos < len(line) and line[pos] not in ",}] \t":
+        raise ValueError(f"bad integer for {key}")
+    return True, int(line[start:pos])
+
+
+def _u8_field(line: str, key: str) -> int:
+    present, value = _long_field(line, key)
+    if not present or value is None or value < 0 or value > 255:
+        raise ValueError(f"bad u8 for {key}")
+    return value
+
+
+def _rgb_list(line: str) -> list[int]:
+    key_at = line.find('"rgb"')
+    if key_at < 0:
+        raise ValueError("missing rgb")
+    bracket = line.find("[", key_at)
+    if bracket < 0:
+        raise ValueError("missing rgb list")
+    pos = bracket + 1
+    values: list[int] = []
+    while pos < len(line) and line[pos] != "]":
+        while pos < len(line) and line[pos] in " \t,":
+            pos += 1
+        if pos < len(line) and line[pos] == "]":
+            break
+        if pos < len(line) and line[pos] == "+":
+            pos += 1
+        start = pos
+        if pos < len(line) and line[pos] == "-":
+            raise ValueError("rgb channel out of range")
+        while pos < len(line) and line[pos].isdigit():
+            pos += 1
+        if pos == start:
+            raise ValueError("bad rgb list")
+        if pos < len(line) and line[pos] not in ",] \t":
+            raise ValueError("bad rgb list")
+        value = int(line[start:pos])
+        if value > 255:
+            raise ValueError("rgb channel out of range")
+        values.append(value)
+    if pos >= len(line) or line[pos] != "]" or not values or len(values) % 3 != 0:
+        raise ValueError("bad rgb list")
+    return values
+
+
+def decode_line(payload: bytes | str, *, num_leds: int = FACE_LEDS) -> dict | None:
+    """Parse one command line the way the firmware scans fields.
+
+    Returns the canonical dict the encoders build, or None when the firmware
+    would ignore the line. This is a mirror of the quoted-key scan, not
+    ``json.loads``.
+    """
+    if isinstance(payload, bytes):
+        text = payload.decode("utf-8", "replace")
+    else:
+        text = payload
+    line = text.strip("\r\n")
+    if not line:
+        return None
+    try:
+        op = _quoted(line, "op")
+        if op == "set_color":
+            return set_color(_u8_field(line, "r"), _u8_field(line, "g"), _u8_field(line, "b"))
+        if op == "set_brightness_cap":
+            return set_brightness_cap(_u8_field(line, "cap"))
+        if op == "test_fill":
+            r = _u8_field(line, "r")
+            g = _u8_field(line, "g")
+            b = _u8_field(line, "b")
+            has_start, start = _long_field(line, "start")
+            has_count, count = _long_field(line, "count")
+            if has_start != has_count:
+                return None
+            if not has_start:
+                return test_fill(r, g, b)
+            return test_fill(r, g, b, start, count, num_leds=num_leds)
+        if op == "test_swatches":
+            n = _u8_field(line, "n")
+            rgb = _rgb_list(line)
+            if n < 1 or n > MAX_SWATCHES or n > num_leds or len(rgb) != n * 3:
+                return None
+            colors = [tuple(rgb[i : i + 3]) for i in range(0, len(rgb), 3)]
+            return test_swatches(colors, num_leds=num_leds)
+        if op == "test_exit":
+            return test_exit()
+    except ValueError:
+        return None
+    return None
+
+
 def viseme_obj(samples, normalizer: RmsNormalizer | None = None) -> dict:
     raw = rms_of(samples)
     rms = round(raw, 4)
@@ -145,6 +395,14 @@ def format_dry_run(gesture: str = "tip", *, rate: int = 22050) -> str:
     return "".join(chunks)
 
 
+# Bound before the class so the methods call these, not themselves.
+_CMD_SET_COLOR = set_color
+_CMD_SET_BRIGHTNESS_CAP = set_brightness_cap
+_CMD_TEST_FILL = test_fill
+_CMD_TEST_SWATCHES = test_swatches
+_CMD_TEST_EXIT = test_exit
+
+
 class FaceLink:
     """Writes command lines to a serial port, or to a fake port in tests.
 
@@ -184,6 +442,30 @@ class FaceLink:
 
     def forward_gesture(self, name: str | None) -> bool:
         return self.write_obj(gesture_obj(name))
+
+    def set_color(self, r: int, g: int, b: int) -> bool:
+        return self.write_obj(_CMD_SET_COLOR(r, g, b))
+
+    def set_brightness_cap(self, cap: int) -> bool:
+        return self.write_obj(_CMD_SET_BRIGHTNESS_CAP(cap))
+
+    def test_fill(
+        self,
+        r: int,
+        g: int,
+        b: int,
+        start: int | None = None,
+        count: int | None = None,
+        *,
+        num_leds: int = FACE_LEDS,
+    ) -> bool:
+        return self.write_obj(_CMD_TEST_FILL(r, g, b, start, count, num_leds=num_leds))
+
+    def test_swatches(self, colors: Sequence[Sequence[int]], *, num_leds: int = FACE_LEDS) -> bool:
+        return self.write_obj(_CMD_TEST_SWATCHES(colors, num_leds=num_leds))
+
+    def test_exit(self) -> bool:
+        return self.write_obj(_CMD_TEST_EXIT())
 
     def drive(self, samples, rate: int) -> None:
         """Send the viseme lines for this buffer, then idle. Does not sleep."""
