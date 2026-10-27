@@ -185,8 +185,8 @@ static void advanceSpeech() {
 }
 
 static float idleTarget(uint32_t now) {
-  // Slow noise, then a second smoother, then the idle band.
-  uint8_t n = inoise8((uint16_t)(now >> 5));
+  // Gentle noise (about 2 s per cell), then a second smoother, then the idle band.
+  uint8_t n = inoise8((uint16_t)(now >> 3));
   float raw = (float)IDLE_LO + ((float)n * (float)(IDLE_HI - IDLE_LO)) / 255.0f;
   static float wander = (float)SPEECH_FLOOR;
   wander += (raw - wander) * GLOW_DECAY;
