@@ -235,10 +235,11 @@ def test_firmware_keeps_power_limit_and_new_ops():
         "DEFAULT_BASE_B = 20",
         "DEFAULT_BRIGHT_CAP = 102",
         "setMaxPowerInVoltsAndMilliamps(5, 4000)",
-        "mouthMask",
+        "FACE_LEDS",
         "faceColor",
     ):
         assert token in src
+    assert "mouthMask" not in src
     assert "if (testMode) return;" in src
 
 
