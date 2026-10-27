@@ -2,11 +2,11 @@
 
 ESP32 DevKit V1, WROOM-32, 30-pin. Not S3, not C3. Arduino framework via PlatformIO.
 
-The ESP32 is the only device that pulses servos or clocks LEDs. Wi-Fi and Bluetooth stay off. The Pi writes JSON lines on the UART; this firmware turns them into a pose and a mouth frame.
+The ESP32 is the only device that pulses servos or clocks LEDs. Wi-Fi and Bluetooth stay off. The Pi writes JSON lines on the UART; this firmware turns them into a pose and one face brightness.
 
 ## Libraries
 
-- [FastLED](https://github.com/FastLED/FastLED) 3.6, the default ESP32 RMT driver (do not define `FASTLED_ESP32_I2S`). Three `WS2812B` controllers, one pin each. The Pi does not bit-bang the strips.
+- [FastLED](https://github.com/FastLED/FastLED) 3.6, the default ESP32 RMT driver (do not define `FASTLED_ESP32_I2S`). One `WS2812B` controller, on GPIO 18. The Pi does not bit-bang the strip.
 - [Adafruit PWM Servo Driver](https://github.com/adafruit/Adafruit-PWM-Servo-Driver-Library) for the PCA9685 at `0x40`. Servo power is the board V+ rail, not the ESP32 5 V pin.
 
 ## Pins
@@ -15,14 +15,12 @@ The ESP32 is the only device that pulses servos or clocks LEDs. Wi-Fi and Blueto
 |---|---|
 | UART RX from Pi GPIO 14 TX | 16 |
 | UART TX to Pi GPIO 15 RX | 17 |
-| Mouth data into the 74AHCT125 | 18 |
-| Eye L data | 19 |
-| Eye R data | 21 |
+| Face strip data into the 74AHCT125 | 18 |
 | I2C SDA / SCL to PCA9685 | 22 / 23 |
 
-PCA9685 channels: 0 left brow, 1 right brow, 2 hat tip, 3 mustache (center at rest; `twirl` swings it). Gestures: `tip`, `beam`, `reckon`, `chuckle`, `attend`, `twirl`. Mouth is one 8×32 panel, `MOUTH_COLS` × `MOUTH_ROWS` (32×8, 256 px) on GPIO 18. `mouthIndex()` snakes 32-pixel rows (even rows left to right, odd rows right to left). Many 8×32 panels snake in 8-pixel columns instead, so light a test pattern first and change `mouthIndex()` if the mouth is mirrored or scrambled. Each eye is its own run, `EYE_LEDS` 16, GPIO 19 and 21. Do not chain the three data lines.
+PCA9685 channels: 0 left brow, 1 right brow, 2 hat tip, 3 mustache (center at rest; `twirl` swings it). Gestures: `tip`, `beam`, `reckon`, `chuckle`, `attend`, `twirl`. The face is one strip of `FACE_LEDS` WS2812B pixels (231) on GPIO 18. `-DFACE_LEDS=231` in `platformio.ini` sets the length; `main.cpp` falls back to the same number if the flag is missing. There is no second data pin. Speech and idle paint every LED the same colour.
 
-Base colour defaults to yellow-gold `R=255, G=140, B=20`. Speech brightness is still `50 + loudness * 52`, then clamped to the brightness cap (default 102, 40% of 255). A higher cap does not brighten speech past 102. Wide eyes use the cap. Every other normal-mode scale is also limited to the cap; at 102 that does not change flicker or a resting eye, because those levels were already below 102. `FULL_WHITE_TEST` still forces normal-mode lit pixels to white for a bench check (on the order of 6 A before the power limit). Default is off. `FastLED.setMaxPowerInVoltsAndMilliamps(5, 4000)` holds the LED rail at 4 A.
+Base colour defaults to yellow-gold `R=255, G=140, B=20`. Speech brightness is `50 + clamp(rms / 0.30, 0, 1) * 52`. Each 16 ms frame moves a shared level toward that target (attack about 0.55, decay about 0.12) and clamps it to `[50, cap]` when the cap is at least 50. The default cap is 102, so speech still tops out at 102; a higher cap does not brighten speech past 102. If the cap is below 50, the smoothed level stays at 50 and `faceColor` applies the cap, so the smoother is not pulled down to 0. Idle is a uniform candle flicker in about 36–64, also limited by the cap, and the level is never 0 (a cap of 0 still paints black inside `faceColor`). The same smoothed level carries from speech into idle, so a quiet link glides instead of cutting to black. `FULL_WHITE_TEST` still forces normal-mode lit pixels to white for a bench check. Default is off. `FastLED.setMaxPowerInVoltsAndMilliamps(5, 4000)` holds the LED rail at 4 A.
 
 `set_color` and `set_brightness_cap` are stored in NVS namespace `face` (keys `r`, `g`, `b`, `cap`) and loaded in `setup` before the first frame.
 
@@ -35,20 +33,20 @@ One JSON object per line, 115200 8N1, no checksum. The same quoted-key scan that
 | `ping` | | reply `{"op":"pong"}` |
 | `idle` | | candle flicker, neutral pose. Ignored in test mode |
 | `gesture` | `name` | one of `tip`, `beam`, `reckon`, `chuckle`, `attend`, `twirl`. Ignored in test mode |
-| `viseme` | `id`, `rms` | mouth shape. Ignored in test mode |
+| `viseme` | `id`, `rms` | whole-strip brightness from `rms`. `id` must be `rest`, `aa`, `ee`, `oh`, or `mbp` and is stored, but it does not select a shape. Ignored in test mode |
 | `set_color` | `r`, `g`, `b` (0–255) | base colour, saved |
 | `set_brightness_cap` | `cap` (0–255) | normal-mode cap, saved |
 | `test_fill` | `r`, `g`, `b`, optional `start`, `count` | enter test mode and paint exact RGB |
 | `test_swatches` | `n`, `rgb` (flat triples) | `n` contiguous groups, each one colour. `n` is 1–16 |
 | `test_exit` | | leave test mode; the next frame is the normal face |
 
-LED index 0 is `mouth[0]` in FastLED wire order, then the left eye (16), then the right eye (16). `test_fill` with no range paints all of them. With `start` and `count` it paints `[start, start+count)`. The first test command clears the face to black; a later range fill leaves the other test pixels alone.
+LED index 0 is the first pixel on the GPIO 18 strip, through `FACE_LEDS - 1` (230 when the length is 231). `test_fill` with no range paints all of them. With `start` and `count` it paints `[start, start+count)`. The first test command clears the strip to black; a later range fill leaves the other test pixels alone.
 
 Swatch groups use the same split as `swatch_layout` in `clients/pi/face_link.py`: earlier groups get one extra LED when the count does not divide. 10 LEDs into 3 groups is 4, 3, 3. `n` must match the number of RGB triples. A mismatch is ignored.
 
 Test-mode pixels are the commanded RGB. They do not pass through the brightness cap and they ignore `FULL_WHITE_TEST`. The 4 A limit still applies at `FastLED.show()`, so a full-bright frame can be scaled down evenly. Hue relationships inside one frame stay put.
 
-If the UART is quiet for 2 seconds, or an `idle` line arrives, the mouth goes back to candle flicker and the eyes to a slow blink. A quiet link does not leave test mode, and an `idle` line is ignored while test mode is on, so the swatches stay until `test_exit`. A Pi reboot does not freeze the face. Unknown gesture names, including `stamp`, `wave`, `think`, `laugh`, `bow`, and `listen`, are ignored and do not stall the mouth.
+If the UART is quiet for 2 seconds, or an `idle` line arrives, the strip glides back to candle flicker and the servos return to neutral. A quiet link does not leave test mode, and an `idle` line is ignored while test mode is on, so the swatches stay until `test_exit`. A Pi reboot does not freeze the face. Unknown gesture names, including `stamp`, `wave`, `think`, `laugh`, `bow`, and `listen`, are ignored and do not stall the glow.
 
 ## Flash
 

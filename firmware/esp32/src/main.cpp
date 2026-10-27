@@ -1,5 +1,5 @@
 // Pumpkin face. ESP32 DevKit V1 (WROOM-32) is the only servo and LED clock.
-// Pi UART is JSON lines. This file never starts Wi-Fi and never chains the strips.
+// Pi UART is JSON lines. This file never starts Wi-Fi. One WS2812 strip on GPIO 18.
 
 #include <Arduino.h>
 #include <Wire.h>
@@ -13,19 +13,12 @@
 #ifndef FULL_WHITE_TEST
 #define FULL_WHITE_TEST 0
 #endif
-#ifndef MOUTH_COLS
-#define MOUTH_COLS 32
-#endif
-#ifndef MOUTH_ROWS
-#define MOUTH_ROWS 8
-#endif
-#ifndef EYE_LEDS
-#define EYE_LEDS 16
+// platformio.ini passes -DFACE_LEDS=231. Keep the same fallback.
+#ifndef FACE_LEDS
+#define FACE_LEDS 231
 #endif
 
-static constexpr int PIN_MOUTH = 18;
-static constexpr int PIN_EYE_L = 19;
-static constexpr int PIN_EYE_R = 21;
+static constexpr int PIN_FACE = 18;
 static constexpr int PIN_SDA = 22;
 static constexpr int PIN_SCL = 23;
 static constexpr int PIN_RX = 16;  // from Pi GPIO 14 TX
@@ -48,9 +41,6 @@ static const int ANG_MUSTACHE_REST = 90;
 
 static const uint32_t TIP_MS = 600;
 static const uint32_t TWIRL_MS = 900;
-static const uint32_t CHUCKLE_SHUT_MS = 220;
-static const uint32_t BLINK_EVERY_MS = 4500;
-static const uint32_t BLINK_SHUT_MS = 140;
 static const uint32_t LINK_QUIET_MS = 2000;
 // Default cap is 40% of 255. Speech still tops out at floor+span (102) and
 // is then clamped to the runtime cap, so a higher cap does not brighten speech.
@@ -62,9 +52,13 @@ static const uint8_t SPEECH_FLOOR = 50;
 static const uint8_t SPEECH_SPAN = 52;  // floor + span reaches the default cap
 // typical Piper en_US-danny-low frame RMS peaks ~0.3-0.4
 static const float RMS_REF = 0.30f;
+// Per 16 ms frame. Attack tracks a louder syllable; decay is slower so the
+// strip does not strobe and so speech can glide down into the idle band.
+static const float GLOW_ATTACK = 0.55f;
+static const float GLOW_DECAY = 0.12f;
+static const uint8_t IDLE_LO = 36;
+static const uint8_t IDLE_HI = 64;
 
-static const int MOUTH_N = MOUTH_COLS * MOUTH_ROWS;
-static const int FACE_N = MOUTH_N + EYE_LEDS + EYE_LEDS;
 static const int MAX_SWATCHES = 16;
 
 static uint8_t baseR = DEFAULT_BASE_R;
@@ -76,9 +70,7 @@ static bool testMode = false;
 static Preferences prefs;
 static const char* PREF_NS = "face";
 
-CRGB mouth[MOUTH_N];
-CRGB eyeL[EYE_LEDS];
-CRGB eyeR[EYE_LEDS];
+CRGB faceLeds[FACE_LEDS];
 
 Adafruit_PWMServoDriver pca(PCA_ADDR);
 static bool servoOk = false;
@@ -86,13 +78,14 @@ static bool servoOk = false;
 enum Pose : uint8_t {
   POSE_NEUTRAL, POSE_TIP, POSE_BEAM, POSE_RECKON, POSE_CHUCKLE, POSE_ATTEND, POSE_TWIRL
 };
-enum EyeShape : uint8_t { EYE_OPEN, EYE_WIDE, EYE_HALF, EYE_SHUT };
 
 static Pose pose = POSE_NEUTRAL;
 static uint32_t poseMs = 0;
 static char visemeId[8] = "rest";
 static float visemeRms = 0.0f;
 static bool visemeLive = false;
+// Shared by speech and idle. goIdle does not clear it, so a quiet link glides.
+static float glowLevel = (float)SPEECH_FLOOR;
 static uint32_t lastUartMs = 0;
 // 16 full-scale swatches encode to about 232 bytes. 512 leaves room for the NUL.
 static char lineBuf[512];
@@ -142,90 +135,93 @@ static CRGB faceColor(uint8_t scale) {
 #endif
 }
 
-static int mouthIndex(int x, int y) {
-  if (y & 1) return y * MOUTH_COLS + (MOUTH_COLS - 1 - x);
-  return y * MOUTH_COLS + x;
+static float approach(float current, float target) {
+  float rate = (target > current) ? GLOW_ATTACK : GLOW_DECAY;
+  return current + (target - current) * rate;
 }
 
-// Shape mask 0–255. The ESP32, not the Pi, turns a viseme id into pixels.
-static uint8_t mouthMask(const char* id, int x, int y) {
-  const int cx = MOUTH_COLS / 2;
-  const int cy = MOUTH_ROWS / 2;
-  int dx = x - cx;
-  if (dx < 0) dx = -dx;
-  int dy = y - cy;
-  if (dy < 0) dy = -dy;
-  if (strcmp(id, "aa") == 0) {
-    return (dx * 3 + dy * 10 <= 30) ? 255 : 0;
-  }
-  if (strcmp(id, "oh") == 0) {
-    return (dx * 3 + dy * 8 <= 18) ? 255 : 0;
-  }
-  if (strcmp(id, "ee") == 0) {
-    return (dy <= 1 && dx <= (MOUTH_COLS * 2) / 5) ? 255 : 0;
-  }
-  if (strcmp(id, "mbp") == 0) {
-    return (dy == 0 && dx <= MOUTH_COLS / 4) ? 255 : 0;
-  }
-  return (dy == 0 && dx <= MOUTH_COLS / 8) ? 140 : 0;
+// Speech ceiling. If the cap is below SPEECH_FLOOR, this returns the floor.
+// faceColor still multiplies by the real cap, so pixels get dimmer, but the
+// smoothed level never drops below the floor and cannot be pulled to 0.
+static float speechHi() {
+  float cap = (float)brightCap;
+  if (cap < (float)SPEECH_FLOOR) return (float)SPEECH_FLOOR;
+  return cap;
 }
 
-static void renderMouthSpeech() {
+// Idle band is [36, 64], tightened to the cap. A cap below 1 collapses the
+// band to 1. faceColor still paints black when the cap itself is 0.
+static float idleHi() {
+  float hi = (float)IDLE_HI;
+  float cap = (float)brightCap;
+  if (cap < hi) hi = cap;
+  if (hi < 1.0f) hi = 1.0f;
+  return hi;
+}
+
+static float idleLo(float hi) {
+  float lo = (float)IDLE_LO;
+  if (lo > hi) lo = hi;
+  if (lo < 1.0f) lo = 1.0f;
+  return lo;
+}
+
+static void advanceSpeech() {
   float rms = visemeRms;
   if (rms < 0.0f) rms = 0.0f;
   if (rms > 1.0f) rms = 1.0f;
   float loud = rms / RMS_REF;
   if (loud < 0.0f) loud = 0.0f;
   if (loud > 1.0f) loud = 1.0f;
-  float capf = (float)SPEECH_FLOOR + loud * (float)SPEECH_SPAN;
-  if (capf > (float)brightCap) capf = (float)brightCap;
-  uint8_t cap = (uint8_t)(capf + 0.5f);
-  for (int y = 0; y < MOUTH_ROWS; y++) {
-    for (int x = 0; x < MOUTH_COLS; x++) {
-      uint8_t mask = mouthMask(visemeId, x, y);
-      uint8_t scale = (uint8_t)(((uint16_t)cap * mask) / 255);
-      mouth[mouthIndex(x, y)] = faceColor(scale);
-    }
+  float target = (float)SPEECH_FLOOR + loud * (float)SPEECH_SPAN;
+  float hi = speechHi();
+  if (target > hi) target = hi;
+  if (target < (float)SPEECH_FLOOR) target = (float)SPEECH_FLOOR;
+  glowLevel = approach(glowLevel, target);
+  if (glowLevel < (float)SPEECH_FLOOR) glowLevel = (float)SPEECH_FLOOR;
+  if (glowLevel > hi) glowLevel = hi;
+  // visemeId is parsed and stored. Brightness does not branch on it.
+  (void)visemeId;
+}
+
+static float idleTarget(uint32_t now) {
+  // Gentle noise (about 2 s per cell), then a second smoother, then the idle band.
+  uint8_t n = inoise8((uint16_t)(now >> 3));
+  float raw = (float)IDLE_LO + ((float)n * (float)(IDLE_HI - IDLE_LO)) / 255.0f;
+  static float wander = (float)SPEECH_FLOOR;
+  wander += (raw - wander) * GLOW_DECAY;
+  float hi = idleHi();
+  float lo = idleLo(hi);
+  if (wander < lo) wander = lo;
+  if (wander > hi) wander = hi;
+  return wander;
+}
+
+static void advanceIdle(uint32_t now) {
+  float target = idleTarget(now);
+  glowLevel = approach(glowLevel, target);
+  float hi = idleHi();
+  // Still above the band: this is the tail of speech. Keep decaying.
+  // Snapping down to the band would skip the glide; snapping to 0 is worse.
+  if (glowLevel <= hi) {
+    float lo = idleLo(hi);
+    if (glowLevel < lo) glowLevel = lo;
   }
+  if (glowLevel < 1.0f) glowLevel = 1.0f;
 }
 
-static void renderMouthFlicker(uint32_t now) {
-  int cx = (MOUTH_COLS / 2) + (int)((now / 180) % 7) - 3;
-  uint8_t bri = (uint8_t)(36 + ((now / 50) % 28));
-  for (int y = 0; y < MOUTH_ROWS; y++) {
-    for (int x = 0; x < MOUTH_COLS; x++) {
-      int dx = x - cx;
-      if (dx < 0) dx = -dx;
-      int dy = y - (MOUTH_ROWS / 2);
-      if (dy < 0) dy = -dy;
-      bool on = (dx + dy * 2) < 8;
-      mouth[mouthIndex(x, y)] = on ? faceColor(bri) : CRGB::Black;
-    }
-  }
+static uint8_t levelToScale(float level) {
+  if (level < 1.0f) level = 1.0f;
+  if (level > 255.0f) level = 255.0f;
+  int rounded = (int)(level + 0.5f);
+  if (rounded < 1) rounded = 1;
+  if (rounded > 255) rounded = 255;
+  return (uint8_t)rounded;
 }
 
-static EyeShape eyeShape(uint32_t now) {
-  if (pose == POSE_BEAM) return EYE_WIDE;
-  if (pose == POSE_RECKON) return EYE_HALF;
-  if (pose == POSE_CHUCKLE && (uint32_t)(now - poseMs) < CHUCKLE_SHUT_MS) return EYE_SHUT;
-  return EYE_OPEN;
-}
-
-static bool blinkClosed(uint32_t now, EyeShape shape) {
-  if (shape == EYE_SHUT) return true;
-  return (now % BLINK_EVERY_MS) < BLINK_SHUT_MS;
-}
-
-static void renderEye(CRGB* leds, int count, EyeShape shape, uint32_t now) {
-  bool shut = blinkClosed(now, shape);
-  uint8_t bri = 80;
-  if (shape == EYE_WIDE) bri = brightCap;
-  else if (shape == EYE_HALF) bri = 70;
-  for (int i = 0; i < count; i++) {
-    bool on = !shut;
-    if (on && shape == EYE_HALF) on = i >= (count / 2);
-    leds[i] = on ? faceColor(bri) : CRGB::Black;
-  }
+static void paintGlow() {
+  CRGB color = faceColor(levelToScale(glowLevel));
+  fill_solid(faceLeds, FACE_LEDS, color);
 }
 
 // 90 -> 60 -> 120 -> 60 -> 90, four equal linear segments.
@@ -367,19 +363,16 @@ static void savePrefs() {
 }
 
 static void clearFace() {
-  fill_solid(mouth, MOUTH_N, CRGB::Black);
-  fill_solid(eyeL, EYE_LEDS, CRGB::Black);
-  fill_solid(eyeR, EYE_LEDS, CRGB::Black);
+  fill_solid(faceLeds, FACE_LEDS, CRGB::Black);
 }
 
-// Wire order: mouth[0..MOUTH_N), eye L, eye R. Same split as swatch_layout().
+// Index 0..FACE_LEDS-1 on the one strip. Same split as swatch_layout().
 static void paintRange(int start, int count, uint8_t r, uint8_t g, uint8_t b) {
   CRGB color(r, g, b);
   for (int i = 0; i < count; i++) {
     int idx = start + i;
-    if (idx < MOUTH_N) mouth[idx] = color;
-    else if (idx < MOUTH_N + EYE_LEDS) eyeL[idx - MOUTH_N] = color;
-    else eyeR[idx - MOUTH_N - EYE_LEDS] = color;
+    if (idx < 0 || idx >= FACE_LEDS) continue;
+    faceLeds[idx] = color;
   }
 }
 
@@ -392,10 +385,10 @@ static void beginTest() {
 // Earlier groups take the remainder so counts differ by at most one.
 // 10 LEDs into 3 groups → 4, 3, 3.
 static bool paintSwatches(const uint8_t* rgb, int n) {
-  if (n < 1 || n > MAX_SWATCHES || n > FACE_N) return false;
+  if (n < 1 || n > MAX_SWATCHES || n > FACE_LEDS) return false;
   beginTest();
-  int base = FACE_N / n;
-  int extra = FACE_N % n;
+  int base = FACE_LEDS / n;
+  int extra = FACE_LEDS % n;
   int start = 0;
   for (int i = 0; i < n; i++) {
     int count = base + (i < extra ? 1 : 0);
@@ -481,9 +474,9 @@ static void handleLine(const char* line) {
     if (bad || hasStart != hasCount) return;
     if (!hasStart) {
       start = 0;
-      count = FACE_N;
-    } else if (start < 0 || count < 1 || start > FACE_N || count > FACE_N ||
-               start + count > FACE_N) {
+      count = FACE_LEDS;
+    } else if (start < 0 || count < 1 || start > FACE_LEDS || count > FACE_LEDS ||
+               start + count > FACE_LEDS) {
       return;
     }
     beginTest();
@@ -564,11 +557,9 @@ static void pollUart() {
 static void render(uint32_t now) {
   applyServos(now);
   if (testMode) return;
-  if (visemeLive) renderMouthSpeech();
-  else renderMouthFlicker(now);
-  EyeShape shape = eyeShape(now);
-  renderEye(eyeL, EYE_LEDS, shape, now);
-  renderEye(eyeR, EYE_LEDS, shape, now);
+  if (visemeLive) advanceSpeech();
+  else advanceIdle(now);
+  paintGlow();
 }
 
 void setup() {
@@ -578,8 +569,8 @@ void setup() {
   Serial2.begin(115200, SERIAL_8N1, PIN_RX, PIN_TX);
   Wire.begin(PIN_SDA, PIN_SCL);
   pca.begin();
-  // begin() may call Wire.begin() with no pins, which would steal GPIO 21
-  // (eye R) as the default SDA. Put SDA/SCL back on 22/23.
+  // begin() may call Wire.begin() with no pins and take the default I2C
+  // pins (SDA GPIO 21, SCL GPIO 22). Put SDA/SCL back on 22/23.
   Wire.begin(PIN_SDA, PIN_SCL);
   Wire.beginTransmission(PCA_ADDR);
   servoOk = (Wire.endTransmission() == 0);
@@ -594,9 +585,7 @@ void setup() {
   }
   // 5 V LED rail, 4 A budget; branch fuses are 5 A.
   FastLED.setMaxPowerInVoltsAndMilliamps(5, 4000);
-  FastLED.addLeds<WS2812B, PIN_MOUTH, GRB>(mouth, MOUTH_N);
-  FastLED.addLeds<WS2812B, PIN_EYE_L, GRB>(eyeL, EYE_LEDS);
-  FastLED.addLeds<WS2812B, PIN_EYE_R, GRB>(eyeR, EYE_LEDS);
+  FastLED.addLeds<WS2812B, PIN_FACE, GRB>(faceLeds, FACE_LEDS);
   FastLED.clear(true);
   goIdle();
   lastUartMs = millis();

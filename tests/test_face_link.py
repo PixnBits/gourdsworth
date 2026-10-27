@@ -199,8 +199,11 @@ def test_firmware_is_esp32_classic_and_keeps_wifi_off():
     assert "board = esp32dev" in ini
     assert "FastLED" in ini
     assert "Adafruit PWM Servo Driver" in ini
-    for token in ("18", "19", "21", "22", "23", "16", "17", "0x40"):
+    for token in ("18", "22", "23", "16", "17", "0x40"):
         assert token in src
+    assert "PIN_EYE" not in src
+    assert "EYE_LEDS" not in src
+    assert "MOUTH_COLS" not in src
     for name in ALLOWED:
         assert f'"{name}"' in src
     assert "CH_MUSTACHE" in src
@@ -241,6 +244,46 @@ def _pcm_for_frame_rms(levels: np.ndarray, rate: int = 22050) -> np.ndarray:
 def _viseme_objs(samples: np.ndarray, rate: int = 22050) -> list[dict]:
     objs = [json.loads(line) for line in face_link.playback_lines(samples, rate)]
     return [obj for obj in objs if obj["op"] == "viseme"]
+
+
+def test_face_is_one_strip_of_231():
+    assert face_link.FACE_LEDS == 231
+    assert not hasattr(face_link, "MOUTH_LEDS")
+    assert not hasattr(face_link, "EYE_LEDS")
+    for n in (1, 10, 16, 231):
+        spans = face_link.swatch_layout(231, n)
+        cursor = 0
+        for start, count in spans:
+            assert start == cursor
+            assert count >= 1
+            cursor += count
+        assert cursor == 231
+        assert [led for start, count in spans for led in range(start, start + count)] == list(
+            range(231)
+        )
+    full = face_link.test_fill(8, 9, 10, 0, face_link.FACE_LEDS)
+    assert full == {"op": "test_fill", "r": 8, "g": 9, "b": 10, "start": 0, "count": 231}
+    assert face_link.decode_line(face_link.encode_line(full)) == full
+    edge = face_link.decode_line(
+        b'{"op":"test_fill","r":1,"g":2,"b":3,"start":230,"count":1}\n'
+    )
+    assert edge == {"op": "test_fill", "r": 1, "g": 2, "b": 3, "start": 230, "count": 1}
+    with pytest.raises(ValueError):
+        face_link.test_fill(1, 2, 3, 0, 232)
+    with pytest.raises(ValueError):
+        face_link.test_fill(1, 2, 3, 200, 32)
+    assert (
+        face_link.decode_line(b'{"op":"test_fill","r":1,"g":2,"b":3,"start":200,"count":32}\n')
+        is None
+    )
+    ini = (_REPO / "firmware" / "esp32" / "platformio.ini").read_text(encoding="utf-8")
+    flags = re.findall(r"-DFACE_LEDS=(\d+)", ini)
+    assert flags == ["231"]
+    assert int(flags[0]) == face_link.FACE_LEDS
+    assert "-DMOUTH_COLS" not in ini
+    assert "-DEYE_LEDS" not in ini
+    src = (_REPO / "firmware" / "esp32" / "src" / "main.cpp").read_text(encoding="utf-8")
+    assert "#define FACE_LEDS 231" in src
 
 
 def test_rms_normalizer_scales_loud_frames_and_does_not_amplify_silence():

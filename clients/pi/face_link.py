@@ -41,11 +41,9 @@ import numpy as np
 BAUD = 115200
 VISEME_HZ = 30
 
-# Default geometry in firmware/esp32/src/main.cpp. A build that changes
-# MOUTH_COLS, MOUTH_ROWS, or EYE_LEDS has to change these too.
-MOUTH_LEDS = 32 * 8
-EYE_LEDS = 16
-FACE_LEDS = MOUTH_LEDS + EYE_LEDS * 2
+# One face strip. Must match -DFACE_LEDS in firmware/esp32/platformio.ini
+# and the FACE_LEDS fallback in firmware/esp32/src/main.cpp.
+FACE_LEDS = 231
 MAX_SWATCHES = 16
 # main.cpp lineBuf is 512 bytes including the NUL. The newline is not stored.
 LINE_MAX = 511
@@ -162,7 +160,7 @@ def swatch_layout(num_leds: int, n: int) -> list[tuple[int, int]]:
 
 
 def set_color(r: int, g: int, b: int) -> dict:
-    """Persisted base face colour. The mouth still scales this by viseme level."""
+    """Persisted base face colour. One brightness scales it across the strip."""
     return {"op": "set_color", "r": as_u8(r), "g": as_u8(g), "b": as_u8(b)}
 
 
