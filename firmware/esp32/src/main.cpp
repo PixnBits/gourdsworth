@@ -17,6 +17,7 @@
 #ifndef FACE_LEDS
 #define FACE_LEDS 231
 #endif
+#include "led_height.h"
 
 static constexpr int PIN_FACE = 18;
 static constexpr int PIN_SDA = 22;
@@ -56,8 +57,25 @@ static const float RMS_REF = 0.30f;
 // strip does not strobe and so speech can glide down into the idle band.
 static const float GLOW_ATTACK = 0.55f;
 static const float GLOW_DECAY = 0.12f;
-static const uint8_t IDLE_LO = 36;
-static const uint8_t IDLE_HI = 64;
+// Idle envelope. idleHi/idleLo still tighten it to the cap and never let
+// the floor drop below 1. Height shapes a shorter, brighter band at the
+// bottom of the face; the top uses this whole envelope.
+static const uint8_t IDLE_LO = 30;
+static const uint8_t IDLE_HI = 70;
+static const float CANDLE_BOT_LO = 48.0f;
+static const float CANDLE_BOT_HI = 62.0f;
+// inoise8 cells are 256 counts wide. Height * 4 is about four cells from
+// the bottom of the face to the top. Subtracting now>>1 (~500 counts/s)
+// walks a feature toward larger height, about 2 s across the face.
+// now>>4 morphs the field, about 4 s per cell.
+static const int NOISE_H_SCALE = 4;
+static const int NOISE_RISE_SHIFT = 1;
+static const int NOISE_EVOLVE_SHIFT = 4;
+// Per 16 ms frame. The base is smoothed harder than the top so it sits
+// still while the top follows the rising field. Neither rate is the
+// speech attack, so a smooth noise target does not strobe.
+static const float CANDLE_SMOOTH_BOT = 0.10f;
+static const float CANDLE_SMOOTH_TOP = 0.28f;
 
 static const int MAX_SWATCHES = 16;
 
@@ -86,6 +104,9 @@ static float visemeRms = 0.0f;
 static bool visemeLive = false;
 // Shared by speech and idle. goIdle does not clear it, so a quiet link glides.
 static float glowLevel = (float)SPEECH_FLOOR;
+// Smoothed idle brightness for each LED. Speech copies glowLevel into every
+// entry so the flame starts from the syllable instead of jumping.
+static float ledLevel[FACE_LEDS];
 static uint32_t lastUartMs = 0;
 // 16 full-scale swatches encode to about 232 bytes. 512 leaves room for the NUL.
 static char lineBuf[512];
@@ -149,8 +170,8 @@ static float speechHi() {
   return cap;
 }
 
-// Idle band is [36, 64], tightened to the cap. A cap below 1 collapses the
-// band to 1. faceColor still paints black when the cap itself is 0.
+// Idle band is [IDLE_LO, IDLE_HI], tightened to the cap. A cap below 1
+// collapses the band to 1. faceColor still paints black when the cap is 0.
 static float idleHi() {
   float hi = (float)IDLE_HI;
   float cap = (float)brightCap;
@@ -184,30 +205,65 @@ static void advanceSpeech() {
   (void)visemeId;
 }
 
-static float idleTarget(uint32_t now) {
-  // Gentle noise (about 2 s per cell), then a second smoother, then the idle band.
-  uint8_t n = inoise8((uint16_t)(now >> 3));
-  float raw = (float)IDLE_LO + ((float)n * (float)(IDLE_HI - IDLE_LO)) / 255.0f;
-  static float wander = (float)SPEECH_FLOOR;
-  wander += (raw - wander) * GLOW_DECAY;
-  float hi = idleHi();
-  float lo = idleLo(hi);
-  if (wander < lo) wander = lo;
-  if (wander > hi) wander = hi;
-  return wander;
+// Rising noise. Subtracting time from the height coordinate moves a fixed
+// feature toward a larger height, which is up the face.
+static uint8_t candleNoise(uint8_t height, uint32_t now) {
+  uint16_t along = (uint16_t)((uint16_t)height * (uint16_t)NOISE_H_SCALE);
+  uint16_t rise = (uint16_t)(now >> NOISE_RISE_SHIFT);
+  uint16_t evolve = (uint16_t)(now >> NOISE_EVOLVE_SHIFT);
+  return inoise8((uint16_t)(along - rise), evolve);
+}
+
+// Bottom of the face: about 48–62. Top: the full idle envelope (about 30–70),
+// then the same cap clamp as idleHi/idleLo.
+static void candleBand(uint8_t height, float* loOut, float* hiOut) {
+  float u = (float)height / 255.0f;
+  float lo = CANDLE_BOT_LO + ((float)IDLE_LO - CANDLE_BOT_LO) * u;
+  float hi = CANDLE_BOT_HI + ((float)IDLE_HI - CANDLE_BOT_HI) * u;
+  float capHi = idleHi();
+  if (hi > capHi) hi = capHi;
+  if (lo > hi) lo = hi;
+  float capLo = idleLo(capHi);
+  if (lo < capLo) lo = capLo;
+  if (hi < lo) hi = lo;
+  if (lo < 1.0f) lo = 1.0f;
+  if (hi < 1.0f) hi = 1.0f;
+  *loOut = lo;
+  *hiOut = hi;
+}
+
+static float candleSmooth(uint8_t height) {
+  float u = (float)height / 255.0f;
+  return CANDLE_SMOOTH_BOT + (CANDLE_SMOOTH_TOP - CANDLE_SMOOTH_BOT) * u;
 }
 
 static void advanceIdle(uint32_t now) {
-  float target = idleTarget(now);
-  glowLevel = approach(glowLevel, target);
   float hi = idleHi();
+  float lo = idleLo(hi);
+  // Park at the bottom of the band. The per-LED flame is max()'d with this
+  // level, so a higher parking spot would flatten the darker tips.
+  glowLevel = approach(glowLevel, lo);
   // Still above the band: this is the tail of speech. Keep decaying.
   // Snapping down to the band would skip the glide; snapping to 0 is worse.
   if (glowLevel <= hi) {
-    float lo = idleLo(hi);
     if (glowLevel < lo) glowLevel = lo;
   }
   if (glowLevel < 1.0f) glowLevel = 1.0f;
+
+  for (int i = 0; i < FACE_LEDS; i++) {
+    uint8_t height = LED_HEIGHT[i];
+    float bandLo = 0.0f;
+    float bandHi = 0.0f;
+    candleBand(height, &bandLo, &bandHi);
+    float n = (float)candleNoise(height, now);
+    float raw = bandLo + (bandHi - bandLo) * (n / 255.0f);
+    if (raw < 1.0f) raw = 1.0f;
+    float level = ledLevel[i];
+    level += (raw - level) * candleSmooth(height);
+    if (level < 1.0f) level = 1.0f;
+    if (level > 255.0f) level = 255.0f;
+    ledLevel[i] = level;
+  }
 }
 
 static uint8_t levelToScale(float level) {
@@ -220,8 +276,21 @@ static uint8_t levelToScale(float level) {
 }
 
 static void paintGlow() {
-  CRGB color = faceColor(levelToScale(glowLevel));
-  fill_solid(faceLeds, FACE_LEDS, color);
+  if (visemeLive) {
+    // Speech stays one brightness for the whole strip.
+    CRGB color = faceColor(levelToScale(glowLevel));
+    fill_solid(faceLeds, FACE_LEDS, color);
+    for (int i = 0; i < FACE_LEDS; i++) ledLevel[i] = glowLevel;
+    return;
+  }
+  for (int i = 0; i < FACE_LEDS; i++) {
+    // While the shared level is still brighter than this LED's flame, hold
+    // it. The flame shows through as that level decays, with no snap to dark.
+    float level = ledLevel[i];
+    if (glowLevel > level) level = glowLevel;
+    if (level < 1.0f) level = 1.0f;
+    faceLeds[i] = faceColor(levelToScale(level));
+  }
 }
 
 // 90 -> 60 -> 120 -> 60 -> 90, four equal linear segments.
@@ -588,6 +657,7 @@ void setup() {
   FastLED.addLeds<WS2812B, PIN_FACE, GRB>(faceLeds, FACE_LEDS);
   FastLED.clear(true);
   goIdle();
+  for (int i = 0; i < FACE_LEDS; i++) ledLevel[i] = glowLevel;
   lastUartMs = millis();
   Serial.printf("face up, wifi off, colour %u,%u,%u cap %u\n", baseR, baseG, baseB, brightCap);
 }
