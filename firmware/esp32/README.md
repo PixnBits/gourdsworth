@@ -2,7 +2,7 @@
 
 ESP32 DevKit V1, WROOM-32, 30-pin. Not S3, not C3. Arduino framework via PlatformIO.
 
-The ESP32 is the only device that pulses servos or clocks LEDs. Wi-Fi and Bluetooth stay off. The Pi writes JSON lines on the UART; this firmware turns them into a pose and one face brightness.
+The ESP32 is the only device that pulses servos or clocks LEDs. Wi-Fi and Bluetooth stay off. The Pi writes JSON lines on the UART; this firmware turns them into a pose and the face LEDs.
 
 ## Libraries
 
@@ -18,9 +18,9 @@ The ESP32 is the only device that pulses servos or clocks LEDs. Wi-Fi and Blueto
 | Face strip data into the 74AHCT125 | 18 |
 | I2C SDA / SCL to PCA9685 | 22 / 23 |
 
-PCA9685 channels: 0 left brow, 1 right brow, 2 hat tip, 3 mustache (center at rest; `twirl` swings it). Gestures: `tip`, `beam`, `reckon`, `chuckle`, `attend`, `twirl`. The face is one strip of `FACE_LEDS` WS2812B pixels (231) on GPIO 18. `-DFACE_LEDS=231` in `platformio.ini` sets the length; `main.cpp` falls back to the same number if the flag is missing. There is no second data pin. Speech and idle paint every LED the same colour.
+PCA9685 channels: 0 left brow, 1 right brow, 2 hat tip, 3 mustache (center at rest; `twirl` swings it). Gestures: `tip`, `beam`, `reckon`, `chuckle`, `attend`, `twirl`. The face is one strip of `FACE_LEDS` WS2812B pixels (231) on GPIO 18. `-DFACE_LEDS=231` in `platformio.ini` sets the length; `main.cpp` falls back to the same number if the flag is missing. There is no second data pin. Speech paints every LED the same colour and the same brightness. Idle keeps that colour and varies brightness by measured height (`led_height.h`).
 
-Base colour defaults to yellow-gold `R=255, G=140, B=20`. Speech brightness is `50 + clamp(rms / 0.30, 0, 1) * 52`. Each 16 ms frame moves a shared level toward that target (attack about 0.55, decay about 0.12) and clamps it to `[50, cap]` when the cap is at least 50. The default cap is 102, so speech still tops out at 102; a higher cap does not brighten speech past 102. If the cap is below 50, the smoothed level stays at 50 and `faceColor` applies the cap, so the smoother is not pulled down to 0. Idle is a uniform candle flicker in about 36–64, also limited by the cap, and the level is never 0 (a cap of 0 still paints black inside `faceColor`). The same smoothed level carries from speech into idle, so a quiet link glides instead of cutting to black. `FULL_WHITE_TEST` still forces normal-mode lit pixels to white for a bench check. Default is off. `FastLED.setMaxPowerInVoltsAndMilliamps(5, 4000)` holds the LED rail at 4 A.
+Base colour defaults to yellow-gold `R=255, G=140, B=20`. Speech brightness is `50 + clamp(rms / 0.30, 0, 1) * 52`. Each 16 ms frame moves a shared level toward that target (attack about 0.55, decay about 0.12) and clamps it to `[50, cap]` when the cap is at least 50. The default cap is 102, so speech still tops out at 102; a higher cap does not brighten speech past 102. If the cap is below 50, the smoothed level stays at 50 and `faceColor` applies the cap, so the smoother is not pulled down to 0. Idle keeps that colour. Each LED's brightness is a smoothed noise sample of its measured height (`led_height.h`: 0 at the bottom of the face, 255 at the top) so the flicker travels upward. The base is a little brighter and steadier (about 48–62); the top is livelier (about 30–70). The cap still limits every LED, and the level is never 0 (a cap of 0 still paints black inside `faceColor`). The shared speech level decays into that band and the flame mixes in under it, so a quiet link glides instead of cutting to black. `FULL_WHITE_TEST` still forces normal-mode lit pixels to white for a bench check. Default is off. `FastLED.setMaxPowerInVoltsAndMilliamps(5, 4000)` holds the LED rail at 4 A.
 
 `set_color` and `set_brightness_cap` are stored in NVS namespace `face` (keys `r`, `g`, `b`, `cap`) and loaded in `setup` before the first frame.
 
@@ -31,7 +31,7 @@ One JSON object per line, 115200 8N1, no checksum. The same quoted-key scan that
 | op | fields | effect |
 |---|---|---|
 | `ping` | | reply `{"op":"pong"}` |
-| `idle` | | candle flicker, neutral pose. Ignored in test mode |
+| `idle` | | height-shaped candle flicker, neutral pose. Ignored in test mode |
 | `gesture` | `name` | one of `tip`, `beam`, `reckon`, `chuckle`, `attend`, `twirl`. Ignored in test mode |
 | `viseme` | `id`, `rms` | whole-strip brightness from `rms`. `id` must be `rest`, `aa`, `ee`, `oh`, or `mbp` and is stored, but it does not select a shape. Ignored in test mode |
 | `set_color` | `r`, `g`, `b` (0–255) | base colour, saved |
