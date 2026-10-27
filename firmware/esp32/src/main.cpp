@@ -18,6 +18,7 @@
 #define FACE_LEDS 231
 #endif
 #include "led_height.h"
+#include "flame.h"
 
 static constexpr int PIN_FACE = 18;
 static constexpr int PIN_SDA = 22;
@@ -54,16 +55,9 @@ static const uint8_t SPEECH_SPAN = 52;  // floor + span reaches the default cap
 // typical Piper en_US-danny-low frame RMS peaks ~0.3-0.4
 static const float RMS_REF = 0.30f;
 // Per 16 ms frame. Attack tracks a louder syllable; decay is slower so the
-// strip does not strobe and so speech can glide down into the idle band.
+// strip does not strobe and so speech can glide down into the idle flame.
 static const float GLOW_ATTACK = 0.55f;
 static const float GLOW_DECAY = 0.12f;
-// Idle envelope. idleHi/idleLo still tighten it to the cap and never let
-// the floor drop below 1. Height shapes a shorter, brighter band at the
-// bottom of the face; the top uses this whole envelope.
-static const uint8_t IDLE_LO = 30;
-static const uint8_t IDLE_HI = 70;
-static const float CANDLE_BOT_LO = 48.0f;
-static const float CANDLE_BOT_HI = 62.0f;
 // inoise8 cells are 256 counts wide. Height * 4 is about four cells from
 // the bottom of the face to the top. Subtracting now>>1 (~500 counts/s)
 // walks a feature toward larger height, about 2 s across the face.
@@ -71,6 +65,17 @@ static const float CANDLE_BOT_HI = 62.0f;
 static const int NOISE_H_SCALE = 4;
 static const int NOISE_RISE_SHIFT = 1;
 static const int NOISE_EVOLVE_SHIFT = 4;
+// Flares and gutters. Different scale and a fixed offset so this field
+// does not track the rising flame. now>>3 crosses a cell in about 2 s
+// (the main field takes about 4 s), so a tail crossing is a short peak.
+static const int EVENT_H_SCALE = 9;
+static const int EVENT_RISE_SHIFT = 2;
+static const int EVENT_EVOLVE_SHIFT = 3;
+static const uint16_t EVENT_X_OFFSET = 17000;
+static const uint16_t EVENT_Y_OFFSET = 9000;
+// paintGlow holds max(glowLevel, ledLevel). Parking any higher would cover
+// the dim top and the gutters. Speech still decays through this at GLOW_DECAY.
+static const float IDLE_PARK = 1.0f;
 // Per 16 ms frame. The base is smoothed harder than the top so it sits
 // still while the top follows the rising field. Neither rate is the
 // speech attack, so a smooth noise target does not strobe.
@@ -170,23 +175,6 @@ static float speechHi() {
   return cap;
 }
 
-// Idle band is [IDLE_LO, IDLE_HI], tightened to the cap. A cap below 1
-// collapses the band to 1. faceColor still paints black when the cap is 0.
-static float idleHi() {
-  float hi = (float)IDLE_HI;
-  float cap = (float)brightCap;
-  if (cap < hi) hi = cap;
-  if (hi < 1.0f) hi = 1.0f;
-  return hi;
-}
-
-static float idleLo(float hi) {
-  float lo = (float)IDLE_LO;
-  if (lo > hi) lo = hi;
-  if (lo < 1.0f) lo = 1.0f;
-  return lo;
-}
-
 static void advanceSpeech() {
   float rms = visemeRms;
   if (rms < 0.0f) rms = 0.0f;
@@ -214,22 +202,12 @@ static uint8_t candleNoise(uint8_t height, uint32_t now) {
   return inoise8((uint16_t)(along - rise), evolve);
 }
 
-// Bottom of the face: about 48–62. Top: the full idle envelope (about 30–70),
-// then the same cap clamp as idleHi/idleLo.
-static void candleBand(uint8_t height, float* loOut, float* hiOut) {
-  float u = (float)height / 255.0f;
-  float lo = CANDLE_BOT_LO + ((float)IDLE_LO - CANDLE_BOT_LO) * u;
-  float hi = CANDLE_BOT_HI + ((float)IDLE_HI - CANDLE_BOT_HI) * u;
-  float capHi = idleHi();
-  if (hi > capHi) hi = capHi;
-  if (lo > hi) lo = hi;
-  float capLo = idleLo(capHi);
-  if (lo < capLo) lo = capLo;
-  if (hi < lo) hi = lo;
-  if (lo < 1.0f) lo = 1.0f;
-  if (hi < 1.0f) hi = 1.0f;
-  *loOut = lo;
-  *hiOut = hi;
+// Separate sample for flame.h's flare and gutter thresholds.
+static uint8_t candleEventNoise(uint8_t height, uint32_t now) {
+  uint16_t along = (uint16_t)((uint16_t)height * (uint16_t)EVENT_H_SCALE);
+  uint16_t rise = (uint16_t)(now >> EVENT_RISE_SHIFT);
+  uint16_t evolve = (uint16_t)((now >> EVENT_EVOLVE_SHIFT) + EVENT_Y_OFFSET);
+  return inoise8((uint16_t)(along + EVENT_X_OFFSET - rise), evolve);
 }
 
 static float candleSmooth(uint8_t height) {
@@ -238,26 +216,17 @@ static float candleSmooth(uint8_t height) {
 }
 
 static void advanceIdle(uint32_t now) {
-  float hi = idleHi();
-  float lo = idleLo(hi);
-  // Park at the bottom of the band. The per-LED flame is max()'d with this
-  // level, so a higher parking spot would flatten the darker tips.
-  glowLevel = approach(glowLevel, lo);
-  // Still above the band: this is the tail of speech. Keep decaying.
-  // Snapping down to the band would skip the glide; snapping to 0 is worse.
-  if (glowLevel <= hi) {
-    if (glowLevel < lo) glowLevel = lo;
-  }
-  if (glowLevel < 1.0f) glowLevel = 1.0f;
+  // Park on the never-off floor. The per-LED flame is max()'d with this
+  // level in paintGlow, so a higher spot would hide gutters and the dim
+  // top. Above the floor this is the tail of speech: keep decaying.
+  glowLevel = approach(glowLevel, IDLE_PARK);
+  if (glowLevel < IDLE_PARK) glowLevel = IDLE_PARK;
 
   for (int i = 0; i < FACE_LEDS; i++) {
     uint8_t height = LED_HEIGHT[i];
-    float bandLo = 0.0f;
-    float bandHi = 0.0f;
-    candleBand(height, &bandLo, &bandHi);
-    float n = (float)candleNoise(height, now);
-    float raw = bandLo + (bandHi - bandLo) * (n / 255.0f);
-    if (raw < 1.0f) raw = 1.0f;
+    uint8_t n = candleNoise(height, now);
+    uint8_t event = candleEventNoise(height, now);
+    float raw = (float)flameLevel(height, n, event, brightCap);
     float level = ledLevel[i];
     level += (raw - level) * candleSmooth(height);
     if (level < 1.0f) level = 1.0f;
@@ -275,6 +244,19 @@ static uint8_t levelToScale(float level) {
   return (uint8_t)rounded;
 }
 
+// Idle pixel. Speech does not call this: it stays on faceColor so the
+// whole strip is one copy of the saved colour. FULL_WHITE_TEST matches
+// faceColor (lit pixels become white, scale 0 stays black).
+static CRGB idlePixel(uint8_t height, uint8_t scale) {
+#if FULL_WHITE_TEST
+  if (scale == 0) return CRGB::Black;
+  return CRGB(255, 255, 255);
+#else
+  FlameRgb px = flamePixel(baseR, baseG, baseB, scale, height, brightCap);
+  return CRGB(px.r, px.g, px.b);
+#endif
+}
+
 static void paintGlow() {
   if (visemeLive) {
     // Speech stays one brightness for the whole strip.
@@ -289,7 +271,7 @@ static void paintGlow() {
     float level = ledLevel[i];
     if (glowLevel > level) level = glowLevel;
     if (level < 1.0f) level = 1.0f;
-    faceLeds[i] = faceColor(levelToScale(level));
+    faceLeds[i] = idlePixel(LED_HEIGHT[i], levelToScale(level));
   }
 }
 
