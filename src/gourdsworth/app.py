@@ -17,6 +17,7 @@ from gourdsworth.net import (
     CrateListener,
     carry_history_for_peer,
     is_loopback,
+    TrustedPeersError,
     load_trusted_peers,
     resolve_bind,
     serve_echo,
@@ -681,8 +682,9 @@ def _crate_settings(cfg: dict) -> tuple[str, int]:
 def _trusted_for_start(cfg: dict, host: str):
     """Merge trusted peers once and warn when a LAN bind has an empty list.
 
-    An empty list still starts. The returned set is what the listener uses;
-    it does not read ``CRATE_TRUSTED_PEERS`` again.
+    An empty list still starts. An entry that is not an IP raises
+    ``TrustedPeersError``; callers exit nonzero. The returned set is what
+    the listener uses; it does not read ``CRATE_TRUSTED_PEERS`` again.
     """
     raw = (cfg.get("crate") or {}).get("trusted_peers")
     trusted = load_trusted_peers(raw)
@@ -722,7 +724,11 @@ def _run_crate_echo(args) -> int:
     else:
         print(f"  bind {host}:{port}  WARNING: LAN bind. PCM/JPEG reachable on this network. No TLS.")
     print("  Ctrl+C to quit")
-    trusted = _trusted_for_start(cfg, host)
+    try:
+        trusted = _trusted_for_start(cfg, host)
+    except TrustedPeersError as exc:
+        print(exc, file=sys.stderr, flush=True)
+        return 2
     try:
         code = serve_echo(host, port, trusted_peers=trusted, trust_env=False)
     except KeyboardInterrupt:
@@ -757,12 +763,16 @@ def _serve_crate(cfg, mayor, stt, speaker, sidecar, canned) -> int:
         print("  vision: JPEG stills from the crate (desktop camera unused)")
     print("  Talk is the Pi button / Enter. Ctrl+C to quit.")
     print()
+    try:
+        trusted = _trusted_for_start(cfg, host)
+    except TrustedPeersError as exc:
+        print(exc, file=sys.stderr, flush=True)
+        return 2
     listener = CrateListener(host, port)
     # History survives only an exact same-IP reconnect. A different IP,
     # trusted or not, starts empty. The turn cap stays in the turn handler.
     history: list[dict] = []
     last_peer: dict[str, str | None] = {"ip": None}
-    trusted = _trusted_for_start(cfg, host)
 
     def _one(conn) -> None:
         peer = conn.peer or ("?", 0)

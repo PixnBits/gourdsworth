@@ -783,17 +783,21 @@ def _play_local_shutdown(*, kind: str = "disconnect") -> None:
 # them if both back off.
 SUPERSEDED_BACKOFF_S = 30.0
 SUPERSEDED_BACKOFF_JITTER_S = 5.0
+# Failed or unserved connects: refused TCP, close/EOF/RST at accept, or a
+# session that ends before "ready". Start at MIN and double up to MAX.
+# Jitter is added on top, so a retry is never sooner than the base. Reset
+# only after a session reaches ready. Busy and superseded keep their own wait.
+RECONNECT_BACKOFF_MIN_S = 1.0
+RECONNECT_BACKOFF_MAX_S = 30.0
+RECONNECT_BACKOFF_JITTER_S = 1.0
 # Spoken disconnect line: once per outage, then at most this often until a
 # session reaches "ready" again. _wait_for_desktop uses the same spacing.
 DISCONNECT_ANNOUNCE_EVERY_S = 45.0
 
 
-def _backoff_superseded(quit_ev: threading.Event) -> bool:
-    """Wait out a supersede. Return True if quit or shutdown interrupted it."""
-    delay = float(SUPERSEDED_BACKOFF_S) + random.uniform(
-        0.0, max(0.0, float(SUPERSEDED_BACKOFF_JITTER_S))
-    )
-    deadline = time.monotonic() + max(0.0, delay)
+def _backoff_wait(quit_ev: threading.Event, delay: float) -> bool:
+    """Wait ``delay`` seconds. True if quit, shutdown, or q interrupted it."""
+    deadline = time.monotonic() + max(0.0, float(delay))
     while True:
         if quit_ev.is_set() or _SHUTDOWN.is_set():
             return True
@@ -809,6 +813,32 @@ def _backoff_superseded(quit_ev: threading.Event) -> bool:
             return True
 
 
+def _backoff_superseded(quit_ev: threading.Event) -> bool:
+    """Wait out a supersede. Return True if quit or shutdown interrupted it."""
+    delay = float(SUPERSEDED_BACKOFF_S) + random.uniform(
+        0.0, max(0.0, float(SUPERSEDED_BACKOFF_JITTER_S))
+    )
+    return _backoff_wait(quit_ev, delay)
+
+
+def _next_reconnect_backoff(current: float) -> float:
+    """Next base delay after one failed or unserved connect."""
+    grown = float(current) * 2.0
+    floor = float(RECONNECT_BACKOFF_MIN_S)
+    cap = float(RECONNECT_BACKOFF_MAX_S)
+    if grown < floor:
+        grown = floor
+    if grown > cap:
+        grown = cap
+    return grown
+
+
+def _backoff_reconnect(quit_ev: threading.Event, base: float) -> bool:
+    """Wait ``base`` plus jitter. True if quit or shutdown interrupted it."""
+    extra = random.uniform(0.0, max(0.0, float(RECONNECT_BACKOFF_JITTER_S)))
+    return _backoff_wait(quit_ev, max(0.0, float(base)) + extra)
+
+
 def _wait_for_desktop(
     host: str,
     port: int,
@@ -820,6 +850,7 @@ def _wait_for_desktop(
     announce_immediately: bool = True,
     play=None,
     announce_clock: list | None = None,
+    on_connect_error=None,
 ) -> socket.socket | None:
     """Block until the desktop accepts TCP. Play generic disconnect lines while waiting.
 
@@ -827,6 +858,8 @@ def _wait_for_desktop(
     when announce_immediately is True; later announcements are spaced by announce_every_s.
     ``announce_clock`` is an optional one-element list shared with the reconnect loop
     so a busy refusal and a TCP wait count as one outage.
+    ``on_connect_error``, when set, replaces the fixed ``retry_s`` pause. It should
+    wait and return True when quit or shutdown should stop the client.
     """
     play_fn = play or _play_local_shutdown
     every = float(
@@ -855,6 +888,10 @@ def _wait_for_desktop(
                 next_announce = now + every
                 if announce_clock is not None:
                     announce_clock[0] = next_announce
+            if on_connect_error is not None:
+                if on_connect_error():
+                    return None
+                continue
             if quit_ev.wait(timeout=max(0.5, float(retry_s))):
                 return None
     return None
@@ -1478,10 +1515,14 @@ def main(argv: list[str] | None = None) -> int:
     superseded_box = {"hit": False}
     busy_box = {"hit": False}
     served_box = {"hit": False}
+    # Set once _wait_ready succeeds. The talk loop clears the ready event, so
+    # the flag at teardown is not enough to know the desktop served us.
+    reached_ready = {"hit": False}
     # Shared with _wait_for_desktop. 0 means the disconnect line is due.
     announce_clock = [0.0]
     announce_every_s = float(DISCONNECT_ANNOUNCE_EVERY_S)
     announce_now = True
+    reconnect_base = float(RECONNECT_BACKOFF_MIN_S)
 
     def _note_outage(message: str) -> None:
         nonlocal announce_now
@@ -1494,9 +1535,18 @@ def main(argv: list[str] | None = None) -> int:
         announce_clock[0] = now + announce_every_s
 
     def _session_succeeded() -> None:
-        nonlocal announce_now
+        nonlocal announce_now, reconnect_base
         announce_clock[0] = 0.0
         announce_now = True
+        reconnect_base = float(RECONNECT_BACKOFF_MIN_S)
+
+    def _pause_unserved() -> bool:
+        """Backoff for one failed or unserved connect. True if we should stop."""
+        nonlocal reconnect_base
+        base = float(reconnect_base)
+        interrupted = _backoff_reconnect(quit_ev, base)
+        reconnect_base = _next_reconnect_backoff(base)
+        return interrupted
 
     def _run_connected_session(conn: CrateConnection) -> str:
         """Run one desktop session. Returns 'goodbye' (stop client) or 'disconnect' (retry)."""
@@ -1525,6 +1575,7 @@ def main(argv: list[str] | None = None) -> int:
                 if not conn.closed:
                     print("No ready from desktop (is --serve-crate / --crate-echo running?)")
                 return "disconnect"
+            reached_ready["hit"] = True
             telemetry = threading.Thread(
                 target=_telemetry_loop,
                 args=(conn, stop),
@@ -1686,6 +1737,7 @@ def main(argv: list[str] | None = None) -> int:
                 announce_every_s=announce_every_s,
                 announce_immediately=announce_now,
                 announce_clock=announce_clock,
+                on_connect_error=_pause_unserved,
             )
             if sock is None:
                 return 0
@@ -1696,9 +1748,8 @@ def main(argv: list[str] | None = None) -> int:
                 superseded_box["hit"] = False
                 busy_box["hit"] = False
                 served_box["hit"] = False
+                reached_ready["hit"] = False
                 reason = _run_connected_session(conn)
-                if served_box["hit"]:
-                    _session_succeeded()
                 if reason != "goodbye" and superseded_box["hit"]:
                     reason = "superseded"
                 elif reason != "goodbye" and busy_box["hit"]:
@@ -1710,6 +1761,13 @@ def main(argv: list[str] | None = None) -> int:
                     break
                 print(f"disconnected: {exc}")
                 reason = "disconnect"
+            if served_box["hit"]:
+                _session_succeeded()
+            elif reached_ready["hit"]:
+                # Reached ready, then the talk loop cleared the event. The
+                # outage chime stays on the existing schedule; the reconnect
+                # penalty still starts over.
+                reconnect_base = float(RECONNECT_BACKOFF_MIN_S)
             if reason == "goodbye" or quit_ev.is_set() or _SHUTDOWN.is_set():
                 break
             if reason == "superseded":
@@ -1722,8 +1780,13 @@ def main(argv: list[str] | None = None) -> int:
                 if _backoff_superseded(quit_ev):
                     break
                 continue
-            # Desktop dropped or never became ready. One line per outage.
+            # Desktop dropped, or the connect never reached ready. One line
+            # per outage. A session that reached ready retries at once; the
+            # next failure starts again at RECONNECT_BACKOFF_MIN_S.
             _note_outage("  desktop gone; will retry when it returns")
+            if not served_box["hit"] and not reached_ready["hit"]:
+                if _pause_unserved():
+                    break
     except KeyboardInterrupt:
         quit_ev.set()
         _play_local_shutdown(kind="goodbye")

@@ -824,15 +824,50 @@ def _still_pending(sock: socket.socket) -> bool:
 
 
 def test_untrusted_is_dropped_at_accept_when_list_is_set(monkeypatch, capsys):
-    from gourdsworth.net import parse_trusted_peers, run_echo_session
+    from gourdsworth import app as appmod
+    from gourdsworth.app import _trusted_for_start
+    from gourdsworth.net import TrustedPeersError, parse_trusted_peers, run_echo_session
 
     assert parse_trusted_peers("192.0.2.7 198.51.100.8") == frozenset(
         {"192.0.2.7", "198.51.100.8"}
     )
     assert parse_trusted_peers("::ffff:192.0.2.7") == frozenset({"192.0.2.7"})
+    with pytest.raises(TrustedPeersError) as excinfo:
+        parse_trusted_peers("*, 192.0.2.0/24, localhost, junk")
+    text = str(excinfo.value)
+    for token in ("*", "192.0.2.0/24", "localhost", "junk"):
+        assert token in text
+    monkeypatch.delenv("CRATE_TRUSTED_PEERS", raising=False)
+    with pytest.raises(TrustedPeersError) as excinfo:
+        _trusted_for_start(
+            {"crate": {"trusted_peers": ["192.0.2.55", "pi.local"]}},
+            "127.0.0.1",
+        )
+    assert "pi.local" in str(excinfo.value)
+    assert "192.0.2.55" not in str(excinfo.value)
+
+    def _no_serve(*_args, **_kwargs):
+        raise AssertionError("server started with invalid trusted peers")
+
+    monkeypatch.setattr(appmod, "serve_echo", _no_serve)
     monkeypatch.setenv(
         "CRATE_TRUSTED_PEERS",
         "192.0.2.55, *, 192.0.2.0/24, localhost, junk, ::ffff:198.51.100.55",
+    )
+    code = appmod.main(
+        ["--crate-echo", "--crate-host", "127.0.0.1", "--crate-port", "0"]
+    )
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "Refusing to start" in err
+    for token in ("*", "192.0.2.0/24", "localhost", "junk"):
+        assert token in err
+    assert "192.0.2.55" not in err
+    assert "198.51.100.55" not in err
+
+    monkeypatch.setenv(
+        "CRATE_TRUSTED_PEERS",
+        "192.0.2.55, ::ffff:198.51.100.55",
     )
     plans, lock = _plans()
     listener, thread, box = _serve(run_echo_session, peer_ip=_hook(plans, lock))
@@ -853,17 +888,6 @@ def test_untrusted_is_dropped_at_accept_when_list_is_set(monkeypatch, capsys):
             if sock is not None:
                 sock.close()
         _stop(listener, thread, box)
-    warned = [
-        line
-        for line in capsys.readouterr().err.splitlines()
-        if "ignoring invalid trusted peer entries" in line
-    ]
-    assert warned, "bad trusted entries did not warn at startup"
-    text = warned[0]
-    for token in ("*", "192.0.2.0/24", "localhost", "junk"):
-        assert token in text
-    assert "192.0.2.55" not in text
-    assert "198.51.100.55" not in text
 
 
 def _expect_desktop_ready(sock: socket.socket) -> None:
@@ -1045,3 +1069,76 @@ def test_emfile_accept_errors_log_once_with_count(monkeypatch, capsys):
     assert delays[:5] == pytest.approx([0.2, 0.4, 0.8, 1.6, 2.0])
     assert delays[-1] == pytest.approx(2.0)
     assert all(item <= 2.0 + 1e-9 for item in delays)
+
+
+def test_vet_thread_start_failure_releases_slot_and_serves_next(monkeypatch, capsys):
+    """A thread.start failure must not leak a hello slot or stop accept."""
+    from gourdsworth import net as netmod
+    from gourdsworth.net import run_echo_session
+
+    monkeypatch.delenv("CRATE_TRUSTED_PEERS", raising=False)
+    gates: list = []
+    orig = netmod._NewestAccept
+
+    def capturing(*args, **kwargs):
+        gate = orig(*args, **kwargs)
+        gates.append(gate)
+        return gate
+
+    monkeypatch.setattr(netmod, "_NewestAccept", capturing)
+    real_start = threading.Thread.start
+    state = {"boom": False}
+
+    def start(self):
+        if self.name == "gourdsworth-crate-hello" and not state["boom"]:
+            state["boom"] = True
+            raise RuntimeError("cannot start thread")
+        return real_start(self)
+
+    monkeypatch.setattr(threading.Thread, "start", start)
+    served: list[str] = []
+
+    def session(conn) -> None:
+        served.append(str(conn.policy_ip))
+        run_echo_session(conn)
+
+    listener, thread, box = _serve(session)
+    first = None
+    second = None
+    try:
+        first = socket.create_connection(("127.0.0.1", listener.port), timeout=2)
+        assert _eof_within(first, 1.0), "failed vet socket was not closed"
+        assert gates, "accept gate was not created"
+        gate = gates[0]
+
+        def slots_clear() -> bool:
+            with gate._cv:
+                return (
+                    len(gate._hello_ips) == 0
+                    and len(gate._vet_socks) == 0
+                    and not gate._vetters
+                )
+
+        _wait_until(slots_clear, 1.0, "hello slot was not released after thread start failed")
+        err = capsys.readouterr().err
+        assert "failed to start" in err
+        assert state["boom"] is True
+        assert thread.is_alive(), "accept loop exited after thread start failed"
+        assert served == []
+        second = _connect_served(listener.port)
+        _wait_until(lambda: len(served) == 1, 1.0, "next client was not served")
+        assert box.get("err") is None, box.get("err")
+    finally:
+        if second is not None:
+            second.close()
+        if first is not None:
+            try:
+                first.close()
+            except OSError:
+                pass
+        try:
+            listener.close()
+        except OSError:
+            pass
+        thread.join(timeout=2.0)
+        assert not thread.is_alive(), f"server still running err={box.get('err')!r}"

@@ -256,6 +256,10 @@ def resolve_bind(host: str | None, allow_lan: bool) -> str:
     return host
 
 
+class TrustedPeersError(ValueError):
+    """A trusted-peer entry is not an IP address. Startup must not continue."""
+
+
 def normalize_peer_ip(value: Any) -> str | None:
     """Return a canonical IP string, or None when ``value`` is not an address.
 
@@ -301,40 +305,41 @@ def _partition_trusted(value: Any) -> tuple[set[str], list[str]]:
     return good, bad
 
 
-def _warn_bad_trusted(bad: list[str]) -> None:
+def _reject_bad_trusted(bad: list[str]) -> None:
     if not bad:
         return
     listed = ", ".join(bad)
-    print(
-        "warning: ignoring invalid trusted peer entries "
-        f"(not IP addresses): {listed}",
-        file=sys.stderr,
-        flush=True,
+    raise TrustedPeersError(
+        "Refusing to start: invalid trusted peer entries "
+        f"(not IP addresses): {listed}"
     )
 
 
 def parse_trusted_peers(value: Any) -> frozenset[str]:
     """Parse ``crate.trusted_peers`` (list or comma/whitespace string).
 
-    CIDR, hostnames, ``*``, and other non-addresses are ignored. A warning
-    lists them. IPv4-mapped IPv6 is stored as IPv4.
+    CIDR, hostnames, ``*``, and other non-addresses raise
+    ``TrustedPeersError`` and name those entries. IPv4-mapped IPv6 is stored
+    as IPv4. An empty value is an empty allowlist.
     """
     good, bad = _partition_trusted(value)
-    _warn_bad_trusted(bad)
+    _reject_bad_trusted(bad)
     return frozenset(good)
 
 
 def load_trusted_peers(config_value: Any = None, *, env: str | None = None) -> frozenset[str]:
-    """Merge config and ``CRATE_TRUSTED_PEERS`` once. Warn once about bad entries.
+    """Merge config and ``CRATE_TRUSTED_PEERS`` once.
 
     ``env is None`` reads the environment. Pass ``env=""`` to skip it.
-    Call this at startup and keep the returned set; do not re-read per connection.
+    Any entry that is not an IP raises ``TrustedPeersError`` naming the bad
+    entries; startup must not continue with a shorter list. Call this at
+    startup and keep the returned set; do not re-read per connection.
     """
     if env is None:
         env = os.environ.get("CRATE_TRUSTED_PEERS", "")
     good, bad = _partition_trusted(config_value)
     good_env, bad_env = _partition_trusted(env)
-    _warn_bad_trusted(bad + bad_env)
+    _reject_bad_trusted(bad + bad_env)
     return frozenset(good) | frozenset(good_env)
 
 
@@ -1340,7 +1345,19 @@ class _NewestAccept:
         )
         with self._cv:
             self._vetters.add(thread)
-        thread.start()
+        try:
+            thread.start()
+        except Exception as exc:
+            # A failed start never runs _vet, so the reservation would leak
+            # and the exception would stop the accept loop.
+            with self._cv:
+                self._vetters.discard(thread)
+            self._release_hello(sock)
+            _close_socket(sock)
+            self._log_limited(
+                "vet-start",
+                f"crate hello thread failed to start for {ip}: {exc}",
+            )
 
     def _vet(self, sock: socket.socket, addr: tuple, ip: str) -> None:
         conn: CrateConnection | None = None

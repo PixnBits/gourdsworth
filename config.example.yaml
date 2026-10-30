@@ -50,8 +50,8 @@ crate:
   # even if the slot is empty. A second trusted host can evict the Pi and
   # hold it in the 30s backoff. Empty still starts: with allow_lan, any LAN
   # host may take an empty slot, and the server prints a warning.
-  # IPs only, separated by commas or whitespace. CIDR, hostnames, and '*'
-  # are ignored with a startup warning. ::ffff:a.b.c.d is compared as IPv4.
+  # IPs only, separated by commas or whitespace. A CIDR, a hostname, or '*'
+  # refuses startup and is named in the error. ::ffff:a.b.c.d is compared as IPv4.
   # The env var is read once at startup. Documentation addresses only:
   #   trusted_peers: [192.0.2.55]
   #   Environment=CRATE_TRUSTED_PEERS=192.0.2.55

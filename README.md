@@ -110,7 +110,7 @@ crate:
 
 A new TCP connection is not served until it sends a crate hello (`role` `crate`, `proto` 1, no payload) within 3 seconds. That deadline covers the whole hello. A line over about 1 KiB, or a hello that declares a payload, is closed without reading the payload. Pending hellos are capped (16 at once, 2 per address). Anything else is closed and the Mayor stays up.
 
-When `crate.trusted_peers` or `CRATE_TRUSTED_PEERS` is non-empty, that list is an allowlist: other addresses are closed at accept, even if nobody is connected. Put **only the Pi** on it. A second trusted address can evict the Pi and hold it in the 30 second backoff. Entries are IP addresses, split on commas or whitespace. CIDR, hostnames, and `*` are ignored and named in a startup warning. `::ffff:a.b.c.d` is compared as IPv4. The environment variable is read once at startup.
+When `crate.trusted_peers` or `CRATE_TRUSTED_PEERS` is non-empty, that list is an allowlist: other addresses are closed at accept, even if nobody is connected. Put **only the Pi** on it. A second trusted address can evict the Pi and hold it in the 30 second backoff. Entries are IP addresses, split on commas or whitespace. A CIDR, a hostname, or `*` refuses startup and is named in the error. `::ffff:a.b.c.d` is compared as IPv4. The environment variable is read once at startup.
 
 With `allow_lan` and an empty list the server still starts, and it warns: any LAN host may take an empty slot. Pin the Pi in `config.yaml` (`trusted_peers: [192.0.2.55]`) or in the user systemd unit:
 
