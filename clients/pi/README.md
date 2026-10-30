@@ -76,6 +76,9 @@ On a real Pi on the porch LAN:
 #   host: 0.0.0.0
 #   port: 8746
 #   allow_lan: true    # anyone on this LAN can read PCM/JPEG; no TLS
+#   trusted_peers: [192.0.2.55]  # only the Pi. Empty + allow_lan warns and still starts.
+#   # or, in the desktop user unit / `systemctl --user edit gourdsworth-server`:
+#   # Environment=CRATE_TRUSTED_PEERS=192.0.2.55
 PYTHONPATH=src python clients/pi/crate_client.py --button-pin 17   # host from local.env
 ```
 

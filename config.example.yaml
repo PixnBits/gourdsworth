@@ -45,6 +45,18 @@ crate:
   host: 127.0.0.1         # loopback. Do not use 0.0.0.0 unless allow_lan
   port: 8746
   allow_lan: false        # required to bind a LAN address or 0.0.0.0
+  # Who may hold the crate slot. List only the Pi. When this is non-empty
+  # (or CRATE_TRUSTED_PEERS is), every other address is closed at accept,
+  # even if the slot is empty. A second trusted host can evict the Pi and
+  # hold it in the 30s backoff. Empty still starts: with allow_lan, any LAN
+  # host may take an empty slot, and the server prints a warning.
+  # IPs only, separated by commas or whitespace. CIDR, hostnames, and '*'
+  # are ignored with a startup warning. ::ffff:a.b.c.d is compared as IPv4.
+  # The env var is read once at startup. Documentation addresses only:
+  #   trusted_peers: [192.0.2.55]
+  #   Environment=CRATE_TRUSTED_PEERS=192.0.2.55
+  #   systemctl --user edit gourdsworth-server
+  trusted_peers: []
 
 # Opt-in local CLIP still (issue #19 V0). Voice works without this.
 # pip install -e '.[vision]'  then  python -m gourdsworth --snap
