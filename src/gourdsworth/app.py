@@ -18,6 +18,7 @@ from gourdsworth.net import (
     is_loopback,
     resolve_bind,
     serve_echo,
+    serve_newest,
 )
 from gourdsworth.guardrails import (
     looks_debug_pass,
@@ -730,22 +731,28 @@ def _serve_crate(cfg, mayor, stt, speaker, sidecar, canned) -> int:
     print("  Talk is the Pi button / Enter. Ctrl+C to quit.")
     print()
     listener = CrateListener(host, port)
+    # One history across reconnects — a newer socket replaces the TCP session,
+    # not the conversation.
     history: list[dict] = []
+
+    def _one(conn) -> None:
+        peer = conn.peer or ("?", 0)
+        print(f"crate connected {peer[0]}:{peer[1]}")
+        try:
+            _run_crate_session(
+                conn, cfg, mayor, stt, speaker, sidecar, canned, history
+            )
+        except (ConnectionError, OSError) as exc:
+            print(f"crate session ended: {exc}")
+        finally:
+            print("crate disconnected")
+
     try:
-        while True:
-            print("waiting for crate client…")
-            conn = listener.accept()
-            peer = conn.peer or ("?", 0)
-            print(f"crate connected {peer[0]}:{peer[1]}")
-            try:
-                _run_crate_session(
-                    conn, cfg, mayor, stt, speaker, sidecar, canned, history
-                )
-            except (ConnectionError, OSError) as exc:
-                print(f"crate session ended: {exc}")
-            finally:
-                conn.close()
-                print("crate disconnected")
+        serve_newest(
+            listener,
+            _one,
+            waiting_message="waiting for crate client…",
+        )
     except KeyboardInterrupt:
         print()
         line = random.choice(canned["goodnight"])
@@ -758,6 +765,8 @@ def _serve_crate(cfg, mayor, stt, speaker, sidecar, canned) -> int:
 def _run_crate_session(conn, cfg, mayor, stt, speaker, sidecar, canned, history) -> None:
     hello = conn.handshake("desktop", timeout=10.0)
     if hello is None:
+        if conn.closed:
+            raise ConnectionError("crate connection closed")
         raise ConnectionError("crate hello timeout")
     continuous = bool(hello.get("continuous"))
     session_stats = SessionStats()
@@ -767,12 +776,24 @@ def _run_crate_session(conn, cfg, mayor, stt, speaker, sidecar, canned, history)
         print("  continuous crate: mic stays open except while SPEAKING")
     if speaker is not None:
         samples, rate, _, _ = speaker.synthesize(opener)
+        if conn.closed:
+            return
         print("SPEAKING")
         conn.send({"event": "speaking"})
         conn.play_float(samples, rate)
         del samples
+        if conn.closed:
+            return
     conn.send({"event": "ready"})
     print("ready.")
+
+    def _cooldown() -> None:
+        deadline = time.monotonic() + float(cfg["cooldown_s"])
+        while not conn.closed:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            time.sleep(min(0.05, remaining))
 
     armed = False
     vis_future = None  # in-flight or unused CLIP future (carried across turns)
@@ -789,6 +810,8 @@ def _run_crate_session(conn, cfg, mayor, stt, speaker, sidecar, canned, history)
         else:
             if not conn.wait_button("down", timeout=0.5):
                 continue
+        if conn.closed:
+            return
 
         metrics = TurnMetrics()
         print("LISTENING")
@@ -808,6 +831,8 @@ def _run_crate_session(conn, cfg, mayor, stt, speaker, sidecar, canned, history)
             min_voiced_s=0.35,
             keep_listening=continuous,
         )
+        if conn.closed:
+            return
         if str(cfg.get("mode") or "vad") == "vad" and metrics.had_voice:
             metrics.post_speech_silence_ms = float(cfg["silence_s"]) * 1000.0
 
@@ -861,7 +886,7 @@ def _run_crate_session(conn, cfg, mayor, stt, speaker, sidecar, canned, history)
                 conn.reset_talk_latch()
                 conn.send({"event": "ready"})
                 print("ready.")
-                time.sleep(float(cfg["cooldown_s"]))
+                _cooldown()
 
         if not metrics.had_voice:
             print("  (still listening)")
@@ -872,6 +897,8 @@ def _run_crate_session(conn, cfg, mayor, stt, speaker, sidecar, canned, history)
         # STT starts immediately — CLIP may still be running
         user_text, metrics.stt_ms = stt.transcribe(audio_in, cfg["sample_rate"])
         del audio_in
+        if conn.closed:
+            return
         user_text = (user_text or "").strip()
         _ingest_jpeg("during-stt")
         _promote_pending()
@@ -910,6 +937,8 @@ def _run_crate_session(conn, cfg, mayor, stt, speaker, sidecar, canned, history)
             session_stats=session_stats,
             latest_telemetry=conn.latest_telemetry,
         )
+        if conn.closed:
+            return
         session_stats.note_completed_turn(metrics)
         # If this turn used the note, clear the future so a carried still can run next.
         # If unused (CLIP late or skipped), keep vis_future for the next utterance.
@@ -929,7 +958,7 @@ def _run_crate_session(conn, cfg, mayor, stt, speaker, sidecar, canned, history)
             conn.reset_talk_latch()
         conn.send({"event": "ready"})
         print("ready.")
-        time.sleep(float(cfg["cooldown_s"]))
+        _cooldown()
 
 
 if __name__ == "__main__":

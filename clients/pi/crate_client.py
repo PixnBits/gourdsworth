@@ -1005,9 +1005,35 @@ def _pump(
         # payload dropped here — never written
 
 
-def _wait_trigger(gpio, stop: threading.Event) -> str:
+def _wait_ready(ready: threading.Event, conn: CrateConnection, timeout: float) -> bool:
+    """True when ``ready`` is set. False on timeout or a dead socket.
+
+    The recv thread sets ``conn.closed`` when keepalive or TCP_USER_TIMEOUT
+    fails the socket (or the peer sends FIN/RST). Polling here lets the
+    session return "disconnect" in well under a second instead of sitting
+    out the full ready timeout. There is no app-level heartbeat: idle PTT
+    and older peers may send nothing, and kernel keepalive already bounds
+    a black hole to about 25–30s.
+    """
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    while True:
+        if ready.is_set():
+            return True
+        if conn.closed:
+            return False
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        if ready.wait(timeout=min(0.2, remaining)):
+            return True
+
+
+def _wait_trigger(gpio, stop: threading.Event, conn: CrateConnection | None = None) -> str:
     print("Enter = Talk" + (" (or hold the button)" if gpio is not None else "") + ", q = quit")
     while not stop.is_set() and not _SHUTDOWN.is_set():
+        # Dead desktop (keepalive / user-timeout / FIN) must not wait for Enter.
+        if conn is not None and conn.closed:
+            return "disconnect"
         if gpio is not None and gpio.is_pressed:
             return "gpio"
         if _stdin_ready(0.1):
@@ -1400,8 +1426,9 @@ def main(argv: list[str] | None = None) -> int:
             if args.continuous:
                 hello["continuous"] = True
             conn.send(hello)
-            if not ready.wait(timeout=20):
-                print("No ready from desktop (is --serve-crate / --crate-echo running?)")
+            if not _wait_ready(ready, conn, 20):
+                if not conn.closed:
+                    print("No ready from desktop (is --serve-crate / --crate-echo running?)")
                 return "disconnect"
             telemetry = threading.Thread(
                 target=_telemetry_loop,
@@ -1477,8 +1504,12 @@ def main(argv: list[str] | None = None) -> int:
                 return exit_kind
 
             while not quit_ev.is_set():
+                if conn.closed:
+                    return "disconnect"
                 ready.clear()
-                trig = _wait_trigger(gpio, stop)
+                trig = _wait_trigger(gpio, stop, conn)
+                if trig == "disconnect":
+                    return "disconnect"
                 if trig == "quit":
                     try:
                         conn.send({"event": "bye"})
@@ -1499,10 +1530,10 @@ def main(argv: list[str] | None = None) -> int:
                     end_talk=end_talk,
                     continuous=False,
                 )
-                if not ready.wait(timeout=float(args.listen_s) + 15):
-                    print("  (timed out waiting for desktop ready)")
+                if not _wait_ready(ready, conn, float(args.listen_s) + 15):
                     if conn.closed:
                         return "disconnect"
+                    print("  (timed out waiting for desktop ready)")
             return "disconnect"
         except (KeyboardInterrupt, ConnectionError, OSError) as exc:
             kind = "goodbye" if isinstance(exc, KeyboardInterrupt) else "disconnect"
@@ -1553,6 +1584,8 @@ def main(argv: list[str] | None = None) -> int:
             )
             if sock is None:
                 return 0
+            # Keepalive and TCP_USER_TIMEOUT are set in CrateConnection so a
+            # dead desktop errors the recv thread and closed becomes true.
             conn = CrateConnection(sock)
             try:
                 reason = _run_connected_session(conn)

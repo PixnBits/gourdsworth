@@ -7,6 +7,7 @@ import re
 import socket
 import tempfile
 import threading
+import time
 from pathlib import Path
 
 import numpy as np
@@ -32,6 +33,7 @@ from gourdsworth.net import (
     run_echo_session,
     s16le_to_f32,
     send_msg,
+    serve_echo,
 )
 
 
@@ -277,3 +279,187 @@ def test_serve_crate_rejects_dry_run():
     from gourdsworth.app import main
 
     assert main(["--serve-crate", "--dry-run"]) == 2
+
+
+def _assert_tcp_keepalive(sock: socket.socket) -> None:
+    assert sock.getsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE) == 1
+    expected = {
+        "TCP_KEEPIDLE": 10,
+        "TCP_KEEPINTVL": 5,
+        "TCP_KEEPCNT": 3,
+        "TCP_USER_TIMEOUT": 30000,
+    }
+    for name, value in expected.items():
+        opt = getattr(socket, name, None)
+        if opt is None:
+            continue
+        try:
+            got = sock.getsockopt(socket.IPPROTO_TCP, opt)
+        except OSError:
+            continue
+        assert got == value, f"{name}={got!r} want {value}"
+
+
+def _recv_until_peer_gone(sock: socket.socket, timeout: float) -> bool:
+    """True if the peer FINs or RSTs within ``timeout`` seconds."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        sock.settimeout(max(0.05, deadline - time.monotonic()))
+        try:
+            chunk = sock.recv(4096)
+        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+            return True
+        except TimeoutError:
+            continue
+        except OSError:
+            return True
+        if not chunk:
+            return True
+    return False
+
+
+def test_listen_backlog_is_four_and_used_by_crate_listener(monkeypatch):
+    from gourdsworth.net import LISTEN_BACKLOG, CrateListener as Listener
+
+    assert LISTEN_BACKLOG == 4
+    seen: list[int] = []
+    orig = socket.socket.listen
+
+    def spy(self, backlog):
+        seen.append(int(backlog))
+        return orig(self, backlog)
+
+    monkeypatch.setattr(socket.socket, "listen", spy)
+    listener = Listener("127.0.0.1", 0)
+    try:
+        assert seen == [4]
+    finally:
+        listener.close()
+
+
+def test_crate_connection_sets_keepalive_on_server_and_client_sockets():
+    listener = CrateListener("127.0.0.1", 0)
+    server_conn = None
+    client = None
+    try:
+        accepted: dict = {}
+
+        def accept_one() -> None:
+            accepted["c"] = listener.accept()
+
+        t = threading.Thread(target=accept_one, name="crate-ka-accept", daemon=True)
+        t.start()
+        sock = socket.create_connection(("127.0.0.1", listener.port), timeout=2)
+        client = CrateConnection(sock)
+        t.join(timeout=2.0)
+        assert not t.is_alive()
+        server_conn = accepted["c"]
+        _assert_tcp_keepalive(server_conn.sock)
+        _assert_tcp_keepalive(client.sock)
+    finally:
+        if client is not None:
+            client.close()
+        if server_conn is not None:
+            server_conn.close()
+        listener.close()
+
+
+def test_newest_client_wins_while_idle_peer_holds_session(monkeypatch):
+    """Client B is served while idle A never sends; A then sees EOF/reset.
+
+    Timeouts are short so this fails fast on a one-at-a-time accept loop
+    (restore dfac1a8 net.py) instead of hanging.
+    """
+    from gourdsworth import net as netmod
+
+    held: dict = {}
+    orig_init = netmod.CrateListener.__init__
+
+    def capturing_init(self, host, port):
+        orig_init(self, host, port)
+        held["listener"] = self
+
+    monkeypatch.setattr(netmod.CrateListener, "__init__", capturing_init)
+
+    server_err: list[BaseException] = []
+
+    def run_server() -> None:
+        try:
+            serve_echo("127.0.0.1", 0)
+        except BaseException as exc:
+            server_err.append(exc)
+
+    server = threading.Thread(target=run_server, name="crate-echo-newest", daemon=True)
+    server.start()
+    deadline = time.monotonic() + 2.0
+    while "listener" not in held and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert "listener" in held, "serve_echo never bound"
+    listener = held["listener"]
+    port = int(listener.port)
+    client_a = None
+    client_b = None
+    try:
+        client_a = socket.create_connection(("127.0.0.1", port), timeout=2)
+        client_a.settimeout(2)
+        # A is served when the echo session writes hello. Do not send or close.
+        first = client_a.recv(1)
+        assert first, "idle client A was never served hello"
+
+        b_sock = socket.create_connection(("127.0.0.1", port), timeout=2)
+        client_b = CrateConnection(b_sock)
+        client_b.send({"event": "hello", "role": "crate", "proto": PROTO})
+        hello = client_b.wait_event("hello", timeout=3.0)
+        assert hello is not None, "client B was not served (newest-wins failed)"
+        assert hello[0]["role"] == "desktop"
+        ready = client_b.wait_event("ready", timeout=3.0)
+        assert ready is not None
+
+        tone = (
+            (0.25 * np.sin(2 * np.pi * np.arange(UPLINK_CHUNK_SAMPLES) / 40))
+            .astype(np.float32)
+        )
+        pcm = (tone * 32767).astype("<i2").tobytes()
+        client_b.send({"event": "button", "state": "down"})
+        client_b.send(
+            {
+                "event": "pcm",
+                "rate": UPLINK_RATE,
+                "channels": 1,
+                "format": UPLINK_FORMAT,
+            },
+            pcm,
+        )
+        client_b.send({"event": "button", "state": "up"})
+        play = client_b.wait_event("play", timeout=3.0)
+        assert play is not None
+        header, payload = play
+        assert header["event"] == "play"
+        assert header["format"] == DOWNLINK_FORMAT
+        assert payload is not None and len(payload) >= 4
+        client_b.send({"event": "play_done"})
+        gest = client_b.wait_event("gesture", timeout=3.0)
+        assert gest is not None
+        ready2 = client_b.wait_event("ready", timeout=3.0)
+        assert ready2 is not None
+
+        assert _recv_until_peer_gone(client_a, timeout=3.0), (
+            "idle client A did not see EOF/reset after B connected"
+        )
+    finally:
+        if client_b is not None:
+            try:
+                client_b.close()
+            except OSError:
+                pass
+        if client_a is not None:
+            try:
+                client_a.close()
+            except OSError:
+                pass
+        try:
+            listener.close()
+        except OSError:
+            pass
+        server.join(timeout=3.0)
+        assert not server.is_alive(), f"echo server still running: {server_err!r}"

@@ -5,7 +5,7 @@ microphone PCM, optional JPEG stills, and button events; it receives TTS
 PCM and gesture names. Children's PCM, JPEG, and transcripts stay in RAM
 and are dropped after the turn. Nothing is written to disk.
 
-Wire format (one TCP connection, one client at a time)
+Wire format (one TCP connection; a newer client replaces the active session)
 ------------------------------------------------------
 Control is JSON lines. A binary blob (PCM or JPEG) is length-prefixed by
 the JSON line's ``n`` field, then that many raw bytes with **no** extra
@@ -93,6 +93,19 @@ MAX_EVENTS = 64
 
 _RECV_TIMEOUT_S = 0.4
 
+# Room for a reconnect (and a CLOSE-WAIT left in the queue) while a session
+# is still open. The desktop serves one Pi; see serve_newest.
+LISTEN_BACKLOG = 4
+
+# Dead-peer probes. An idle black hole is aborted after
+# TCP_KEEPIDLE_S + TCP_KEEPCNT * TCP_KEEPINTVL_S seconds (25s).
+# TCP_USER_TIMEOUT_MS covers data that stays unacked: keepalive probes are
+# not sent while transmit data is outstanding.
+TCP_KEEPIDLE_S = 10
+TCP_KEEPINTVL_S = 5
+TCP_KEEPCNT = 3
+TCP_USER_TIMEOUT_MS = 30_000
+
 
 def parse_thermal_sysfs_temp(raw: str | bytes | None) -> float | None:
     """Parse `/sys/class/thermal/*/temp` millidegree text into Celsius.
@@ -119,6 +132,46 @@ def parse_thermal_sysfs_temp(raw: str | bytes | None) -> float | None:
 
 def is_loopback(host: str) -> bool:
     return (host or "").strip().lower() in LOOPBACK_HOSTS
+
+
+def _setsockopt_if(sock: socket.socket, level: int, name: str, value: int) -> None:
+    """Set a socket option when this platform defines it. Ignore OSError."""
+    opt = getattr(socket, name, None)
+    if opt is None:
+        return
+    try:
+        sock.setsockopt(level, opt, int(value))
+    except OSError:
+        pass
+
+
+def enable_tcp_keepalive(sock: socket.socket) -> None:
+    """Bound dead-peer detection to about 25–30s without an app read timeout.
+
+    Idle connection (nothing unacked): the kernel starts probes after
+    TCP_KEEPIDLE_S and drops the socket after TCP_KEEPCNT failures spaced
+    TCP_KEEPINTVL_S apart — about 25s. If payload is stuck unacked, keepalive
+    does not run; TCP_USER_TIMEOUT_MS (30s) forces ETIMEDOUT instead.
+
+    No application heartbeat. PTT can sit with no button forever, and the
+    desktop sends nothing during that idle. The Pi's telemetry event is
+    optional, starts only after "ready", and is every 15s — an idle cutoff
+    would drop a healthy porch session and any older peer that never sends
+    telemetry. Long TTS playback and LLM turns are quiet on the desktop
+    side except for the audio already on the wire, which user-timeout
+    covers if those bytes stop being acked. The recv thread turns the
+    resulting OSError into CrateConnection.closed so the session loop
+    returns. Applied from CrateConnection.__init__, so both the accepted
+    server socket and the Pi client's outbound socket get it.
+    """
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    except OSError:
+        pass
+    _setsockopt_if(sock, socket.IPPROTO_TCP, "TCP_KEEPIDLE", TCP_KEEPIDLE_S)
+    _setsockopt_if(sock, socket.IPPROTO_TCP, "TCP_KEEPINTVL", TCP_KEEPINTVL_S)
+    _setsockopt_if(sock, socket.IPPROTO_TCP, "TCP_KEEPCNT", TCP_KEEPCNT)
+    _setsockopt_if(sock, socket.IPPROTO_TCP, "TCP_USER_TIMEOUT", TCP_USER_TIMEOUT_MS)
 
 
 def resolve_bind(host: str | None, allow_lan: bool) -> str:
@@ -305,9 +358,15 @@ class CrateConnection:
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         except OSError:
             pass
+        # Server accept and the Pi outbound socket both construct this class.
+        enable_tcp_keepalive(sock)
         sock.settimeout(_RECV_TIMEOUT_S)
         self._send_lock = threading.Lock()
         self._closed = threading.Event()
+        # Set by serve_newest when a later accept replaces this socket.
+        # An attribute on the object, not id(), so a recycled id cannot
+        # mark a different connection as superseded.
+        self.superseded = False
         self._last_err: BaseException | None = None
         self._gate = threading.Lock()
         self._listening = False
@@ -626,25 +685,33 @@ class CrateConnection:
 
 
 class CrateListener:
-    """TCP listener. Default bind is loopback. Accepts one client at a time."""
+    """TCP listener. Default bind is loopback.
+
+    Backlog is LISTEN_BACKLOG so a new handshake can finish while an old
+    socket is still in the session. ``serve_newest`` keeps accepting and
+    serves only the newest client.
+    """
 
     def __init__(self, host: str, port: int):
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._sock.bind((host, int(port)))
-        self._sock.listen(1)
+        self._sock.listen(LISTEN_BACKLOG)
         self._sock.settimeout(0.5)
         self.host, self.port = self._sock.getsockname()[:2]
+        self._closed = False
 
     def accept(self) -> CrateConnection:
-        while True:
+        while not self._closed:
             try:
                 sock, addr = self._sock.accept()
             except socket.timeout:
                 continue
             return CrateConnection(sock, peer=addr)
+        raise OSError("crate listener closed")
 
     def close(self) -> None:
+        self._closed = True
         try:
             self._sock.close()
         except OSError:
@@ -663,35 +730,204 @@ def run_echo_session(conn: CrateConnection, *, gesture: str = "tip") -> None:
     while not conn.closed:
         if not conn.wait_button("down", timeout=0.5):
             continue
+        if conn.closed:
+            return
         conn.send({"event": "listen"})
         audio, _ms, _uf, _uj, _voiced = conn.listen_pcm(limit_s=4.0, mode="ptt")
+        if conn.closed:
+            return
         jpeg = conn.take_jpeg()
         if jpeg:
             del jpeg
         conn.send({"event": "speaking"})
         conn.play_float(audio, UPLINK_RATE)
+        if conn.closed:
+            return
         conn.send({"event": "gesture", "name": name})
         conn.reset_talk_latch()
         conn.send({"event": "ready"})
 
 
+def _peer_text(conn: CrateConnection) -> str:
+    peer = conn.peer
+    if not peer:
+        return "?"
+    return f"{peer[0]}:{peer[1]}"
+
+
+class _NewestAccept:
+    """Accept on a side thread and keep only the newest CrateConnection.
+
+    Closing the previous connection unblocks that session's waits and sends
+    so the caller can move on to the socket just accepted. The accept thread
+    is a daemon and is joined from close() so Ctrl+C / listener.close() does
+    not leave it running.
+    """
+
+    def __init__(self, listener: CrateListener):
+        self._listener = listener
+        self._cv = threading.Condition()
+        self._stop = threading.Event()
+        self._pending: CrateConnection | None = None
+        self._current: CrateConnection | None = None
+        self._active = False
+        self._thread = threading.Thread(
+            target=self._accept_loop,
+            name="gourdsworth-crate-accept",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def take(self, waiting_message: str | None = None) -> CrateConnection | None:
+        """Block until the next connection to serve, or None on shutdown."""
+        announced = False
+        with self._cv:
+            # Previous session has returned; don't treat a later connect as
+            # a replacement of a session we are already done with.
+            self._active = False
+            self._current = None
+            while self._pending is None and not self._stop.is_set():
+                if waiting_message and not announced:
+                    print(waiting_message, flush=True)
+                    announced = True
+                self._cv.wait(timeout=0.5)
+            if self._pending is None:
+                return None
+            conn = self._pending
+            self._pending = None
+            self._current = conn
+            self._active = True
+            return conn
+
+    def was_superseded(self, conn: CrateConnection) -> bool:
+        return bool(getattr(conn, "superseded", False))
+
+    def close(self) -> None:
+        self._stop.set()
+        self._listener.close()
+        with self._cv:
+            victims: list[CrateConnection] = []
+            if self._current is not None:
+                victims.append(self._current)
+            if self._pending is not None and self._pending is not self._current:
+                victims.append(self._pending)
+            self._current = None
+            self._pending = None
+            self._active = False
+            self._cv.notify_all()
+        for conn in victims:
+            conn.close()
+        thread = self._thread
+        if thread.is_alive() and threading.current_thread() is not thread:
+            thread.join(timeout=2.0)
+
+    def _accept_loop(self) -> None:
+        try:
+            while not self._stop.is_set():
+                try:
+                    conn = self._listener.accept()
+                except OSError:
+                    break
+                replaced: list[CrateConnection] = []
+                with self._cv:
+                    if self._stop.is_set():
+                        conn.close()
+                        break
+                    replaced = self._swap_in_locked(conn)
+                    self._cv.notify_all()
+                self._close_replaced(conn, replaced)
+        finally:
+            victims: list[CrateConnection] = []
+            with self._cv:
+                self._stop.set()
+                if self._current is not None:
+                    victims.append(self._current)
+                if self._pending is not None and self._pending is not self._current:
+                    victims.append(self._pending)
+                self._cv.notify_all()
+            for item in victims:
+                item.close()
+
+    def _swap_in_locked(self, conn: CrateConnection) -> list[CrateConnection]:
+        old: list[CrateConnection] = []
+        if self._pending is not None:
+            old.append(self._pending)
+        if self._active and self._current is not None and self._current not in old:
+            old.append(self._current)
+        self._pending = conn
+        for item in old:
+            item.superseded = True
+        return old
+
+    def _close_replaced(self, new: CrateConnection, old: list[CrateConnection]) -> None:
+        if not old:
+            return
+        old_text = ", ".join(_peer_text(item) for item in old)
+        print(
+            f"crate session replaced: closing {old_text} for newer client {_peer_text(new)}",
+            flush=True,
+        )
+        for item in old:
+            item.close()
+
+
+def serve_newest(
+    listener: CrateListener,
+    session_fn,
+    *,
+    oneshot: bool = False,
+    waiting_message: str | None = None,
+) -> None:
+    """Run ``session_fn(conn)`` for each client. The newest connection wins.
+
+    The accept thread keeps calling accept while a session is active. When a
+    new client arrives, the previous CrateConnection is closed so in-flight
+    waits and sends end and ``session_fn`` returns. The next call then serves
+    the new socket. State that must survive a reconnect (conversation
+    history) belongs in the closure around ``session_fn``, not in here.
+
+    ``listener.close()`` or Ctrl+C makes ``take`` return and joins the accept
+    thread. ``oneshot`` stops after a session that was not replaced.
+    """
+    gate = _NewestAccept(listener)
+    try:
+        while True:
+            conn = gate.take(waiting_message)
+            if conn is None:
+                return
+            try:
+                session_fn(conn)
+            except (ConnectionError, OSError):
+                # Replaced or dropped peer: serve the pending socket next.
+                pass
+            finally:
+                conn.close()
+            if oneshot and not gate.was_superseded(conn):
+                return
+    finally:
+        gate.close()
+
+
 def serve_echo(host: str, port: int, *, oneshot: bool = False) -> None:
     listener = CrateListener(host, port)
     print(f"  crate echo listening on {listener.host}:{listener.port}")
+
+    def _one(conn: CrateConnection) -> None:
+        peer = conn.peer or ("?", 0)
+        print(f"  connected {peer[0]}:{peer[1]}  (echo; no models)")
+        try:
+            run_echo_session(conn)
+        except (ConnectionError, OSError) as exc:
+            print(f"  session ended: {exc}")
+        finally:
+            print("  crate disconnected")
+
     try:
-        while True:
-            print("  waiting for crate client…")
-            conn = listener.accept()
-            peer = conn.peer or ("?", 0)
-            print(f"  connected {peer[0]}:{peer[1]}  (echo; no models)")
-            try:
-                run_echo_session(conn)
-            except (ConnectionError, OSError) as exc:
-                print(f"  session ended: {exc}")
-            finally:
-                conn.close()
-                print("  crate disconnected")
-            if oneshot:
-                break
+        serve_newest(
+            listener,
+            _one,
+            oneshot=oneshot,
+            waiting_message="  waiting for crate client…",
+        )
     finally:
         listener.close()
