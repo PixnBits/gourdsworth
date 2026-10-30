@@ -21,6 +21,7 @@ import os
 import select
 import signal
 import socket
+import subprocess
 import sys
 import random
 import threading
@@ -198,6 +199,28 @@ _CLEANUP_DONE = False
 _ACTIVE_CAPS: set = set()  # live cv2.VideoCapture objects
 _PW_PLAY_PROC = None  # live pw-play Popen
 _FACE: face_link.FaceLink | None = None
+# Uplink PortAudio capture: "closed", "open", or "closing". Shutdown chimes
+# must not start while this is open or closing (PortAudio deadlocks if play
+# overlaps a stuck stream close).
+_UPLINK_STREAM = None
+_UPLINK_STREAM_STATE = "closed"
+_UPLINK_STREAM_LOCK = threading.Lock()
+_DEFERRED_CHIME: str | None = None
+# Reconnect/outage steps pet _RECONNECT_STEP_AT. The watchdog exits if it
+# goes stale while armed. A live session disarms it.
+_RECONNECT_STEP_AT = 0.0
+_RECONNECT_STEP_LOCK = threading.Lock()
+_RECONNECT_WATCH_ARMED = threading.Event()
+_RECONNECT_WATCH_STOP = threading.Event()
+_RECONNECT_WATCH_THREAD: threading.Thread | None = None
+_RECONNECT_WATCH_LOCK = threading.Lock()
+# Seconds. Override with CRATE_UPLINK_CLOSE_TIMEOUT_S, CRATE_CHIME_TIMEOUT_S,
+# CRATE_RECONNECT_STEP_TIMEOUT_S. Tests shrink the constants or the env.
+UPLINK_CLOSE_TIMEOUT_S = 5.0
+CHIME_PW_PLAY_TIMEOUT_S = 5.0
+RECONNECT_STEP_TIMEOUT_S = 20.0
+WEDGED_EXIT_CODE = 1
+EXIT_CLEANUP_TIMEOUT_S = 0.5
 
 _LOG_FH = None
 
@@ -312,11 +335,20 @@ def _cleanup_devices(*, force: bool = False, camera_wait_s: float = 2.0) -> bool
 def _reset_shutdown_state_for_tests() -> None:
     """Reset signal-shutdown flags so unit tests do not leak into each other."""
     global _SHUTDOWN_SIGNAL, _CLEANUP_DONE, _PW_PLAY_PROC
+    global _UPLINK_STREAM, _UPLINK_STREAM_STATE, _DEFERRED_CHIME, _RECONNECT_STEP_AT
+    _stop_reconnect_watchdog()
     _SHUTDOWN.clear()
     _SHUTDOWN_SIGNAL = None
     _CLEANUP_DONE = False
     _ACTIVE_CAPS.clear()
     _PW_PLAY_PROC = None
+    with _UPLINK_STREAM_LOCK:
+        _UPLINK_STREAM = None
+        _UPLINK_STREAM_STATE = "closed"
+        _DEFERRED_CHIME = None
+    with _RECONNECT_STEP_LOCK:
+        _RECONNECT_STEP_AT = 0.0
+    _RECONNECT_WATCH_ARMED.clear()
     if _CAMERA_LOCK.locked():
         try:
             _CAMERA_LOCK.release()
@@ -607,23 +639,6 @@ def _shutdown_wav_dir() -> Path:
     return Path(__file__).resolve().parent / "assets" / "shutdown"
 
 
-def _load_wav_f32(path: Path):
-    import numpy as np
-
-    with wave.open(str(path), "rb") as wf:
-        ch = wf.getnchannels()
-        sw = wf.getsampwidth()
-        rate = wf.getframerate()
-        raw = wf.readframes(wf.getnframes())
-    if sw == 2:
-        arr = np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
-    else:
-        raise RuntimeError(f"unsupported wav width {sw} in {path}")
-    if ch > 1:
-        arr = arr.reshape(-1, ch).mean(axis=1)
-    return arr, int(rate)
-
-
 
 def _playback_backend() -> str:
     """pw = PipeWire pw-play (stable on Bluetooth); sounddevice = PortAudio."""
@@ -741,17 +756,260 @@ def _play_pcm_f32(samples, rate: int) -> None:
             sd.wait()
 
 
-def _play_local_shutdown(*, kind: str = "disconnect") -> None:
-    """Play a canned Mayor line from disk — no desktop, no TTS on the Pi."""
-    if _SHUTDOWN.is_set():
-        print("  (signal shutdown: skipping canned goodbye audio)")
-        return
+def _timeout_s(env_name: str, default: float) -> float:
+    """``env_name`` if it is a non-negative number, otherwise ``default``.
+
+    ``default`` is read at call time so tests can monkeypatch the constant.
+    An environment value wins over the constant.
+    """
+    raw = os.environ.get(env_name)
+    if raw is None or str(raw).strip() == "":
+        return float(default)
     try:
-        import numpy as np  # noqa: F401 — used via _load_wav_f32
-        import sounddevice as sd
-    except ImportError:
-        print("  (no sounddevice; skip local shutdown line)")
+        value = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return float(default)
+    if value < 0:
+        return 0.0
+    return value
+
+
+def _uplink_close_timeout_s() -> float:
+    return _timeout_s("CRATE_UPLINK_CLOSE_TIMEOUT_S", UPLINK_CLOSE_TIMEOUT_S)
+
+
+def _chime_timeout_s() -> float:
+    return _timeout_s("CRATE_CHIME_TIMEOUT_S", CHIME_PW_PLAY_TIMEOUT_S)
+
+
+def _reconnect_step_timeout_s() -> float:
+    return _timeout_s("CRATE_RECONNECT_STEP_TIMEOUT_S", RECONNECT_STEP_TIMEOUT_S)
+
+
+def _exit_cleanup_timeout_s() -> float:
+    return _timeout_s("CRATE_EXIT_CLEANUP_TIMEOUT_S", EXIT_CLEANUP_TIMEOUT_S)
+
+
+def _set_uplink_stream_state(state: str) -> None:
+    global _UPLINK_STREAM_STATE
+    with _UPLINK_STREAM_LOCK:
+        _UPLINK_STREAM_STATE = state
+
+
+def _uplink_stream_busy() -> bool:
+    with _UPLINK_STREAM_LOCK:
+        return _UPLINK_STREAM_STATE in {"open", "closing"}
+
+
+def _register_uplink_stream(stream) -> None:
+    global _UPLINK_STREAM, _UPLINK_STREAM_STATE
+    with _UPLINK_STREAM_LOCK:
+        _UPLINK_STREAM = stream
+        _UPLINK_STREAM_STATE = "open"
+
+
+def _current_uplink_stream():
+    with _UPLINK_STREAM_LOCK:
+        return _UPLINK_STREAM
+
+
+def _release_uplink_stream(stream) -> None:
+    """Uplink thread left its capture. Do not clobber a close in progress."""
+    global _UPLINK_STREAM, _UPLINK_STREAM_STATE
+    with _UPLINK_STREAM_LOCK:
+        if _UPLINK_STREAM is not stream:
+            return
+        if _UPLINK_STREAM_STATE == "closing":
+            return
+        _UPLINK_STREAM = None
+        _UPLINK_STREAM_STATE = "closed"
+
+
+def _restore_uplink_open_if_closing() -> None:
+    """A chunk's ``sd.wait`` finished. Leave a teardown close in charge."""
+    global _UPLINK_STREAM_STATE
+    with _UPLINK_STREAM_LOCK:
+        if _UPLINK_STREAM_STATE == "closing" and _UPLINK_STREAM is not None:
+            _UPLINK_STREAM_STATE = "open"
+
+
+def _defer_chime(kind: str) -> None:
+    global _DEFERRED_CHIME
+    with _UPLINK_STREAM_LOCK:
+        _DEFERRED_CHIME = kind
+
+
+def _take_deferred_chime() -> str | None:
+    global _DEFERRED_CHIME
+    with _UPLINK_STREAM_LOCK:
+        kind = _DEFERRED_CHIME
+        _DEFERRED_CHIME = None
+        return kind
+
+
+def _exit_wedged(code: int, message: str) -> None:
+    """Log, best-effort cleanup, then ``os._exit``. Returns only if ``_exit`` was patched."""
+    try:
+        print(message, flush=True)
+    except Exception:
+        pass
+    done = threading.Event()
+
+    def _cleanup() -> None:
+        try:
+            _cleanup_devices(force=True)
+        except Exception:
+            pass
+        finally:
+            done.set()
+
+    worker = threading.Thread(target=_cleanup, name="crate-exit-cleanup", daemon=True)
+    worker.start()
+    done.wait(timeout=_exit_cleanup_timeout_s())
+    os._exit(int(code))
+
+
+def _close_uplink_stream(stream, *, timeout_s: float | None = None) -> bool:
+    """Stop and close ``stream`` on a helper thread.
+
+    PortAudio can deadlock if something plays while a close is stuck inside
+    ``sd.wait()``. Returns True if stop/close finished in time. On timeout,
+    log and ``os._exit`` nonzero so systemd restarts the client. If ``_exit``
+    is patched to return, this returns False.
+    """
+    global _UPLINK_STREAM, _UPLINK_STREAM_STATE
+    if stream is None:
+        return True
+    timeout = _uplink_close_timeout_s() if timeout_s is None else float(timeout_s)
+    _set_uplink_stream_state("closing")
+    done = threading.Event()
+
+    def _worker() -> None:
+        try:
+            for name in ("stop", "close"):
+                fn = getattr(stream, name, None)
+                if not callable(fn):
+                    continue
+                try:
+                    fn()
+                except Exception as exc:
+                    print(f"  (uplink stream {name} failed: {exc})")
+        finally:
+            done.set()
+
+    helper = threading.Thread(target=_worker, name="crate-stream-close", daemon=True)
+    helper.start()
+    if done.wait(timeout=max(0.0, timeout)):
+        helper.join(timeout=0.1)
+        with _UPLINK_STREAM_LOCK:
+            if _UPLINK_STREAM is stream:
+                _UPLINK_STREAM = None
+            _UPLINK_STREAM_STATE = "closed"
+        return True
+    _exit_wedged(
+        WEDGED_EXIT_CODE,
+        f"  uplink stream close exceeded {timeout:.1f}s; exiting so systemd can restart",
+    )
+    return False
+
+
+def _finish_uplink(uplink: threading.Thread | None) -> None:
+    """Bound uplink teardown, then play a chime deferred while the stream was up."""
+    if uplink is not None and uplink.is_alive():
+        timeout = _uplink_close_timeout_s()
+        deadline = time.monotonic() + max(0.0, timeout)
+        stream = _current_uplink_stream()
+        if stream is not None:
+            remaining = deadline - time.monotonic()
+            if not _close_uplink_stream(stream, timeout_s=max(0.0, remaining)):
+                return
+        uplink.join(timeout=max(0.0, deadline - time.monotonic()))
+        if uplink.is_alive():
+            _exit_wedged(
+                WEDGED_EXIT_CODE,
+                "  uplink did not exit after stream close; exiting so systemd can restart",
+            )
+            return
+    _play_deferred_chime()
+
+
+def _pet_reconnect_step() -> None:
+    global _RECONNECT_STEP_AT
+    with _RECONNECT_STEP_LOCK:
+        _RECONNECT_STEP_AT = time.monotonic()
+
+
+def _reconnect_step_age() -> float:
+    with _RECONNECT_STEP_LOCK:
+        stamped = _RECONNECT_STEP_AT
+    if stamped <= 0.0:
+        return 0.0
+    return time.monotonic() - stamped
+
+
+def _arm_reconnect_watchdog() -> None:
+    _pet_reconnect_step()
+    _RECONNECT_WATCH_ARMED.set()
+
+
+def _disarm_reconnect_watchdog() -> None:
+    _RECONNECT_WATCH_ARMED.clear()
+
+
+def _watchdog_loop() -> None:
+    while not _RECONNECT_WATCH_STOP.is_set():
+        limit = _reconnect_step_timeout_s()
+        poll = 0.05 if limit <= 0 else min(0.05, max(0.01, limit / 4.0))
+        if _RECONNECT_WATCH_STOP.wait(timeout=poll):
+            return
+        if not _RECONNECT_WATCH_ARMED.is_set():
+            continue
+        age = _reconnect_step_age()
+        if age > limit:
+            _exit_wedged(
+                WEDGED_EXIT_CODE,
+                f"  reconnect step stuck for {age:.1f}s "
+                f"(limit {limit:.1f}s); exiting so systemd can restart",
+            )
+            return
+
+
+def _start_reconnect_watchdog() -> None:
+    global _RECONNECT_WATCH_THREAD
+    with _RECONNECT_WATCH_LOCK:
+        if _RECONNECT_WATCH_THREAD is not None and _RECONNECT_WATCH_THREAD.is_alive():
+            return
+        _RECONNECT_WATCH_STOP.clear()
+        thread = threading.Thread(
+            target=_watchdog_loop, name="crate-reconnect-watchdog", daemon=True
+        )
+        _RECONNECT_WATCH_THREAD = thread
+        thread.start()
+
+
+def _stop_reconnect_watchdog() -> None:
+    global _RECONNECT_WATCH_THREAD
+    _RECONNECT_WATCH_ARMED.clear()
+    _RECONNECT_WATCH_STOP.set()
+    with _RECONNECT_WATCH_LOCK:
+        thread = _RECONNECT_WATCH_THREAD
+        _RECONNECT_WATCH_THREAD = None
+    if thread is not None and thread is not threading.current_thread():
+        thread.join(timeout=1.0)
+
+
+def _play_deferred_chime() -> None:
+    kind = _take_deferred_chime()
+    if not kind:
         return
+    if _uplink_stream_busy():
+        _defer_chime(kind)
+        return
+    _pet_reconnect_step()
+    _play_local_shutdown(kind=kind)
+
+
+def _shutdown_wav_path(kind: str) -> Path | None:
     root = _shutdown_wav_dir()
     if kind == "goodbye":
         paths = sorted(root.glob("goodbye_*.wav"))
@@ -762,18 +1020,60 @@ def _play_local_shutdown(*, kind: str = "disconnect") -> None:
         if not paths:
             paths = sorted(root.glob("goodbye_*.wav"))
     if not paths:
-        print("  (no local shutdown wavs)")
-        return
-    path = random.choice(paths)
+        return None
+    return random.choice(paths)
+
+
+def _pw_play_chime(path: Path) -> None:
+    """Play one canned wav with ``pw-play``. Never raises and never uses PortAudio.
+
+    ``subprocess.run`` kills the child when ``timeout`` expires, then raises
+    ``TimeoutExpired``. A missing ``pw-play`` or a timeout is logged and ignored.
+    """
+    timeout = _chime_timeout_s()
+    wavpath = os.fspath(path)
     try:
-        samples, rate = _load_wav_f32(path)
-        play_rate = _probe_play_rate() or rate
-        if play_rate != rate:
-            samples, play_rate = _resample_f32(samples, rate, play_rate)
-        _play_pcm_f32(samples, play_rate)
-        print(f"  shutdown line: {path.name}  playback={_playback_backend()}")
+        completed = subprocess.run(
+            ["pw-play", wavpath],
+            timeout=timeout,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    except FileNotFoundError:
+        print("  (pw-play missing; skip local shutdown line)")
+        return
+    except subprocess.TimeoutExpired:
+        print(f"  (pw-play chime timed out after {timeout:.1f}s)")
+        return
     except Exception as exc:
         print(f"  (shutdown wav failed: {exc})")
+        return
+    if completed.returncode != 0:
+        print(f"  (pw-play chime failed: exit {completed.returncode})")
+        return
+    print(f"  shutdown line: {path.name}  playback=pw")
+
+
+def _play_local_shutdown(*, kind: str = "disconnect") -> None:
+    """Play a canned Mayor line from disk — no desktop, no TTS, no PortAudio.
+
+    Disconnect and goodbye both go through ``pw-play``. If the uplink capture
+    stream is open or closing, the line is deferred until that stream is down.
+    """
+    if _SHUTDOWN.is_set():
+        print("  (signal shutdown: skipping canned goodbye audio)")
+        return
+    if _uplink_stream_busy():
+        _defer_chime(kind)
+        print("  (uplink stream open; deferring shutdown line)")
+        return
+    _take_deferred_chime()
+    path = _shutdown_wav_path(kind)
+    if path is None:
+        print("  (no local shutdown wavs)")
+        return
+    _pw_play_chime(path)
 
 
 
@@ -799,6 +1099,7 @@ def _backoff_wait(quit_ev: threading.Event, delay: float) -> bool:
     """Wait ``delay`` seconds. True if quit, shutdown, or q interrupted it."""
     deadline = time.monotonic() + max(0.0, float(delay))
     while True:
+        _pet_reconnect_step()
         if quit_ev.is_set() or _SHUTDOWN.is_set():
             return True
         if _stdin_ready(0):
@@ -873,6 +1174,7 @@ def _wait_for_desktop(
         next_announce = float(announce_clock[0])
     printed_hint = False
     while not quit_ev.is_set() and not _SHUTDOWN.is_set():
+        _pet_reconnect_step()
         try:
             sock = socket.create_connection((host, port), timeout=connect_timeout_s)
             print(f"  connected to {host}:{port}")
@@ -884,6 +1186,7 @@ def _wait_for_desktop(
                 print("  On the desktop: python -m gourdsworth --serve-crate   (or --crate-echo)")
                 printed_hint = True
             if now >= next_announce:
+                _pet_reconnect_step()
                 play_fn(kind="disconnect")
                 next_announce = now + every
                 if announce_clock is not None:
@@ -892,6 +1195,7 @@ def _wait_for_desktop(
                 if on_connect_error():
                     return None
                 continue
+            _pet_reconnect_step()
             if quit_ev.wait(timeout=max(0.5, float(retry_s))):
                 return None
     return None
@@ -1150,6 +1454,25 @@ def _wait_trigger(gpio, stop: threading.Event, conn: CrateConnection | None = No
 
 
 
+class _UplinkCapture:
+    """Abort handle for an uplink stuck in ``sd.rec`` / ``sd.wait``."""
+
+    def __init__(self, sd_module) -> None:
+        self._sd = sd_module
+
+    def stop(self) -> None:
+        stop = getattr(self._sd, "stop", None)
+        if not callable(stop):
+            return
+        try:
+            stop(ignore_errors=True)
+        except TypeError:
+            stop()
+
+    def close(self) -> None:
+        self.stop()
+
+
 def _always_on_uplink(
     conn: CrateConnection,
     stop: threading.Event,
@@ -1167,6 +1490,37 @@ def _always_on_uplink(
     except ImportError:
         print("  (no sounddevice; always-on uplink unavailable)")
         return
+    # Held open for the whole uplink so a shutdown chime cannot overlap PortAudio.
+    gate = _UplinkCapture(sd)
+    _register_uplink_stream(gate)
+    try:
+        _always_on_uplink_loop(
+            conn,
+            stop,
+            pause_mic,
+            sd=sd,
+            np=np,
+            energy=energy,
+            camera=camera,
+            camera_index=camera_index,
+            still=still,
+        )
+    finally:
+        _release_uplink_stream(gate)
+
+
+def _always_on_uplink_loop(
+    conn: CrateConnection,
+    stop: threading.Event,
+    pause_mic: threading.Event,
+    *,
+    sd,
+    np,
+    energy: float,
+    camera: bool,
+    camera_index: int,
+    still: _StillAdaptive | None,
+) -> None:
     header = {
         "event": "pcm",
         "rate": UPLINK_RATE,
@@ -1230,7 +1584,12 @@ def _always_on_uplink(
                     channels=1,
                     dtype="int16",
                 )
-                sd.wait()
+                # sd.wait() closes the chunk stream. A chime here deadlocks.
+                _set_uplink_stream_state("closing")
+                try:
+                    sd.wait()
+                finally:
+                    _restore_uplink_open_if_closing()
         except Exception as exc:
             print(f"  (mic error: {exc})")
             time.sleep(0.2)
@@ -1526,6 +1885,7 @@ def main(argv: list[str] | None = None) -> int:
 
     def _note_outage(message: str) -> None:
         nonlocal announce_now
+        _pet_reconnect_step()
         announce_now = False
         now = time.monotonic()
         if now < float(announce_clock[0]):
@@ -1550,6 +1910,9 @@ def main(argv: list[str] | None = None) -> int:
 
     def _run_connected_session(conn: CrateConnection) -> str:
         """Run one desktop session. Returns 'goodbye' (stop client) or 'disconnect' (retry)."""
+        # A live session can sit for a long time. The watchdog covers reconnect
+        # and teardown only; the finally block arms it again.
+        _disarm_reconnect_watchdog()
         stop = threading.Event()
         ready = threading.Event()
         end_talk = threading.Event()
@@ -1699,6 +2062,9 @@ def main(argv: list[str] | None = None) -> int:
                 shutdown_played = True
             return kind
         finally:
+            # Teardown is on the reconnect path: a stuck send or stream close
+            # must not wedge the process.
+            _arm_reconnect_watchdog()
             stop.set()
             pause_mic.set()
             # Join before close so a queued "superseded" is observed.
@@ -1713,14 +2079,7 @@ def main(argv: list[str] | None = None) -> int:
             except Exception:
                 pass
             conn.close()
-            if uplink is not None and uplink.is_alive():
-                try:
-                    import sounddevice as sd
-
-                    sd.stop(ignore_errors=True)
-                except Exception:
-                    pass
-                uplink.join(timeout=1.5)
+            _finish_uplink(uplink)
             if superseded.is_set():
                 superseded_box["hit"] = True
             if busy.is_set():
@@ -1729,7 +2088,9 @@ def main(argv: list[str] | None = None) -> int:
                 served_box["hit"] = True
 
     try:
+        _start_reconnect_watchdog()
         while not quit_ev.is_set():
+            _arm_reconnect_watchdog()
             sock = _wait_for_desktop(
                 args.host,
                 args.port,
@@ -1793,6 +2154,7 @@ def main(argv: list[str] | None = None) -> int:
         print()
     finally:
         # Any exit path (Ctrl+C, SIGTERM/SIGHUP, desktop gone): close audio + camera.
+        _stop_reconnect_watchdog()
         _cleanup_devices()
     return 0
 
