@@ -777,10 +777,15 @@ def _play_local_shutdown(*, kind: str = "disconnect") -> None:
 
 
 
-# After {"event":"superseded"}, wait before reconnecting so two crate clients
-# do not replace each other in a loop. Jitter spreads them if both back off.
+# After {"event":"superseded"} or {"event":"error","message":"busy"}, wait
+# before reconnecting so two crate clients do not replace each other in a
+# loop, and so a busy slot is not polled every few seconds. Jitter spreads
+# them if both back off.
 SUPERSEDED_BACKOFF_S = 30.0
 SUPERSEDED_BACKOFF_JITTER_S = 5.0
+# Spoken disconnect line: once per outage, then at most this often until a
+# session reaches "ready" again. _wait_for_desktop uses the same spacing.
+DISCONNECT_ANNOUNCE_EVERY_S = 45.0
 
 
 def _backoff_superseded(quit_ev: threading.Event) -> bool:
@@ -810,18 +815,29 @@ def _wait_for_desktop(
     quit_ev: threading.Event,
     *,
     retry_s: float = 5.0,
-    announce_every_s: float = 45.0,
+    announce_every_s: float | None = None,
     connect_timeout_s: float = 8.0,
     announce_immediately: bool = True,
     play=None,
+    announce_clock: list | None = None,
 ) -> socket.socket | None:
     """Block until the desktop accepts TCP. Play generic disconnect lines while waiting.
 
     Returns a connected socket, or None if quit_ev is set. Announces on first failure
     when announce_immediately is True; later announcements are spaced by announce_every_s.
+    ``announce_clock`` is an optional one-element list shared with the reconnect loop
+    so a busy refusal and a TCP wait count as one outage.
     """
     play_fn = play or _play_local_shutdown
-    next_announce = 0.0 if announce_immediately else (time.monotonic() + float(announce_every_s))
+    every = float(
+        DISCONNECT_ANNOUNCE_EVERY_S if announce_every_s is None else announce_every_s
+    )
+    if announce_clock is None:
+        next_announce = 0.0 if announce_immediately else (time.monotonic() + every)
+    else:
+        if not announce_immediately and float(announce_clock[0]) <= 0.0:
+            announce_clock[0] = time.monotonic() + every
+        next_announce = float(announce_clock[0])
     printed_hint = False
     while not quit_ev.is_set() and not _SHUTDOWN.is_set():
         try:
@@ -836,7 +852,9 @@ def _wait_for_desktop(
                 printed_hint = True
             if now >= next_announce:
                 play_fn(kind="disconnect")
-                next_announce = now + float(announce_every_s)
+                next_announce = now + every
+                if announce_clock is not None:
+                    announce_clock[0] = next_announce
             if quit_ev.wait(timeout=max(0.5, float(retry_s))):
                 return None
     return None
@@ -990,6 +1008,7 @@ def _pump(
     stop: threading.Event,
     pause_mic: threading.Event | None = None,
     superseded: threading.Event | None = None,
+    busy: threading.Event | None = None,
 ) -> None:
     # Drain queued events even after stop/close so "superseded" is not lost.
     while True:
@@ -1032,7 +1051,12 @@ def _pump(
         elif ev == "hello":
             pass
         elif ev == "error":
-            print(f"  desktop error: {header.get('message')}")
+            message = str(header.get("message") or "")
+            if message == "busy" and busy is not None:
+                busy.set()
+                print("  desktop busy")
+                break
+            print(f"  desktop error: {message}")
         elif ev == "superseded":
             # Newer same-IP or trusted client took the session. Main backs off.
             if superseded is not None:
@@ -1042,8 +1066,13 @@ def _pump(
         # payload dropped here — never written. Unknown events are ignored.
 
 
-def _wait_ready(ready: threading.Event, conn: CrateConnection, timeout: float) -> bool:
-    """True when ``ready`` is set. False on timeout or a dead socket.
+def _wait_ready(
+    ready: threading.Event,
+    conn: CrateConnection,
+    timeout: float,
+    busy: threading.Event | None = None,
+) -> bool:
+    """True when ``ready`` is set. False on timeout, a dead socket, or busy.
 
     The recv thread sets ``conn.closed`` when keepalive or TCP_USER_TIMEOUT
     fails the socket (or the peer sends FIN/RST). Polling here lets the
@@ -1056,6 +1085,8 @@ def _wait_ready(ready: threading.Event, conn: CrateConnection, timeout: float) -
     while True:
         if ready.is_set():
             return True
+        if busy is not None and busy.is_set():
+            return False
         if conn.closed:
             return False
         remaining = deadline - time.monotonic()
@@ -1445,6 +1476,27 @@ def main(argv: list[str] | None = None) -> int:
     # The session function itself returns "disconnect"; the reconnect loop
     # turns that into a backoff. No return-in-finally (Python warns on it).
     superseded_box = {"hit": False}
+    busy_box = {"hit": False}
+    served_box = {"hit": False}
+    # Shared with _wait_for_desktop. 0 means the disconnect line is due.
+    announce_clock = [0.0]
+    announce_every_s = float(DISCONNECT_ANNOUNCE_EVERY_S)
+    announce_now = True
+
+    def _note_outage(message: str) -> None:
+        nonlocal announce_now
+        announce_now = False
+        now = time.monotonic()
+        if now < float(announce_clock[0]):
+            return
+        print(message)
+        _play_local_shutdown(kind="disconnect")
+        announce_clock[0] = now + announce_every_s
+
+    def _session_succeeded() -> None:
+        nonlocal announce_now
+        announce_clock[0] = 0.0
+        announce_now = True
 
     def _run_connected_session(conn: CrateConnection) -> str:
         """Run one desktop session. Returns 'goodbye' (stop client) or 'disconnect' (retry)."""
@@ -1454,9 +1506,10 @@ def main(argv: list[str] | None = None) -> int:
         pause_mic = threading.Event()
         shutdown_played = False
         superseded = threading.Event()
+        busy = threading.Event()
         pump = threading.Thread(
             target=_pump,
-            args=(conn, ready, end_talk, stop, pause_mic, superseded),
+            args=(conn, ready, end_talk, stop, pause_mic, superseded, busy),
             name="crate-pump",
             daemon=True,
         )
@@ -1468,7 +1521,7 @@ def main(argv: list[str] | None = None) -> int:
             if args.continuous:
                 hello["continuous"] = True
             conn.send(hello)
-            if not _wait_ready(ready, conn, 20):
+            if not _wait_ready(ready, conn, 20, busy):
                 if not conn.closed:
                     print("No ready from desktop (is --serve-crate / --crate-echo running?)")
                 return "disconnect"
@@ -1619,15 +1672,20 @@ def main(argv: list[str] | None = None) -> int:
                 uplink.join(timeout=1.5)
             if superseded.is_set():
                 superseded_box["hit"] = True
+            if busy.is_set():
+                busy_box["hit"] = True
+            if ready.is_set():
+                served_box["hit"] = True
 
     try:
-        announce_now = True
         while not quit_ev.is_set():
             sock = _wait_for_desktop(
                 args.host,
                 args.port,
                 quit_ev,
+                announce_every_s=announce_every_s,
                 announce_immediately=announce_now,
+                announce_clock=announce_clock,
             )
             if sock is None:
                 return 0
@@ -1636,9 +1694,15 @@ def main(argv: list[str] | None = None) -> int:
             conn = CrateConnection(sock)
             try:
                 superseded_box["hit"] = False
+                busy_box["hit"] = False
+                served_box["hit"] = False
                 reason = _run_connected_session(conn)
+                if served_box["hit"]:
+                    _session_succeeded()
                 if reason != "goodbye" and superseded_box["hit"]:
                     reason = "superseded"
+                elif reason != "goodbye" and busy_box["hit"]:
+                    reason = "busy"
             except (KeyboardInterrupt, ConnectionError, OSError) as exc:
                 if isinstance(exc, KeyboardInterrupt):
                     quit_ev.set()
@@ -1649,16 +1713,17 @@ def main(argv: list[str] | None = None) -> int:
             if reason == "goodbye" or quit_ev.is_set() or _SHUTDOWN.is_set():
                 break
             if reason == "superseded":
-                print("  another crate client took this session; backing off")
-                _play_local_shutdown(kind="disconnect")
-                announce_now = False
+                _note_outage("  another crate client took this session; backing off")
                 if _backoff_superseded(quit_ev):
                     break
                 continue
-            # Desktop dropped or never became ready — announce, then wait again.
-            print("  desktop gone; will retry when it returns")
-            _play_local_shutdown(kind="disconnect")
-            announce_now = False  # already spoke; next wait is quieter until interval
+            if reason == "busy":
+                _note_outage("  desktop busy; backing off")
+                if _backoff_superseded(quit_ev):
+                    break
+                continue
+            # Desktop dropped or never became ready. One line per outage.
+            _note_outage("  desktop gone; will retry when it returns")
     except KeyboardInterrupt:
         quit_ev.set()
         _play_local_shutdown(kind="goodbye")

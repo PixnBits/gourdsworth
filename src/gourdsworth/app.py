@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import random
 import sys
 import time
@@ -18,7 +17,7 @@ from gourdsworth.net import (
     CrateListener,
     carry_history_for_peer,
     is_loopback,
-    parse_trusted_peers,
+    load_trusted_peers,
     resolve_bind,
     serve_echo,
     serve_newest,
@@ -679,6 +678,29 @@ def _crate_settings(cfg: dict) -> tuple[str, int]:
     return host, port
 
 
+def _trusted_for_start(cfg: dict, host: str):
+    """Merge trusted peers once and warn when a LAN bind has an empty list.
+
+    An empty list still starts. The returned set is what the listener uses;
+    it does not read ``CRATE_TRUSTED_PEERS`` again.
+    """
+    raw = (cfg.get("crate") or {}).get("trusted_peers")
+    trusted = load_trusted_peers(raw)
+    if not is_loopback(host) and not trusted:
+        print(
+            "warning: crate is bound off loopback and trusted_peers is empty. "
+            "Any LAN host may take an empty slot and hold it. Set "
+            "CRATE_TRUSTED_PEERS to the Pi's address only "
+            "(Environment=CRATE_TRUSTED_PEERS=192.0.2.55 in the user unit, "
+            "or a drop-in from `systemctl --user edit gourdsworth-server`) "
+            "or set crate.trusted_peers in config.yaml. The list should "
+            "contain only the Pi. Starting anyway.",
+            file=sys.stderr,
+            flush=True,
+        )
+    return trusted
+
+
 def _run_crate_echo(args) -> int:
     cfg = load_config(args.config)
     if cfg["privacy"].get("save_audio") or cfg["privacy"].get("save_transcripts"):
@@ -700,8 +722,9 @@ def _run_crate_echo(args) -> int:
     else:
         print(f"  bind {host}:{port}  WARNING: LAN bind. PCM/JPEG reachable on this network. No TLS.")
     print("  Ctrl+C to quit")
+    trusted = _trusted_for_start(cfg, host)
     try:
-        code = serve_echo(host, port)
+        code = serve_echo(host, port, trusted_peers=trusted, trust_env=False)
     except KeyboardInterrupt:
         print()
         return 0
@@ -735,16 +758,15 @@ def _serve_crate(cfg, mayor, stt, speaker, sidecar, canned) -> int:
     print("  Talk is the Pi button / Enter. Ctrl+C to quit.")
     print()
     listener = CrateListener(host, port)
-    # History survives a same-IP or trusted reconnect. A different untrusted
-    # peer starts empty. The turn cap stays in the turn handler.
+    # History survives only an exact same-IP reconnect. A different IP,
+    # trusted or not, starts empty. The turn cap stays in the turn handler.
     history: list[dict] = []
     last_peer: dict[str, str | None] = {"ip": None}
-    trusted_cfg = parse_trusted_peers((cfg.get("crate") or {}).get("trusted_peers"))
+    trusted = _trusted_for_start(cfg, host)
 
     def _one(conn) -> None:
         peer = conn.peer or ("?", 0)
         peer_ip = str(getattr(conn, "policy_ip", None) or peer[0])
-        trusted = trusted_cfg | parse_trusted_peers(os.environ.get("CRATE_TRUSTED_PEERS", ""))
         last_peer["ip"] = carry_history_for_peer(
             history, peer_ip, last_peer["ip"], trusted
         )
@@ -764,7 +786,8 @@ def _serve_crate(cfg, mayor, stt, speaker, sidecar, canned) -> int:
             listener,
             _one,
             waiting_message="waiting for crate client…",
-            trusted_peers=trusted_cfg,
+            trusted_peers=trusted,
+            trust_env=False,
         )
     except KeyboardInterrupt:
         print()

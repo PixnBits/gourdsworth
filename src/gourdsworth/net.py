@@ -57,9 +57,13 @@ Control JSON (no payload)
 
 Default bind is 127.0.0.1. Binding a LAN address or 0.0.0.0 requires
 ``crate.allow_lan: true`` — anyone on that network could then read kids'
-PCM/JPEG. There is no TLS and no auth. A live session is replaced only
-after a valid crate hello, and only by the same peer IP or an address in
-``crate.trusted_peers`` / ``CRATE_TRUSTED_PEERS``.
+PCM/JPEG. There is no TLS and no auth. A hello must finish within
+``HELLO_DEADLINE_S`` for the whole read, and it must not carry a payload.
+When ``crate.trusted_peers`` / ``CRATE_TRUSTED_PEERS`` is non-empty it is
+an allowlist: other addresses are closed at accept, even if the slot is
+empty. The list should contain only the Pi. A live or not-yet-served
+session is replaced only by the same IP or a trusted IP. History stays
+only with that exact same IP.
 """
 
 from __future__ import annotations
@@ -67,9 +71,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import errno
+import ipaddress
 import json
 import os
 import queue
+import re
 import socket
 import sys
 import threading
@@ -114,16 +120,30 @@ TCP_KEEPCNT = 3
 TCP_USER_TIMEOUT_MS = 30_000
 
 # A newcomer must send a crate hello before it can be served or replace anyone.
+# One absolute deadline for the whole hello, not a fresh timeout per recv.
 HELLO_DEADLINE_S = 3.0
-# At most one replacement of an active session per IP per this interval.
+# Hello line cap. A longer line, or any declared payload, is rejected unread.
+HELLO_MAX_BYTES = 1024
+# Floor so settimeout(0) does not turn the last slice into a busy poll.
+# The deadline is still checked before every recv.
+_HELLO_RECV_FLOOR_S = 0.02
+# Not-yet-validated hellos. Over-cap sockets are closed at accept.
+HELLO_PENDING_MAX = 16
+HELLO_PENDING_PER_IP = 2
+# At most one replacement of an active or pending session per IP per this interval.
 REPLACE_MIN_INTERVAL_S = 5.0
 # Connects per IP before a hello thread is started. Excess sockets are closed.
 CONNECT_RATE_MAX = 8
 CONNECT_RATE_WINDOW_S = 10.0
-# Pause after a transient accept() error so a brief EMFILE does not spin.
+# First pause after a transient accept() error. Later pauses double up to the cap.
 ACCEPT_RETRY_S = 0.2
+ACCEPT_BACKOFF_MAX_S = 2.0
+# One accept-error or refusal line per this interval, per kind.
+LOG_THROTTLE_S = 10.0
 # Best-effort write of superseded / busy. Never block the hello thread on it.
 SUPERSEDE_SEND_TIMEOUT_S = 0.5
+
+_TRUSTED_SPLIT = re.compile(r"[\s,]+")
 
 _TRANSIENT_ACCEPT_ERRNOS = frozenset(
     {
@@ -236,35 +256,110 @@ def resolve_bind(host: str | None, allow_lan: bool) -> str:
     return host
 
 
-def parse_trusted_peers(value: Any) -> frozenset[str]:
-    """Parse ``crate.trusted_peers`` (list or comma string) or ``CRATE_TRUSTED_PEERS``."""
+def normalize_peer_ip(value: Any) -> str | None:
+    """Return a canonical IP string, or None when ``value`` is not an address.
+
+    IPv4-mapped IPv6 (``::ffff:a.b.c.d``) becomes the IPv4 address so a
+    trusted entry and a peer address compare equal.
+    """
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    try:
+        parsed = ipaddress.ip_address(text)
+    except ValueError:
+        return None
+    mapped = getattr(parsed, "ipv4_mapped", None)
+    if mapped is not None:
+        parsed = mapped
+    return str(parsed)
+
+
+def _partition_trusted(value: Any) -> tuple[set[str], list[str]]:
+    """Split trusted-peer text into normalized addresses and rejected tokens."""
+    good: set[str] = set()
+    bad: list[str] = []
     if isinstance(value, str):
-        parts = value.split(",")
-    elif isinstance(value, (list, tuple, set)):
-        parts = []
+        tokens = [tok for tok in _TRUSTED_SPLIT.split(value) if tok]
+    elif isinstance(value, (list, tuple, set, frozenset)):
+        tokens = []
         for item in value:
             if isinstance(item, str):
-                parts.extend(item.split(","))
+                tokens.extend(tok for tok in _TRUSTED_SPLIT.split(item) if tok)
+            elif item is not None:
+                bad.append(str(item))
     else:
-        return frozenset()
-    return frozenset(part.strip() for part in parts if part and part.strip())
+        return good, bad
+    for tok in tokens:
+        norm = normalize_peer_ip(tok)
+        if norm is None:
+            bad.append(tok)
+        else:
+            good.add(norm)
+    return good, bad
+
+
+def _warn_bad_trusted(bad: list[str]) -> None:
+    if not bad:
+        return
+    listed = ", ".join(bad)
+    print(
+        "warning: ignoring invalid trusted peer entries "
+        f"(not IP addresses): {listed}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def parse_trusted_peers(value: Any) -> frozenset[str]:
+    """Parse ``crate.trusted_peers`` (list or comma/whitespace string).
+
+    CIDR, hostnames, ``*``, and other non-addresses are ignored. A warning
+    lists them. IPv4-mapped IPv6 is stored as IPv4.
+    """
+    good, bad = _partition_trusted(value)
+    _warn_bad_trusted(bad)
+    return frozenset(good)
+
+
+def load_trusted_peers(config_value: Any = None, *, env: str | None = None) -> frozenset[str]:
+    """Merge config and ``CRATE_TRUSTED_PEERS`` once. Warn once about bad entries.
+
+    ``env is None`` reads the environment. Pass ``env=""`` to skip it.
+    Call this at startup and keep the returned set; do not re-read per connection.
+    """
+    if env is None:
+        env = os.environ.get("CRATE_TRUSTED_PEERS", "")
+    good, bad = _partition_trusted(config_value)
+    good_env, bad_env = _partition_trusted(env)
+    _warn_bad_trusted(bad + bad_env)
+    return frozenset(good) | frozenset(good_env)
 
 
 def carry_history_for_peer(
     history: list,
     peer_ip: str,
     previous_ip: str | None,
-    trusted: set[str] | frozenset[str],
+    trusted: set[str] | frozenset[str] | None = None,
 ) -> str:
-    """Keep history for the same IP or a trusted peer. Clear it for anyone else.
+    """Keep history only when the new peer IP is exactly the previous one.
 
+    A different IP starts empty, including a different trusted IP. Trust
+    decides who may replace a session; it does not carry the conversation.
+    ``trusted`` is accepted so existing callers keep working and is ignored.
     ``previous_ip`` is None until the first served session records a peer.
-    Returns ``peer_ip`` so the caller can store it for the next session.
-    The turn cap stays with the caller.
+    Returns the normalized peer IP for the caller to store. The turn cap
+    stays with the caller.
     """
-    prev = (previous_ip or "").strip()
-    ip = (peer_ip or "").strip()
-    if prev and ip != prev and ip not in trusted:
+    del trusted
+    ip = normalize_peer_ip(peer_ip) or str(peer_ip or "").strip()
+    if previous_ip:
+        prev = normalize_peer_ip(previous_ip) or str(previous_ip).strip()
+    else:
+        prev = ""
+    if prev and ip != prev:
         history.clear()
     return ip
 
@@ -895,23 +990,55 @@ def _valid_crate_hello(header: dict[str, Any]) -> bool:
 
 
 def _read_crate_hello(sock: socket.socket) -> tuple[dict[str, Any], bytes] | None:
-    """Read one crate hello, or None on timeout, close, garbage, or a bad role/proto.
+    """Read one crate hello, or None on timeout, close, garbage, or a payload.
 
     ``HELLO_DEADLINE_S`` is read when this runs so tests can shorten it.
-    Leftover bytes after the hello line are returned for the recv thread.
+    The deadline is absolute: each recv waits only for the time still left.
+    The line is capped at ``HELLO_MAX_BYTES``. ``n`` > 0 is rejected without
+    a further read. Bytes after the newline are returned for the recv thread.
     """
-    try:
-        sock.settimeout(HELLO_DEADLINE_S)
-    except OSError:
-        return None
+    deadline = time.monotonic() + float(HELLO_DEADLINE_S)
+    cap = int(HELLO_MAX_BYTES)
     buf = bytearray()
+    while True:
+        nl = buf.find(b"\n")
+        if nl != -1:
+            break
+        if len(buf) >= cap:
+            return None
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        try:
+            sock.settimeout(max(_HELLO_RECV_FLOOR_S, remaining))
+            chunk = sock.recv(cap - len(buf))
+        except OSError:
+            return None
+        if not chunk:
+            return None
+        buf.extend(chunk)
+    nl = buf.find(b"\n")
+    if nl < 0 or nl > cap:
+        return None
+    line = bytes(buf[:nl])
+    leftover = bytes(buf[nl + 1 :])
     try:
-        header, payload = recv_msg(sock, buf)
-    except (TimeoutError, ConnectionError, OSError, ValueError):
+        header = json.loads(line.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
         return None
-    if payload or not isinstance(header, dict) or not _valid_crate_hello(header):
+    if not isinstance(header, dict):
         return None
-    return header, bytes(buf)
+    if "n" in header:
+        try:
+            n = int(header.get("n") or 0)
+        except (TypeError, ValueError):
+            return None
+        if n != 0:
+            # Declared payload. Do not recv it.
+            return None
+    if not _valid_crate_hello(header):
+        return None
+    return header, leftover
 
 
 def _close_socket(sock: socket.socket) -> None:
@@ -929,19 +1056,16 @@ def _send_busy(sock: socket.socket) -> None:
         pass
 
 
-def _log_accept_oserror(exc: OSError, *, fatal: bool) -> None:
-    kind = "fatal" if fatal else "transient"
-    print(f"crate accept {kind} error: {exc}", file=sys.stderr, flush=True)
-
-
 class _NewestAccept:
     """Accept on a side thread. Only a validated crate hello can be served.
 
     The accept loop never blocks on a newcomer: each socket is handed to a
-    short-lived thread that reads the hello. A live session is replaced only
-    for the same policy IP or a trusted peer, and at most once per
-    ``REPLACE_MIN_INTERVAL_S`` for that IP. The hello thread wakes the old
-    session with shutdown(); that session's thread is the one that close()s.
+    short-lived thread that reads the hello, unless the trusted list, the
+    connect rate, or the pending-hello cap says to close it first. A live
+    or not-yet-served session is replaced only for the same policy IP or a
+    trusted peer, and at most once per ``REPLACE_MIN_INTERVAL_S`` for that
+    IP. The hello thread wakes the old session with shutdown(); that
+    session's thread is the one that close()s.
     """
 
     def __init__(
@@ -950,10 +1074,14 @@ class _NewestAccept:
         *,
         peer_ip: Callable[..., str] | None = None,
         trusted_peers: Any = None,
+        trust_env: bool = True,
     ):
         self._listener = listener
         self._peer_ip = peer_ip
-        self._trusted_config = parse_trusted_peers(trusted_peers)
+        # Parsed once. trust_env is false when the caller already merged the env.
+        self._trusted = load_trusted_peers(
+            trusted_peers, env=None if trust_env else ""
+        )
         self._cv = threading.Condition()
         self._stop = threading.Event()
         self._pending: CrateConnection | None = None
@@ -962,7 +1090,11 @@ class _NewestAccept:
         self._connects: dict[str, deque[float]] = {}
         self._replaced_at: dict[str, float] = {}
         self._vet_socks: set[socket.socket] = set()
+        self._hello_ips: dict[socket.socket, str] = {}
         self._vetters: set[threading.Thread] = set()
+        self._accept_backoff = float(ACCEPT_RETRY_S)
+        self._log_lock = threading.Lock()
+        self._log_slots: dict[str, dict[str, Any]] = {}
         self.exit_code = 0
         self._thread = threading.Thread(
             target=self._accept_loop,
@@ -1031,6 +1163,7 @@ class _NewestAccept:
             thread.join(timeout=2.0)
         for item in vetters:
             item.join(timeout=1.0)
+        self._flush_limited_logs()
 
     def _allow_connect(self, ip: str) -> bool:
         now = time.monotonic()
@@ -1052,21 +1185,80 @@ class _NewestAccept:
         bucket.append(now)
         return True
 
-    def _trusted(self) -> frozenset[str]:
-        return self._trusted_config | parse_trusted_peers(
-            os.environ.get("CRATE_TRUSTED_PEERS", "")
-        )
-
     def _policy_ip(self, addr: tuple) -> str:
         if self._peer_ip is None:
-            return str(addr[0])
-        return str(self._peer_ip(addr)).strip()
+            raw = str(addr[0])
+        else:
+            raw = str(self._peer_ip(addr)).strip()
+        return normalize_peer_ip(raw) or raw
+
+    def _prune_replaced_locked(self, now: float | None = None) -> None:
+        now = time.monotonic() if now is None else now
+        limit = float(REPLACE_MIN_INTERVAL_S)
+        stale = [key for key, ts in self._replaced_at.items() if now - ts >= limit]
+        for key in stale:
+            self._replaced_at.pop(key, None)
 
     def _replacement_ok_locked(self, ip: str) -> bool:
         last = self._replaced_at.get(ip)
         if last is None:
             return True
-        return (time.monotonic() - last) >= REPLACE_MIN_INTERVAL_S
+        return (time.monotonic() - last) >= float(REPLACE_MIN_INTERVAL_S)
+
+    def _pause_accept(self, delay: float) -> bool:
+        """Wait out an accept backoff. True when the listener is stopping."""
+        if delay <= 0:
+            return self._stop.is_set()
+        return self._stop.wait(delay)
+
+    def _log_limited(self, kind: str, message: str) -> None:
+        """Print at most one line per ``LOG_THROTTLE_S`` for ``kind``.
+
+        The next line, or a flush, includes how many repeats were suppressed.
+        """
+        now = time.monotonic()
+        interval = float(LOG_THROTTLE_S)
+        emit: list[str] = []
+        with self._log_lock:
+            slot = self._log_slots.get(kind)
+            if slot is not None and now - float(slot["ts"]) < interval:
+                slot["suppressed"] = int(slot["suppressed"]) + 1
+                slot["message"] = message
+                return
+            if slot is not None and int(slot["suppressed"]):
+                emit.append(f"{slot['message']} ({slot['suppressed']} suppressed)")
+            self._log_slots[kind] = {"ts": now, "suppressed": 0, "message": message}
+            emit.append(message)
+        for line in emit:
+            print(line, file=sys.stderr, flush=True)
+
+    def _flush_limited_logs(self) -> None:
+        emit: list[str] = []
+        with self._log_lock:
+            for slot in self._log_slots.values():
+                if int(slot["suppressed"]):
+                    emit.append(f"{slot['message']} ({slot['suppressed']} suppressed)")
+                    slot["suppressed"] = 0
+        for line in emit:
+            print(line, file=sys.stderr, flush=True)
+
+    def _reserve_hello(self, sock: socket.socket, ip: str) -> str | None:
+        """Reserve a not-yet-validated hello slot. Return a refusal reason or None."""
+        with self._cv:
+            self._prune_replaced_locked()
+            per = sum(1 for item in self._hello_ips.values() if item == ip)
+            if per >= int(HELLO_PENDING_PER_IP):
+                return "per-ip"
+            if len(self._hello_ips) >= int(HELLO_PENDING_MAX):
+                return "global"
+            self._hello_ips[sock] = ip
+            self._vet_socks.add(sock)
+            return None
+
+    def _release_hello(self, sock: socket.socket) -> None:
+        with self._cv:
+            self._hello_ips.pop(sock, None)
+            self._vet_socks.discard(sock)
 
     def _accept_loop(self) -> None:
         try:
@@ -1079,22 +1271,57 @@ class _NewestAccept:
                     if self._stop.is_set() or self._listener._closed:
                         break
                     if exc.errno in _TRANSIENT_ACCEPT_ERRNOS:
-                        _log_accept_oserror(exc, fatal=False)
-                        if self._stop.wait(ACCEPT_RETRY_S):
+                        self._log_limited(
+                            f"accept-{exc.errno}",
+                            f"crate accept transient error: {exc}",
+                        )
+                        delay = self._accept_backoff
+                        grown = delay * 2
+                        floor = float(ACCEPT_RETRY_S)
+                        cap = float(ACCEPT_BACKOFF_MAX_S)
+                        if grown < floor:
+                            grown = floor
+                        if grown > cap:
+                            grown = cap
+                        self._accept_backoff = grown
+                        if self._pause_accept(delay):
                             break
                         continue
-                    _log_accept_oserror(exc, fatal=True)
+                    self._log_limited(
+                        f"accept-fatal-{exc.errno}",
+                        f"crate accept fatal error: {exc}",
+                    )
                     with self._cv:
                         self.exit_code = 1
                         self._stop.set()
                         self._cv.notify_all()
                     break
+                self._accept_backoff = float(ACCEPT_RETRY_S)
                 try:
                     ip = self._policy_ip(addr)
                 except Exception:
                     _close_socket(sock)
                     continue
-                if not ip or not self._allow_connect(ip):
+                if not ip:
+                    _close_socket(sock)
+                    continue
+                if self._trusted and ip not in self._trusted:
+                    self._log_limited(
+                        "untrusted",
+                        f"crate untrusted: refused {ip} at accept",
+                    )
+                    _close_socket(sock)
+                    continue
+                if not self._allow_connect(ip):
+                    self._log_limited("rate", f"crate rate limit: refused {ip}")
+                    _close_socket(sock)
+                    continue
+                reason = self._reserve_hello(sock, ip)
+                if reason is not None:
+                    self._log_limited(
+                        "pending",
+                        f"crate pending cap: refused {ip} ({reason})",
+                    )
                     _close_socket(sock)
                     continue
                 self._spawn_vet(sock, addr, ip)
@@ -1102,6 +1329,7 @@ class _NewestAccept:
             with self._cv:
                 self._stop.set()
                 self._cv.notify_all()
+            self._flush_limited_logs()
 
     def _spawn_vet(self, sock: socket.socket, addr: tuple, ip: str) -> None:
         thread = threading.Thread(
@@ -1112,7 +1340,6 @@ class _NewestAccept:
         )
         with self._cv:
             self._vetters.add(thread)
-            self._vet_socks.add(sock)
         thread.start()
 
     def _vet(self, sock: socket.socket, addr: tuple, ip: str) -> None:
@@ -1120,11 +1347,10 @@ class _NewestAccept:
         try:
             got = _read_crate_hello(sock)
             if got is None:
+                self._release_hello(sock)
                 _close_socket(sock)
                 return
             header, leftover = got
-            with self._cv:
-                self._vet_socks.discard(sock)
             conn = CrateConnection(
                 sock,
                 peer=addr,
@@ -1135,9 +1361,16 @@ class _NewestAccept:
             decision = "drop"
             old_active: CrateConnection | None = None
             old_pending: CrateConnection | None = None
+            refusal: tuple[str, str] | None = None
             with self._cv:
+                # Drop the hello slot and publish the connection under one lock
+                # so close() cannot lose the socket between the two.
+                self._hello_ips.pop(sock, None)
+                self._vet_socks.discard(sock)
                 if not self._stop.is_set():
-                    decision, old_active, old_pending = self._claim_locked(conn, ip)
+                    decision, old_active, old_pending, refusal = self._claim_locked(conn, ip)
+            if refusal is not None:
+                self._log_limited(refusal[0], refusal[1])
             if decision != "serve":
                 if decision == "busy":
                     _send_busy(sock)
@@ -1153,27 +1386,47 @@ class _NewestAccept:
         finally:
             with self._cv:
                 self._vetters.discard(threading.current_thread())
+                self._hello_ips.pop(sock, None)
                 self._vet_socks.discard(sock)
 
     def _claim_locked(
         self, conn: CrateConnection, ip: str
-    ) -> tuple[str, CrateConnection | None, CrateConnection | None]:
+    ) -> tuple[str, CrateConnection | None, CrateConnection | None, tuple[str, str] | None]:
+        self._prune_replaced_locked()
+        guard: CrateConnection | None = None
+        replacing_active = False
         if self._active and self._current is not None:
-            cur_ip = str(getattr(self._current, "policy_ip", "") or "")
-            if ip != cur_ip and ip not in self._trusted():
-                return "busy", None, None
+            guard = self._current
+            replacing_active = True
+        elif self._pending is not None:
+            guard = self._pending
+        if guard is not None:
+            cur_ip = normalize_peer_ip(str(getattr(guard, "policy_ip", "") or "")) or str(
+                getattr(guard, "policy_ip", "") or ""
+            )
+            if ip != cur_ip and ip not in self._trusted:
+                return (
+                    "busy",
+                    None,
+                    None,
+                    ("busy", f"crate busy: refused {ip} (active {cur_ip})"),
+                )
             if not self._replacement_ok_locked(ip):
-                return "busy", None, None
-            old_active = self._current
+                return (
+                    "busy",
+                    None,
+                    None,
+                    ("busy", f"crate busy: refused {ip} (replace interval)"),
+                )
+            old_active = self._current if replacing_active else None
             old_pending = self._pending
             self._pending = conn
             self._replaced_at[ip] = time.monotonic()
             self._cv.notify_all()
-            return "serve", old_active, old_pending
-        old_pending = self._pending
+            return "serve", old_active, old_pending, None
         self._pending = conn
         self._cv.notify_all()
-        return "serve", None, old_pending
+        return "serve", None, None, None
 
     def _finish_replace(
         self,
@@ -1208,25 +1461,34 @@ def serve_newest(
     waiting_message: str | None = None,
     peer_ip: Callable[..., str] | None = None,
     trusted_peers: Any = None,
+    trust_env: bool = True,
 ) -> int:
     """Run ``session_fn(conn)`` for each validated crate client.
 
     A bare connect does not replace anyone. After a valid hello, the client
-    is served if no session is active. An active session is replaced only
-    when the newcomer's policy IP matches the current peer or is trusted,
-    and only once per ``REPLACE_MIN_INTERVAL_S`` for that IP. The hello
-    thread wakes the old socket; this thread's ``finally`` close()s it.
+    is served if no session is active and the pending slot is empty. An
+    active or not-yet-served session is replaced only when the newcomer's
+    policy IP matches that peer or is trusted, and only once per
+    ``REPLACE_MIN_INTERVAL_S`` for that IP. When the trusted list is
+    non-empty, other addresses are closed at accept. The hello thread wakes
+    the old socket; this thread's ``finally`` close()s it.
 
     ``peer_ip`` optionally maps the accepted sockaddr to the IP used for
     those checks (loopback tests simulate another host). Conversation history
     belongs in the closure around ``session_fn``; use ``carry_history_for_peer``
-    so a different untrusted peer starts empty.
+    so a different IP starts empty. ``trust_env`` reads ``CRATE_TRUSTED_PEERS``
+    once at startup. Pass false when ``trusted_peers`` is already the merge.
 
     Returns 0, or 1 if ``accept()`` fails with a non-transient OSError.
     ``listener.close()`` or Ctrl+C makes ``take`` return. ``oneshot`` stops
     after a session that was not replaced.
     """
-    gate = _NewestAccept(listener, peer_ip=peer_ip, trusted_peers=trusted_peers)
+    gate = _NewestAccept(
+        listener,
+        peer_ip=peer_ip,
+        trusted_peers=trusted_peers,
+        trust_env=trust_env,
+    )
     try:
         while True:
             conn = gate.take(waiting_message)
@@ -1255,6 +1517,7 @@ def serve_echo(
     oneshot: bool = False,
     peer_ip: Callable[..., str] | None = None,
     trusted_peers: Any = None,
+    trust_env: bool = True,
 ) -> int:
     listener = CrateListener(host, port)
     print(f"  crate echo listening on {listener.host}:{listener.port}")
@@ -1277,6 +1540,7 @@ def serve_echo(
             waiting_message="  waiting for crate client…",
             peer_ip=peer_ip,
             trusted_peers=trusted_peers,
+            trust_env=trust_env,
         )
     finally:
         listener.close()

@@ -45,8 +45,10 @@ DEFAULTS = {
         "host": "127.0.0.1",
         "port": 8746,
         "allow_lan": False,
-        # IPs that may replace a live session besides the current peer.
-        # Also read from the CRATE_TRUSTED_PEERS environment variable.
+        # Allowlist of crate peers. Empty: any peer may take an empty slot,
+        # and only that same IP may replace it. Non-empty: other addresses
+        # are closed at accept. List only the Pi. Also read once from
+        # CRATE_TRUSTED_PEERS (commas or whitespace; bad entries are ignored).
         "trusted_peers": [],
     },
 }

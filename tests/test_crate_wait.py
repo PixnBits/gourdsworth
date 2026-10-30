@@ -519,3 +519,249 @@ def test_shutdown_interrupts_superseded_backoff(crate_client, monkeypatch, tmp_p
         crate_client._reset_shutdown_state_for_tests()
         assert not client.is_alive()
         assert not server.is_alive(), f"fake desktop still running: {server_err!r}"
+
+
+def _bind_server():
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(4)
+    srv.settimeout(2.0)
+    return srv
+
+
+def _send_busy_and_close(sock: socket.socket) -> None:
+    from gourdsworth.net import send_msg
+
+    sock.settimeout(1.0)
+    try:
+        sock.recv(256)
+    except OSError:
+        pass
+    send_msg(sock, {"event": "error", "message": "busy"})
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+    sock.close()
+
+
+def test_busy_backs_off_and_announces_once_per_outage(crate_client, monkeypatch, tmp_path):
+    """busy waits out the supersede backoff and speaks the disconnect line once."""
+    from gourdsworth.net import PROTO, send_msg
+
+    _stub_client_side(crate_client, monkeypatch)
+    plays: list[float] = []
+
+    def play(**_k):
+        plays.append(time.monotonic())
+
+    monkeypatch.setattr(crate_client, "_play_local_shutdown", play)
+    monkeypatch.setattr(crate_client, "SUPERSEDED_BACKOFF_S", 0.40)
+    monkeypatch.setattr(crate_client, "SUPERSEDED_BACKOFF_JITTER_S", 0.0)
+    monkeypatch.setattr(crate_client, "DISCONNECT_ANNOUNCE_EVERY_S", 30.0)
+    backoffs = {"n": 0}
+    second_backoff = threading.Event()
+    real_backoff = crate_client._backoff_superseded
+
+    def wrapped(quit_ev):
+        backoffs["n"] += 1
+        if backoffs["n"] >= 2:
+            second_backoff.set()
+        return real_backoff(quit_ev)
+
+    monkeypatch.setattr(crate_client, "_backoff_superseded", wrapped)
+    ready_visits = {"n": 0}
+
+    def wait_trigger(gpio, stop, conn=None):
+        ready_visits["n"] += 1
+        if ready_visits["n"] >= 2:
+            return "quit"
+        return "disconnect"
+
+    monkeypatch.setattr(crate_client, "_wait_trigger", wait_trigger)
+
+    times: list[float] = []
+    accepted: list = []
+    server_err: list[BaseException] = []
+    port_ready = threading.Event()
+    port_box: dict = {}
+    release = threading.Event()
+
+    def fake_desktop() -> None:
+        srv = _bind_server()
+        try:
+            port_box["port"] = int(srv.getsockname()[1])
+            port_ready.set()
+            for _ in range(2):
+                conn, _addr = srv.accept()
+                accepted.append(conn)
+                times.append(time.monotonic())
+                _send_busy_and_close(conn)
+            conn, _addr = srv.accept()
+            accepted.append(conn)
+            try:
+                conn.recv(256)
+            except OSError:
+                pass
+            send_msg(conn, {"event": "hello", "role": "desktop", "proto": PROTO})
+            send_msg(conn, {"event": "ready"})
+            # Client returns from the served session, then comes back once more.
+            conn2, _addr2 = srv.accept()
+            accepted.append(conn2)
+            try:
+                conn2.recv(256)
+            except OSError:
+                pass
+            send_msg(conn2, {"event": "hello", "role": "desktop", "proto": PROTO})
+            send_msg(conn2, {"event": "ready"})
+            release.wait(timeout=3.0)
+        except BaseException as exc:
+            server_err.append(exc)
+        finally:
+            try:
+                srv.close()
+            except OSError:
+                pass
+            for sock in accepted:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+
+    server = threading.Thread(target=fake_desktop, name="crate-busy-desktop", daemon=True)
+    server.start()
+    assert port_ready.wait(timeout=2.0), server_err
+    rc = {"v": None}
+
+    def run_client() -> None:
+        rc["v"] = crate_client.main(
+            [
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(port_box["port"]),
+                "--no-camera",
+                "--no-mic",
+                "--log-file",
+                str(tmp_path / "crate-busy.log"),
+            ]
+        )
+
+    client = threading.Thread(target=run_client, name="crate-busy-client", daemon=True)
+    try:
+        client.start()
+        assert second_backoff.wait(timeout=3.0), (
+            f"second busy did not back off: plays={len(plays)} accepts={len(accepted)} "
+            f"err={server_err!r}"
+        )
+        assert len(plays) == 1, plays
+        assert len(times) >= 2
+        assert (times[1] - times[0]) >= 0.30
+        client.join(timeout=3.0)
+        assert not client.is_alive(), f"client still running rc={rc} err={server_err!r}"
+        assert rc["v"] == 0
+        # Two busies were one outage. The served session resets it, so the
+        # drop after ready speaks again. A third busy would be a third line.
+        assert len(plays) == 2, plays
+        assert backoffs["n"] >= 2
+    finally:
+        release.set()
+        crate_client._SHUTDOWN.set()
+        client.join(timeout=2.0)
+        server.join(timeout=2.0)
+        crate_client._reset_shutdown_state_for_tests()
+        assert not client.is_alive()
+        assert not server.is_alive(), f"fake desktop still running: {server_err!r}"
+
+
+def test_shutdown_interrupts_busy_backoff(crate_client, monkeypatch, tmp_path):
+    """Quit or shutdown during a busy backoff does not open another connection."""
+    _stub_client_side(crate_client, monkeypatch)
+    monkeypatch.setattr(crate_client, "SUPERSEDED_BACKOFF_S", 2.0)
+    monkeypatch.setattr(crate_client, "SUPERSEDED_BACKOFF_JITTER_S", 0.0)
+    started = threading.Event()
+    real_backoff = crate_client._backoff_superseded
+
+    def wrapped(quit_ev):
+        started.set()
+        return real_backoff(quit_ev)
+
+    monkeypatch.setattr(crate_client, "_backoff_superseded", wrapped)
+    accepted: list = []
+    server_err: list[BaseException] = []
+    port_ready = threading.Event()
+    port_box: dict = {}
+    release = threading.Event()
+
+    def fake_desktop() -> None:
+        srv = _bind_server()
+        srv.settimeout(0.4)
+        try:
+            port_box["port"] = int(srv.getsockname()[1])
+            port_ready.set()
+            conn, _addr = srv.accept()
+            accepted.append(conn)
+            _send_busy_and_close(conn)
+            while not release.is_set():
+                try:
+                    extra, _addr2 = srv.accept()
+                except TimeoutError:
+                    continue
+                accepted.append(extra)
+                try:
+                    extra.close()
+                except OSError:
+                    pass
+                break
+        except BaseException as exc:
+            server_err.append(exc)
+        finally:
+            try:
+                srv.close()
+            except OSError:
+                pass
+
+    server = threading.Thread(target=fake_desktop, name="crate-busy-quit", daemon=True)
+    server.start()
+    assert port_ready.wait(timeout=2.0), server_err
+    rc = {"v": None}
+
+    def run_client() -> None:
+        rc["v"] = crate_client.main(
+            [
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(port_box["port"]),
+                "--no-camera",
+                "--no-mic",
+                "--log-file",
+                str(tmp_path / "crate-busy-quit.log"),
+            ]
+        )
+
+    client = threading.Thread(target=run_client, name="crate-busy-quit-client", daemon=True)
+    try:
+        client.start()
+        assert started.wait(timeout=3.0), (
+            f"busy backoff did not start: {server_err!r} accepts={len(accepted)}"
+        )
+        crate_client._SHUTDOWN.set()
+        client.join(timeout=2.0)
+        assert not client.is_alive(), f"shutdown did not interrupt busy backoff rc={rc}"
+        assert rc["v"] == 0
+        assert len(accepted) == 1, accepted
+    finally:
+        release.set()
+        crate_client._SHUTDOWN.set()
+        for sock in accepted:
+            try:
+                sock.close()
+            except OSError:
+                pass
+        client.join(timeout=2.0)
+        server.join(timeout=2.0)
+        crate_client._reset_shutdown_state_for_tests()
+        assert not client.is_alive()
+        assert not server.is_alive(), f"fake desktop still running: {server_err!r}"
