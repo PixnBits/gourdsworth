@@ -271,3 +271,251 @@ def test_client_reconnects_after_desktop_drops(crate_client, monkeypatch, tmp_pa
         crate_client._reset_shutdown_state_for_tests()
         assert not client.is_alive()
         assert not server.is_alive(), f"fake desktop still running: {server_err!r}"
+
+
+def _stub_client_side(crate_client, monkeypatch):
+    crate_client._reset_shutdown_state_for_tests()
+    monkeypatch.setattr(crate_client, "_play_local_shutdown", lambda **k: None)
+    monkeypatch.setattr(crate_client, "_stdin_ready", lambda timeout: False)
+    monkeypatch.setattr(crate_client, "_setup_log", lambda path: None)
+    monkeypatch.setattr(crate_client, "_install_signal_handlers", lambda: [])
+    monkeypatch.setattr(crate_client, "_cleanup_devices", lambda **k: True)
+    monkeypatch.setattr(crate_client, "_apply_audio_devices", lambda *a, **k: None)
+
+
+def test_backoff_superseded_returns_when_quit(crate_client, monkeypatch):
+    """Quit during the supersede wait returns before the full backoff."""
+    monkeypatch.setattr(crate_client, "SUPERSEDED_BACKOFF_S", 5.0)
+    monkeypatch.setattr(crate_client, "SUPERSEDED_BACKOFF_JITTER_S", 0.0)
+    monkeypatch.setattr(crate_client, "_stdin_ready", lambda timeout: False)
+    quit_ev = threading.Event()
+
+    def quitter() -> None:
+        time.sleep(0.05)
+        quit_ev.set()
+
+    threading.Thread(target=quitter, daemon=True).start()
+    t0 = time.monotonic()
+    assert crate_client._backoff_superseded(quit_ev) is True
+    assert (time.monotonic() - t0) < 1.0
+
+
+def test_superseded_backs_off_before_reconnect(crate_client, monkeypatch, tmp_path):
+    """A superseded event delays the next TCP connect by the backoff."""
+    from gourdsworth.net import PROTO, send_msg
+
+    _stub_client_side(crate_client, monkeypatch)
+    monkeypatch.setattr(crate_client, "SUPERSEDED_BACKOFF_S", 0.45)
+    monkeypatch.setattr(crate_client, "SUPERSEDED_BACKOFF_JITTER_S", 0.0)
+    started = threading.Event()
+    real_backoff = crate_client._backoff_superseded
+
+    def wrapped(quit_ev):
+        started.set()
+        return real_backoff(quit_ev)
+
+    monkeypatch.setattr(crate_client, "_backoff_superseded", wrapped)
+    second_accepted = threading.Event()
+
+    def wait_trigger(gpio, stop, conn=None):
+        if second_accepted.is_set():
+            return "quit"
+        return "disconnect"
+
+    monkeypatch.setattr(crate_client, "_wait_trigger", wait_trigger)
+
+    port_ready = threading.Event()
+    done = threading.Event()
+    port_box: dict = {}
+    accepted: list = []
+    times: list[float] = []
+    server_err: list[BaseException] = []
+
+    def fake_desktop() -> None:
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            srv.bind(("127.0.0.1", 0))
+            srv.listen(4)
+            srv.settimeout(3.0)
+            port_box["port"] = int(srv.getsockname()[1])
+            port_ready.set()
+            c1, _addr = srv.accept()
+            accepted.append(c1)
+            times.append(time.monotonic())
+            send_msg(c1, {"event": "hello", "role": "desktop", "proto": PROTO})
+            send_msg(c1, {"event": "superseded"})
+            try:
+                c1.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            c1.close()
+            c2, _addr2 = srv.accept()
+            accepted.append(c2)
+            times.append(time.monotonic())
+            second_accepted.set()
+            send_msg(c2, {"event": "hello", "role": "desktop", "proto": PROTO})
+            send_msg(c2, {"event": "ready"})
+            done.wait(timeout=3.0)
+            try:
+                c2.close()
+            except OSError:
+                pass
+        except BaseException as exc:
+            server_err.append(exc)
+        finally:
+            try:
+                srv.close()
+            except OSError:
+                pass
+
+    server = threading.Thread(target=fake_desktop, name="crate-supersede-desktop", daemon=True)
+    server.start()
+    assert port_ready.wait(timeout=2.0), server_err
+    rc = {"v": None}
+
+    def run_client() -> None:
+        rc["v"] = crate_client.main(
+            [
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(port_box["port"]),
+                "--no-camera",
+                "--no-mic",
+                "--log-file",
+                str(tmp_path / "crate-supersede.log"),
+            ]
+        )
+
+    client = threading.Thread(target=run_client, name="crate-supersede-client", daemon=True)
+    try:
+        client.start()
+        assert second_accepted.wait(timeout=3.0), (
+            f"client did not reconnect after backoff: {server_err!r} rc={rc} "
+            f"accepts={len(accepted)} started={started.is_set()}"
+        )
+        assert started.is_set()
+        assert len(times) >= 2
+        assert (times[1] - times[0]) >= 0.35
+        client.join(timeout=3.0)
+        assert not client.is_alive(), f"client still running rc={rc} err={server_err!r}"
+        assert rc["v"] == 0
+    finally:
+        done.set()
+        crate_client._SHUTDOWN.set()
+        for sock in accepted:
+            try:
+                sock.close()
+            except OSError:
+                pass
+        client.join(timeout=2.0)
+        server.join(timeout=2.0)
+        crate_client._reset_shutdown_state_for_tests()
+        assert not client.is_alive()
+        assert not server.is_alive(), f"fake desktop still running: {server_err!r}"
+
+
+def test_shutdown_interrupts_superseded_backoff(crate_client, monkeypatch, tmp_path):
+    """Shutdown during the supersede backoff does not open another connection."""
+    from gourdsworth.net import PROTO, send_msg
+
+    _stub_client_side(crate_client, monkeypatch)
+    monkeypatch.setattr(crate_client, "SUPERSEDED_BACKOFF_S", 2.0)
+    monkeypatch.setattr(crate_client, "SUPERSEDED_BACKOFF_JITTER_S", 0.0)
+    started = threading.Event()
+    real_backoff = crate_client._backoff_superseded
+
+    def wrapped(quit_ev):
+        started.set()
+        return real_backoff(quit_ev)
+
+    monkeypatch.setattr(crate_client, "_backoff_superseded", wrapped)
+
+    port_ready = threading.Event()
+    port_box: dict = {}
+    accepted: list = []
+    server_err: list[BaseException] = []
+    release = threading.Event()
+
+    def fake_desktop() -> None:
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            srv.bind(("127.0.0.1", 0))
+            srv.listen(4)
+            srv.settimeout(0.4)
+            port_box["port"] = int(srv.getsockname()[1])
+            port_ready.set()
+            c1, _addr = srv.accept()
+            accepted.append(c1)
+            send_msg(c1, {"event": "hello", "role": "desktop", "proto": PROTO})
+            send_msg(c1, {"event": "superseded"})
+            try:
+                c1.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            c1.close()
+            # A second accept means the client did not stay in backoff.
+            while not release.is_set():
+                try:
+                    extra, _addr2 = srv.accept()
+                except TimeoutError:
+                    continue
+                accepted.append(extra)
+                try:
+                    extra.close()
+                except OSError:
+                    pass
+                break
+        except BaseException as exc:
+            server_err.append(exc)
+        finally:
+            try:
+                srv.close()
+            except OSError:
+                pass
+
+    server = threading.Thread(target=fake_desktop, name="crate-supersede-quit", daemon=True)
+    server.start()
+    assert port_ready.wait(timeout=2.0), server_err
+    rc = {"v": None}
+
+    def run_client() -> None:
+        rc["v"] = crate_client.main(
+            [
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(port_box["port"]),
+                "--no-camera",
+                "--no-mic",
+                "--log-file",
+                str(tmp_path / "crate-supersede-quit.log"),
+            ]
+        )
+
+    client = threading.Thread(target=run_client, name="crate-supersede-quit-client", daemon=True)
+    try:
+        client.start()
+        assert started.wait(timeout=3.0), (
+            f"backoff did not start: {server_err!r} accepts={len(accepted)}"
+        )
+        crate_client._SHUTDOWN.set()
+        client.join(timeout=2.0)
+        assert not client.is_alive(), f"quit did not interrupt backoff rc={rc} err={server_err!r}"
+        assert rc["v"] == 0
+        assert len(accepted) == 1, accepted
+    finally:
+        release.set()
+        crate_client._SHUTDOWN.set()
+        for sock in accepted:
+            try:
+                sock.close()
+            except OSError:
+                pass
+        client.join(timeout=2.0)
+        server.join(timeout=2.0)
+        crate_client._reset_shutdown_state_for_tests()
+        assert not client.is_alive()
+        assert not server.is_alive(), f"fake desktop still running: {server_err!r}"

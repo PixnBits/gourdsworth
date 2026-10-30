@@ -76,6 +76,7 @@ On a real Pi on the porch LAN:
 #   host: 0.0.0.0
 #   port: 8746
 #   allow_lan: true    # anyone on this LAN can read PCM/JPEG; no TLS
+#   trusted_peers: []  # or CRATE_TRUSTED_PEERS=192.0.2.10,198.51.100.8
 PYTHONPATH=src python clients/pi/crate_client.py --button-pin 17   # host from local.env
 ```
 

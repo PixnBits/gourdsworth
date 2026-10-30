@@ -105,7 +105,10 @@ crate:
   host: 0.0.0.0
   port: 8746
   allow_lan: true   # required; PCM/JPEG then visible to the whole LAN, no TLS
+  trusted_peers: [] # extra IPs that may replace the live session (same IP always may)
 ```
+
+A new TCP connection does not replace the live session until it sends a crate hello (`role` `crate`, `proto` 1) within a few seconds. Anything else is closed and the Mayor stays up. Replacement is allowed for the current peer's IP, or an address listed in `crate.trusted_peers` or the `CRATE_TRUSTED_PEERS` environment variable (comma-separated). Other valid hellos get `{"event":"error","message":"busy"}`. The peer that was replaced receives `{"event":"superseded"}` and the Pi client backs off about 30 seconds before reconnecting, so two clients do not kick each other in a loop. An older Pi that ignores unknown events still reconnects. History is kept for a same-IP or trusted reconnect; a different untrusted peer starts with an empty history. There is still no TLS and no shared secret.
 
 **Protocol smoke** (no Whisper / Ollama / Piper; fake client or the Pi script):
 

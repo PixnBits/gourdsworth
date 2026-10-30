@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import sys
 import time
@@ -15,7 +16,9 @@ from gourdsworth.net import (
     DEFAULT_HOST,
     DEFAULT_PORT,
     CrateListener,
+    carry_history_for_peer,
     is_loopback,
+    parse_trusted_peers,
     resolve_bind,
     serve_echo,
     serve_newest,
@@ -698,10 +701,11 @@ def _run_crate_echo(args) -> int:
         print(f"  bind {host}:{port}  WARNING: LAN bind. PCM/JPEG reachable on this network. No TLS.")
     print("  Ctrl+C to quit")
     try:
-        serve_echo(host, port)
+        code = serve_echo(host, port)
     except KeyboardInterrupt:
         print()
-    return 0
+        return 0
+    return int(code or 0)
 
 
 def _serve_crate(cfg, mayor, stt, speaker, sidecar, canned) -> int:
@@ -731,12 +735,19 @@ def _serve_crate(cfg, mayor, stt, speaker, sidecar, canned) -> int:
     print("  Talk is the Pi button / Enter. Ctrl+C to quit.")
     print()
     listener = CrateListener(host, port)
-    # One history across reconnects — a newer socket replaces the TCP session,
-    # not the conversation.
+    # History survives a same-IP or trusted reconnect. A different untrusted
+    # peer starts empty. The turn cap stays in the turn handler.
     history: list[dict] = []
+    last_peer: dict[str, str | None] = {"ip": None}
+    trusted_cfg = parse_trusted_peers((cfg.get("crate") or {}).get("trusted_peers"))
 
     def _one(conn) -> None:
         peer = conn.peer or ("?", 0)
+        peer_ip = str(getattr(conn, "policy_ip", None) or peer[0])
+        trusted = trusted_cfg | parse_trusted_peers(os.environ.get("CRATE_TRUSTED_PEERS", ""))
+        last_peer["ip"] = carry_history_for_peer(
+            history, peer_ip, last_peer["ip"], trusted
+        )
         print(f"crate connected {peer[0]}:{peer[1]}")
         try:
             _run_crate_session(
@@ -747,19 +758,22 @@ def _serve_crate(cfg, mayor, stt, speaker, sidecar, canned) -> int:
         finally:
             print("crate disconnected")
 
+    code = 0
     try:
-        serve_newest(
+        code = serve_newest(
             listener,
             _one,
             waiting_message="waiting for crate client…",
+            trusted_peers=trusted_cfg,
         )
     except KeyboardInterrupt:
         print()
         line = random.choice(canned["goodnight"])
         print(f"Mayor: {line}")
+        code = 0
     finally:
         listener.close()
-    return 0
+    return int(code or 0)
 
 
 def _run_crate_session(conn, cfg, mayor, stt, speaker, sidecar, canned, history) -> None:

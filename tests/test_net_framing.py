@@ -45,6 +45,7 @@ def test_config_crate_defaults_are_localhost():
     assert crate["port"] == 8746
     assert crate["enabled"] is False
     assert crate["allow_lan"] is False
+    assert crate["trusted_peers"] == []
 
 
 def test_uplink_chunk_size_is_100ms_s16le_16k_mono():
@@ -365,10 +366,11 @@ def test_crate_connection_sets_keepalive_on_server_and_client_sockets():
 
 
 def test_newest_client_wins_while_idle_peer_holds_session(monkeypatch):
-    """Client B is served while idle A never sends; A then sees EOF/reset.
+    """Client B's valid same-IP hello is served while idle A holds the session.
 
-    Timeouts are short so this fails fast on a one-at-a-time accept loop
-    (restore dfac1a8 net.py) instead of hanging.
+    A also sends a crate hello (required before anyone is served) and then
+    stays quiet. Timeouts are short so this fails fast on a one-at-a-time
+    accept loop (restore dfac1a8 net.py) instead of hanging.
     """
     from gourdsworth import net as netmod
 
@@ -402,7 +404,8 @@ def test_newest_client_wins_while_idle_peer_holds_session(monkeypatch):
     try:
         client_a = socket.create_connection(("127.0.0.1", port), timeout=2)
         client_a.settimeout(2)
-        # A is served when the echo session writes hello. Do not send or close.
+        # A is served only after a valid crate hello. Then it stays idle.
+        send_msg(client_a, {"event": "hello", "role": "crate", "proto": PROTO})
         first = client_a.recv(1)
         assert first, "idle client A was never served hello"
 

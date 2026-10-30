@@ -45,6 +45,9 @@ DEFAULTS = {
         "host": "127.0.0.1",
         "port": 8746,
         "allow_lan": False,
+        # IPs that may replace a live session besides the current peer.
+        # Also read from the CRATE_TRUSTED_PEERS environment variable.
+        "trusted_peers": [],
     },
 }
 

@@ -45,6 +45,12 @@ crate:
   host: 127.0.0.1         # loopback. Do not use 0.0.0.0 unless allow_lan
   port: 8746
   allow_lan: false        # required to bind a LAN address or 0.0.0.0
+  # Who may replace a live crate session, besides the current peer IP.
+  # A list or a comma-separated string. Empty means same-IP only.
+  # The CRATE_TRUSTED_PEERS environment variable (comma-separated IPs) is
+  # added to this list. Example documentation addresses only:
+  # trusted_peers: [192.0.2.10, 198.51.100.8]
+  trusted_peers: []
 
 # Opt-in local CLIP still (issue #19 V0). Voice works without this.
 # pip install -e '.[vision]'  then  python -m gourdsworth --snap

@@ -5,7 +5,7 @@ microphone PCM, optional JPEG stills, and button events; it receives TTS
 PCM and gesture names. Children's PCM, JPEG, and transcripts stay in RAM
 and are dropped after the turn. Nothing is written to disk.
 
-Wire format (one TCP connection; a newer client replaces the active session)
+Wire format (one TCP connection; a validated same-IP or trusted client may replace the session)
 ------------------------------------------------------
 Control is JSON lines. A binary blob (PCM or JPEG) is length-prefixed by
 the JSON line's ``n`` field, then that many raw bytes with **no** extra
@@ -47,7 +47,8 @@ Control JSON (no payload)
     {"event":"gesture","name":"tip"|"beam"|"reckon"|"chuckle"|"attend"|"twirl"}
     {"event":"play_done"}
     {"event":"bye"}
-    {"event":"error","message":"..."}
+    {"event":"error","message":"..."}       # "busy" = valid hello refused (other peer or rate limit)
+    {"event":"superseded"}                  # desktop → previous crate; that client should back off
     {"event":"telemetry","cpu_temp_c":47.1}
         # Pi → desktop, lightweight porch health. Optional; omitted fields mean
         # unknown. Cached on CrateConnection.latest_telemetry; does not enter
@@ -56,19 +57,25 @@ Control JSON (no payload)
 
 Default bind is 127.0.0.1. Binding a LAN address or 0.0.0.0 requires
 ``crate.allow_lan: true`` — anyone on that network could then read kids'
-PCM/JPEG. There is no TLS and no auth.
+PCM/JPEG. There is no TLS and no auth. A live session is replaced only
+after a valid crate hello, and only by the same peer IP or an address in
+``crate.trusted_peers`` / ``CRATE_TRUSTED_PEERS``.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
+import errno
 import json
+import os
 import queue
 import socket
+import sys
 import threading
 import time
 from collections import deque
+from collections.abc import Callable
 from typing import Any
 
 PROTO = 1
@@ -97,14 +104,38 @@ _RECV_TIMEOUT_S = 0.4
 # is still open. The desktop serves one Pi; see serve_newest.
 LISTEN_BACKLOG = 4
 
-# Dead-peer probes. An idle black hole is aborted after
-# TCP_KEEPIDLE_S + TCP_KEEPCNT * TCP_KEEPINTVL_S seconds (25s).
-# TCP_USER_TIMEOUT_MS covers data that stays unacked: keepalive probes are
-# not sent while transmit data is outstanding.
+# Dead-peer probes. With TCP_USER_TIMEOUT set, Linux aborts the socket at
+# about 30s (TCP_USER_TIMEOUT governs), including an idle black hole.
+# Keepalive still starts probes after TCP_KEEPIDLE_S; it does not cut the
+# connection at KEEPIDLE + KEEPCNT*KEEPINTVL while user-timeout is set.
 TCP_KEEPIDLE_S = 10
 TCP_KEEPINTVL_S = 5
 TCP_KEEPCNT = 3
 TCP_USER_TIMEOUT_MS = 30_000
+
+# A newcomer must send a crate hello before it can be served or replace anyone.
+HELLO_DEADLINE_S = 3.0
+# At most one replacement of an active session per IP per this interval.
+REPLACE_MIN_INTERVAL_S = 5.0
+# Connects per IP before a hello thread is started. Excess sockets are closed.
+CONNECT_RATE_MAX = 8
+CONNECT_RATE_WINDOW_S = 10.0
+# Pause after a transient accept() error so a brief EMFILE does not spin.
+ACCEPT_RETRY_S = 0.2
+# Best-effort write of superseded / busy. Never block the hello thread on it.
+SUPERSEDE_SEND_TIMEOUT_S = 0.5
+
+_TRANSIENT_ACCEPT_ERRNOS = frozenset(
+    {
+        errno.ECONNABORTED,
+        errno.EMFILE,
+        errno.ENFILE,
+        errno.EINTR,
+    }
+)
+
+_sockopt_warn_lock = threading.Lock()
+_sockopt_warned = False
 
 
 def parse_thermal_sysfs_temp(raw: str | bytes | None) -> float | None:
@@ -134,24 +165,40 @@ def is_loopback(host: str) -> bool:
     return (host or "").strip().lower() in LOOPBACK_HOSTS
 
 
+def _warn_sockopt_once(name: str, exc: OSError) -> None:
+    """Log the first socket-option failure in this process. Later ones stay quiet."""
+    global _sockopt_warned
+    with _sockopt_warn_lock:
+        if _sockopt_warned:
+            return
+        _sockopt_warned = True
+    print(
+        f"warning: crate socket option {name} failed to set ({exc}); "
+        "dead-peer detection may fall back to kernel defaults",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
 def _setsockopt_if(sock: socket.socket, level: int, name: str, value: int) -> None:
-    """Set a socket option when this platform defines it. Ignore OSError."""
+    """Set a socket option when this platform defines it. Warn once on OSError."""
     opt = getattr(socket, name, None)
     if opt is None:
         return
     try:
         sock.setsockopt(level, opt, int(value))
-    except OSError:
-        pass
+    except OSError as exc:
+        _warn_sockopt_once(name, exc)
 
 
 def enable_tcp_keepalive(sock: socket.socket) -> None:
-    """Bound dead-peer detection to about 25–30s without an app read timeout.
+    """Bound dead-peer detection to about 30s without an app read timeout.
 
-    Idle connection (nothing unacked): the kernel starts probes after
-    TCP_KEEPIDLE_S and drops the socket after TCP_KEEPCNT failures spaced
-    TCP_KEEPINTVL_S apart — about 25s. If payload is stuck unacked, keepalive
-    does not run; TCP_USER_TIMEOUT_MS (30s) forces ETIMEDOUT instead.
+    With TCP_USER_TIMEOUT set, Linux aborts the connection at about 30s
+    (TCP_USER_TIMEOUT governs). Keepalive probes start after TCP_KEEPIDLE_S.
+    They do not drop the socket at KEEPIDLE + KEEPCNT*KEEPINTVL while
+    user-timeout is set. If payload stays unacked, user-timeout also forces
+    ETIMEDOUT.
 
     No application heartbeat. PTT can sit with no button forever, and the
     desktop sends nothing during that idle. The Pi's telemetry event is
@@ -166,8 +213,8 @@ def enable_tcp_keepalive(sock: socket.socket) -> None:
     """
     try:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-    except OSError:
-        pass
+    except OSError as exc:
+        _warn_sockopt_once("SO_KEEPALIVE", exc)
     _setsockopt_if(sock, socket.IPPROTO_TCP, "TCP_KEEPIDLE", TCP_KEEPIDLE_S)
     _setsockopt_if(sock, socket.IPPROTO_TCP, "TCP_KEEPINTVL", TCP_KEEPINTVL_S)
     _setsockopt_if(sock, socket.IPPROTO_TCP, "TCP_KEEPCNT", TCP_KEEPCNT)
@@ -187,6 +234,39 @@ def resolve_bind(host: str | None, allow_lan: bool) -> str:
             "network; there is no TLS and no auth)."
         )
     return host
+
+
+def parse_trusted_peers(value: Any) -> frozenset[str]:
+    """Parse ``crate.trusted_peers`` (list or comma string) or ``CRATE_TRUSTED_PEERS``."""
+    if isinstance(value, str):
+        parts = value.split(",")
+    elif isinstance(value, (list, tuple, set)):
+        parts = []
+        for item in value:
+            if isinstance(item, str):
+                parts.extend(item.split(","))
+    else:
+        return frozenset()
+    return frozenset(part.strip() for part in parts if part and part.strip())
+
+
+def carry_history_for_peer(
+    history: list,
+    peer_ip: str,
+    previous_ip: str | None,
+    trusted: set[str] | frozenset[str],
+) -> str:
+    """Keep history for the same IP or a trusted peer. Clear it for anyone else.
+
+    ``previous_ip`` is None until the first served session records a peer.
+    Returns ``peer_ip`` so the caller can store it for the next session.
+    The turn cap stays with the caller.
+    """
+    prev = (previous_ip or "").strip()
+    ip = (peer_ip or "").strip()
+    if prev and ip != prev and ip not in trusted:
+        history.clear()
+    return ip
 
 
 def encode_header(header: dict[str, Any], payload: bytes | None = None) -> bytes:
@@ -351,19 +431,28 @@ def _rms(frame) -> float:
 class CrateConnection:
     """One accepted (or outbound) crate TCP socket with a recv thread."""
 
-    def __init__(self, sock: socket.socket, peer: tuple[str, int] | None = None):
+    def __init__(
+        self,
+        sock: socket.socket,
+        peer: tuple[str, int] | None = None,
+        *,
+        recv_prebuffer: bytes = b"",
+        primed: tuple[dict[str, Any], bytes | None] | None = None,
+    ):
         self.sock = sock
         self.peer = peer
+        # IP used for replace / history decisions. A test hook may overwrite it.
+        self.policy_ip = peer[0] if peer else ""
         try:
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        except OSError:
-            pass
+        except OSError as exc:
+            _warn_sockopt_once("TCP_NODELAY", exc)
         # Server accept and the Pi outbound socket both construct this class.
         enable_tcp_keepalive(sock)
         sock.settimeout(_RECV_TIMEOUT_S)
         self._send_lock = threading.Lock()
         self._closed = threading.Event()
-        # Set by serve_newest when a later accept replaces this socket.
+        # Set when a later validated client replaces this socket.
         # An attribute on the object, not id(), so a recycled id cannot
         # mark a different connection as superseded.
         self.superseded = False
@@ -379,6 +468,10 @@ class CrateConnection:
         self._button_up = threading.Event()
         self._cv = threading.Condition()
         self._events: deque[tuple[dict[str, Any], bytes | None]] = deque()
+        # Bytes already read with the hello, so the recv thread does not lose them.
+        self._recv_prebuffer = bytes(recv_prebuffer)
+        if primed is not None:
+            self._push_event(primed[0], primed[1])
         self._thread = threading.Thread(
             target=self._recv_loop, name="gourdsworth-crate-recv", daemon=True
         )
@@ -406,6 +499,32 @@ class CrateConnection:
             pass
         with self._cv:
             self._cv.notify_all()
+
+    def wake_superseded(self) -> None:
+        """Mark this session replaced and wake its thread. Do not close the socket.
+
+        The hello thread calls this. The session thread's ``finally`` calls
+        ``close()``. Sending ``superseded`` is best-effort and must not block
+        if the session thread holds the send lock.
+        """
+        self.superseded = True
+        try:
+            self.sock.settimeout(SUPERSEDE_SEND_TIMEOUT_S)
+        except OSError:
+            pass
+        acquired = self._send_lock.acquire(timeout=SUPERSEDE_SEND_TIMEOUT_S)
+        if acquired:
+            try:
+                if not self._closed.is_set():
+                    send_msg(self.sock, {"event": "superseded"})
+            except OSError:
+                pass
+            finally:
+                self._send_lock.release()
+        try:
+            self.sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
 
     def wait_event(
         self, name: str, timeout: float | None = None
@@ -668,7 +787,7 @@ class CrateConnection:
         self._push_event(header, payload)
 
     def _recv_loop(self) -> None:
-        buf = bytearray()
+        buf = bytearray(self._recv_prebuffer)
         try:
             while not self._closed.is_set():
                 try:
@@ -684,12 +803,16 @@ class CrateConnection:
                 self._cv.notify_all()
 
 
+class ListenerClosed(OSError):
+    """accept() returned because the listener was closed. Clean shutdown."""
+
+
 class CrateListener:
     """TCP listener. Default bind is loopback.
 
     Backlog is LISTEN_BACKLOG so a new handshake can finish while an old
     socket is still in the session. ``serve_newest`` keeps accepting and
-    serves only the newest client.
+    serves a client only after a valid crate hello.
     """
 
     def __init__(self, host: str, port: int):
@@ -701,14 +824,22 @@ class CrateListener:
         self.host, self.port = self._sock.getsockname()[:2]
         self._closed = False
 
-    def accept(self) -> CrateConnection:
+    def accept_socket(self) -> tuple[socket.socket, tuple]:
+        """Return the next TCP socket. Does not start a crate session."""
         while not self._closed:
             try:
-                sock, addr = self._sock.accept()
+                return self._sock.accept()
             except socket.timeout:
                 continue
-            return CrateConnection(sock, peer=addr)
-        raise OSError("crate listener closed")
+            except OSError as exc:
+                if self._closed:
+                    raise ListenerClosed("crate listener closed") from exc
+                raise
+        raise ListenerClosed("crate listener closed")
+
+    def accept(self) -> CrateConnection:
+        sock, addr = self.accept_socket()
+        return CrateConnection(sock, peer=addr)
 
     def close(self) -> None:
         self._closed = True
@@ -755,22 +886,84 @@ def _peer_text(conn: CrateConnection) -> str:
     return f"{peer[0]}:{peer[1]}"
 
 
-class _NewestAccept:
-    """Accept on a side thread and keep only the newest CrateConnection.
+def _valid_crate_hello(header: dict[str, Any]) -> bool:
+    return (
+        header.get("event") == "hello"
+        and header.get("role") == "crate"
+        and header.get("proto") == PROTO
+    )
 
-    Closing the previous connection unblocks that session's waits and sends
-    so the caller can move on to the socket just accepted. The accept thread
-    is a daemon and is joined from close() so Ctrl+C / listener.close() does
-    not leave it running.
+
+def _read_crate_hello(sock: socket.socket) -> tuple[dict[str, Any], bytes] | None:
+    """Read one crate hello, or None on timeout, close, garbage, or a bad role/proto.
+
+    ``HELLO_DEADLINE_S`` is read when this runs so tests can shorten it.
+    Leftover bytes after the hello line are returned for the recv thread.
+    """
+    try:
+        sock.settimeout(HELLO_DEADLINE_S)
+    except OSError:
+        return None
+    buf = bytearray()
+    try:
+        header, payload = recv_msg(sock, buf)
+    except (TimeoutError, ConnectionError, OSError, ValueError):
+        return None
+    if payload or not isinstance(header, dict) or not _valid_crate_hello(header):
+        return None
+    return header, bytes(buf)
+
+
+def _close_socket(sock: socket.socket) -> None:
+    try:
+        sock.close()
+    except OSError:
+        pass
+
+
+def _send_busy(sock: socket.socket) -> None:
+    try:
+        sock.settimeout(SUPERSEDE_SEND_TIMEOUT_S)
+        send_msg(sock, {"event": "error", "message": "busy"})
+    except OSError:
+        pass
+
+
+def _log_accept_oserror(exc: OSError, *, fatal: bool) -> None:
+    kind = "fatal" if fatal else "transient"
+    print(f"crate accept {kind} error: {exc}", file=sys.stderr, flush=True)
+
+
+class _NewestAccept:
+    """Accept on a side thread. Only a validated crate hello can be served.
+
+    The accept loop never blocks on a newcomer: each socket is handed to a
+    short-lived thread that reads the hello. A live session is replaced only
+    for the same policy IP or a trusted peer, and at most once per
+    ``REPLACE_MIN_INTERVAL_S`` for that IP. The hello thread wakes the old
+    session with shutdown(); that session's thread is the one that close()s.
     """
 
-    def __init__(self, listener: CrateListener):
+    def __init__(
+        self,
+        listener: CrateListener,
+        *,
+        peer_ip: Callable[..., str] | None = None,
+        trusted_peers: Any = None,
+    ):
         self._listener = listener
+        self._peer_ip = peer_ip
+        self._trusted_config = parse_trusted_peers(trusted_peers)
         self._cv = threading.Condition()
         self._stop = threading.Event()
         self._pending: CrateConnection | None = None
         self._current: CrateConnection | None = None
         self._active = False
+        self._connects: dict[str, deque[float]] = {}
+        self._replaced_at: dict[str, float] = {}
+        self._vet_socks: set[socket.socket] = set()
+        self._vetters: set[threading.Thread] = set()
+        self.exit_code = 0
         self._thread = threading.Thread(
             target=self._accept_loop,
             name="gourdsworth-crate-accept",
@@ -802,6 +995,13 @@ class _NewestAccept:
     def was_superseded(self, conn: CrateConnection) -> bool:
         return bool(getattr(conn, "superseded", False))
 
+    def note_session_ended(self, conn: CrateConnection) -> None:
+        """The session thread has left ``session_fn``. A new hello is not a replace."""
+        with self._cv:
+            if self._current is conn:
+                self._current = None
+                self._active = False
+
     def close(self) -> None:
         self._stop.set()
         self._listener.close()
@@ -811,64 +1011,193 @@ class _NewestAccept:
                 victims.append(self._current)
             if self._pending is not None and self._pending is not self._current:
                 victims.append(self._pending)
+            socks = list(self._vet_socks)
+            vetters = [item for item in self._vetters if item is not threading.current_thread()]
             self._current = None
             self._pending = None
             self._active = False
             self._cv.notify_all()
+        for sock in socks:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            _close_socket(sock)
+        # Caller is the serve_newest thread, which owns these sessions.
         for conn in victims:
             conn.close()
         thread = self._thread
         if thread.is_alive() and threading.current_thread() is not thread:
             thread.join(timeout=2.0)
+        for item in vetters:
+            item.join(timeout=1.0)
+
+    def _allow_connect(self, ip: str) -> bool:
+        now = time.monotonic()
+        window = CONNECT_RATE_WINDOW_S
+        limit = CONNECT_RATE_MAX
+        if len(self._connects) > 256:
+            stale = [
+                key
+                for key, bucket in self._connects.items()
+                if not bucket or now - bucket[-1] > window
+            ]
+            for key in stale:
+                self._connects.pop(key, None)
+        bucket = self._connects.setdefault(ip, deque())
+        while bucket and now - bucket[0] > window:
+            bucket.popleft()
+        if len(bucket) >= limit:
+            return False
+        bucket.append(now)
+        return True
+
+    def _trusted(self) -> frozenset[str]:
+        return self._trusted_config | parse_trusted_peers(
+            os.environ.get("CRATE_TRUSTED_PEERS", "")
+        )
+
+    def _policy_ip(self, addr: tuple) -> str:
+        if self._peer_ip is None:
+            return str(addr[0])
+        return str(self._peer_ip(addr)).strip()
+
+    def _replacement_ok_locked(self, ip: str) -> bool:
+        last = self._replaced_at.get(ip)
+        if last is None:
+            return True
+        return (time.monotonic() - last) >= REPLACE_MIN_INTERVAL_S
 
     def _accept_loop(self) -> None:
         try:
             while not self._stop.is_set():
                 try:
-                    conn = self._listener.accept()
-                except OSError:
+                    sock, addr = self._listener.accept_socket()
+                except ListenerClosed:
                     break
-                replaced: list[CrateConnection] = []
-                with self._cv:
-                    if self._stop.is_set():
-                        conn.close()
+                except OSError as exc:
+                    if self._stop.is_set() or self._listener._closed:
                         break
-                    replaced = self._swap_in_locked(conn)
-                    self._cv.notify_all()
-                self._close_replaced(conn, replaced)
+                    if exc.errno in _TRANSIENT_ACCEPT_ERRNOS:
+                        _log_accept_oserror(exc, fatal=False)
+                        if self._stop.wait(ACCEPT_RETRY_S):
+                            break
+                        continue
+                    _log_accept_oserror(exc, fatal=True)
+                    with self._cv:
+                        self.exit_code = 1
+                        self._stop.set()
+                        self._cv.notify_all()
+                    break
+                try:
+                    ip = self._policy_ip(addr)
+                except Exception:
+                    _close_socket(sock)
+                    continue
+                if not ip or not self._allow_connect(ip):
+                    _close_socket(sock)
+                    continue
+                self._spawn_vet(sock, addr, ip)
         finally:
-            victims: list[CrateConnection] = []
             with self._cv:
                 self._stop.set()
-                if self._current is not None:
-                    victims.append(self._current)
-                if self._pending is not None and self._pending is not self._current:
-                    victims.append(self._pending)
                 self._cv.notify_all()
-            for item in victims:
-                item.close()
 
-    def _swap_in_locked(self, conn: CrateConnection) -> list[CrateConnection]:
-        old: list[CrateConnection] = []
-        if self._pending is not None:
-            old.append(self._pending)
-        if self._active and self._current is not None and self._current not in old:
-            old.append(self._current)
-        self._pending = conn
-        for item in old:
-            item.superseded = True
-        return old
-
-    def _close_replaced(self, new: CrateConnection, old: list[CrateConnection]) -> None:
-        if not old:
-            return
-        old_text = ", ".join(_peer_text(item) for item in old)
-        print(
-            f"crate session replaced: closing {old_text} for newer client {_peer_text(new)}",
-            flush=True,
+    def _spawn_vet(self, sock: socket.socket, addr: tuple, ip: str) -> None:
+        thread = threading.Thread(
+            target=self._vet,
+            args=(sock, addr, ip),
+            name="gourdsworth-crate-hello",
+            daemon=True,
         )
-        for item in old:
-            item.close()
+        with self._cv:
+            self._vetters.add(thread)
+            self._vet_socks.add(sock)
+        thread.start()
+
+    def _vet(self, sock: socket.socket, addr: tuple, ip: str) -> None:
+        conn: CrateConnection | None = None
+        try:
+            got = _read_crate_hello(sock)
+            if got is None:
+                _close_socket(sock)
+                return
+            header, leftover = got
+            with self._cv:
+                self._vet_socks.discard(sock)
+            conn = CrateConnection(
+                sock,
+                peer=addr,
+                recv_prebuffer=leftover,
+                primed=(header, None),
+            )
+            conn.policy_ip = ip
+            decision = "drop"
+            old_active: CrateConnection | None = None
+            old_pending: CrateConnection | None = None
+            with self._cv:
+                if not self._stop.is_set():
+                    decision, old_active, old_pending = self._claim_locked(conn, ip)
+            if decision != "serve":
+                if decision == "busy":
+                    _send_busy(sock)
+                conn.close()
+                conn = None
+                return
+            self._finish_replace(conn, old_active, old_pending)
+        except Exception:
+            if conn is not None:
+                conn.close()
+            else:
+                _close_socket(sock)
+        finally:
+            with self._cv:
+                self._vetters.discard(threading.current_thread())
+                self._vet_socks.discard(sock)
+
+    def _claim_locked(
+        self, conn: CrateConnection, ip: str
+    ) -> tuple[str, CrateConnection | None, CrateConnection | None]:
+        if self._active and self._current is not None:
+            cur_ip = str(getattr(self._current, "policy_ip", "") or "")
+            if ip != cur_ip and ip not in self._trusted():
+                return "busy", None, None
+            if not self._replacement_ok_locked(ip):
+                return "busy", None, None
+            old_active = self._current
+            old_pending = self._pending
+            self._pending = conn
+            self._replaced_at[ip] = time.monotonic()
+            self._cv.notify_all()
+            return "serve", old_active, old_pending
+        old_pending = self._pending
+        self._pending = conn
+        self._cv.notify_all()
+        return "serve", None, old_pending
+
+    def _finish_replace(
+        self,
+        conn: CrateConnection,
+        old_active: CrateConnection | None,
+        old_pending: CrateConnection | None,
+    ) -> None:
+        # One old peer in the log. The live session wins over a not-yet-served socket.
+        logged = old_active if old_active is not None else old_pending
+        if logged is not None and logged is not conn:
+            print(
+                f"crate session replaced: closing {_peer_text(logged)} "
+                f"for newer client {_peer_text(conn)}",
+                flush=True,
+            )
+        if old_active is not None and old_active is not conn:
+            old_active.wake_superseded()
+        if (
+            old_pending is not None
+            and old_pending is not old_active
+            and old_pending is not conn
+        ):
+            # Never handed to session_fn, so no session thread will close it.
+            old_pending.close()
 
 
 def serve_newest(
@@ -877,38 +1206,56 @@ def serve_newest(
     *,
     oneshot: bool = False,
     waiting_message: str | None = None,
-) -> None:
-    """Run ``session_fn(conn)`` for each client. The newest connection wins.
+    peer_ip: Callable[..., str] | None = None,
+    trusted_peers: Any = None,
+) -> int:
+    """Run ``session_fn(conn)`` for each validated crate client.
 
-    The accept thread keeps calling accept while a session is active. When a
-    new client arrives, the previous CrateConnection is closed so in-flight
-    waits and sends end and ``session_fn`` returns. The next call then serves
-    the new socket. State that must survive a reconnect (conversation
-    history) belongs in the closure around ``session_fn``, not in here.
+    A bare connect does not replace anyone. After a valid hello, the client
+    is served if no session is active. An active session is replaced only
+    when the newcomer's policy IP matches the current peer or is trusted,
+    and only once per ``REPLACE_MIN_INTERVAL_S`` for that IP. The hello
+    thread wakes the old socket; this thread's ``finally`` close()s it.
 
-    ``listener.close()`` or Ctrl+C makes ``take`` return and joins the accept
-    thread. ``oneshot`` stops after a session that was not replaced.
+    ``peer_ip`` optionally maps the accepted sockaddr to the IP used for
+    those checks (loopback tests simulate another host). Conversation history
+    belongs in the closure around ``session_fn``; use ``carry_history_for_peer``
+    so a different untrusted peer starts empty.
+
+    Returns 0, or 1 if ``accept()`` fails with a non-transient OSError.
+    ``listener.close()`` or Ctrl+C makes ``take`` return. ``oneshot`` stops
+    after a session that was not replaced.
     """
-    gate = _NewestAccept(listener)
+    gate = _NewestAccept(listener, peer_ip=peer_ip, trusted_peers=trusted_peers)
     try:
         while True:
             conn = gate.take(waiting_message)
             if conn is None:
-                return
+                return gate.exit_code
             try:
                 session_fn(conn)
             except (ConnectionError, OSError):
                 # Replaced or dropped peer: serve the pending socket next.
                 pass
             finally:
+                # Drop "active" before close so a fast reconnect is a new
+                # session, not a replacement of one that already returned.
+                gate.note_session_ended(conn)
                 conn.close()
             if oneshot and not gate.was_superseded(conn):
-                return
+                return gate.exit_code
     finally:
         gate.close()
 
 
-def serve_echo(host: str, port: int, *, oneshot: bool = False) -> None:
+def serve_echo(
+    host: str,
+    port: int,
+    *,
+    oneshot: bool = False,
+    peer_ip: Callable[..., str] | None = None,
+    trusted_peers: Any = None,
+) -> int:
     listener = CrateListener(host, port)
     print(f"  crate echo listening on {listener.host}:{listener.port}")
 
@@ -923,11 +1270,13 @@ def serve_echo(host: str, port: int, *, oneshot: bool = False) -> None:
             print("  crate disconnected")
 
     try:
-        serve_newest(
+        return serve_newest(
             listener,
             _one,
             oneshot=oneshot,
             waiting_message="  waiting for crate client…",
+            peer_ip=peer_ip,
+            trusted_peers=trusted_peers,
         )
     finally:
         listener.close()

@@ -777,6 +777,33 @@ def _play_local_shutdown(*, kind: str = "disconnect") -> None:
 
 
 
+# After {"event":"superseded"}, wait before reconnecting so two crate clients
+# do not replace each other in a loop. Jitter spreads them if both back off.
+SUPERSEDED_BACKOFF_S = 30.0
+SUPERSEDED_BACKOFF_JITTER_S = 5.0
+
+
+def _backoff_superseded(quit_ev: threading.Event) -> bool:
+    """Wait out a supersede. Return True if quit or shutdown interrupted it."""
+    delay = float(SUPERSEDED_BACKOFF_S) + random.uniform(
+        0.0, max(0.0, float(SUPERSEDED_BACKOFF_JITTER_S))
+    )
+    deadline = time.monotonic() + max(0.0, delay)
+    while True:
+        if quit_ev.is_set() or _SHUTDOWN.is_set():
+            return True
+        if _stdin_ready(0):
+            line = sys.stdin.readline()
+            if not line or line.strip().lower() in {"q", "quit", "exit"}:
+                quit_ev.set()
+                return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        if quit_ev.wait(timeout=min(0.2, remaining)):
+            return True
+
+
 def _wait_for_desktop(
     host: str,
     port: int,
@@ -962,10 +989,14 @@ def _pump(
     end_talk: threading.Event,
     stop: threading.Event,
     pause_mic: threading.Event | None = None,
+    superseded: threading.Event | None = None,
 ) -> None:
-    while not stop.is_set() and not conn.closed:
+    # Drain queued events even after stop/close so "superseded" is not lost.
+    while True:
         item = conn.wait_any(timeout=0.2)
         if item is None:
+            if conn.closed or stop.is_set():
+                break
             continue
         header, payload = item
         ev = header.get("event")
@@ -1002,7 +1033,13 @@ def _pump(
             pass
         elif ev == "error":
             print(f"  desktop error: {header.get('message')}")
-        # payload dropped here — never written
+        elif ev == "superseded":
+            # Newer same-IP or trusted client took the session. Main backs off.
+            if superseded is not None:
+                superseded.set()
+            print("  desktop superseded this session")
+            break
+        # payload dropped here — never written. Unknown events are ignored.
 
 
 def _wait_ready(ready: threading.Event, conn: CrateConnection, timeout: float) -> bool:
@@ -1013,7 +1050,7 @@ def _wait_ready(ready: threading.Event, conn: CrateConnection, timeout: float) -
     session return "disconnect" in well under a second instead of sitting
     out the full ready timeout. There is no app-level heartbeat: idle PTT
     and older peers may send nothing, and kernel keepalive already bounds
-    a black hole to about 25–30s.
+    a black hole to about 30s (TCP_USER_TIMEOUT governs).
     """
     deadline = time.monotonic() + max(0.0, float(timeout))
     while True:
@@ -1404,6 +1441,10 @@ def main(argv: list[str] | None = None) -> int:
         print("  LAN mode: PCM/JPEG cross the house network, not the internet. No TLS.")
     gpio = _try_gpio(args.button_pin)
     quit_ev = threading.Event()
+    # Set from the session finally when the desktop sends {"event":"superseded"}.
+    # The session function itself returns "disconnect"; the reconnect loop
+    # turns that into a backoff. No return-in-finally (Python warns on it).
+    superseded_box = {"hit": False}
 
     def _run_connected_session(conn: CrateConnection) -> str:
         """Run one desktop session. Returns 'goodbye' (stop client) or 'disconnect' (retry)."""
@@ -1412,9 +1453,10 @@ def main(argv: list[str] | None = None) -> int:
         end_talk = threading.Event()
         pause_mic = threading.Event()
         shutdown_played = False
+        superseded = threading.Event()
         pump = threading.Thread(
             target=_pump,
-            args=(conn, ready, end_talk, stop, pause_mic),
+            args=(conn, ready, end_talk, stop, pause_mic, superseded),
             name="crate-pump",
             daemon=True,
         )
@@ -1456,6 +1498,7 @@ def main(argv: list[str] | None = None) -> int:
                 pause_mic.clear()
                 if args.no_mic:
                     print("  (--no-mic set; continuous needs a mic)")
+                    exit_kind = "goodbye"
                     return "goodbye"
                 conn.send({"event": "button", "state": "down"})
                 uplink = threading.Thread(
@@ -1517,6 +1560,7 @@ def main(argv: list[str] | None = None) -> int:
                         pass
                     _play_local_shutdown(kind="goodbye")
                     shutdown_played = True
+                    exit_kind = "goodbye"
                     return "goodbye"
                 _talk(
                     conn,
@@ -1537,6 +1581,7 @@ def main(argv: list[str] | None = None) -> int:
             return "disconnect"
         except (KeyboardInterrupt, ConnectionError, OSError) as exc:
             kind = "goodbye" if isinstance(exc, KeyboardInterrupt) else "disconnect"
+            exit_kind = kind
             if isinstance(exc, KeyboardInterrupt):
                 quit_ev.set()
             elif not isinstance(exc, KeyboardInterrupt):
@@ -1552,6 +1597,8 @@ def main(argv: list[str] | None = None) -> int:
         finally:
             stop.set()
             pause_mic.set()
+            # Join before close so a queued "superseded" is observed.
+            pump.join(timeout=1.0)
             if _SHUTDOWN.is_set():
                 try:
                     conn.send({"event": "bye"})
@@ -1570,8 +1617,8 @@ def main(argv: list[str] | None = None) -> int:
                 except Exception:
                     pass
                 uplink.join(timeout=1.5)
-            if _SHUTDOWN.is_set():
-                pump.join(timeout=1.0)
+            if superseded.is_set():
+                superseded_box["hit"] = True
 
     try:
         announce_now = True
@@ -1588,7 +1635,10 @@ def main(argv: list[str] | None = None) -> int:
             # dead desktop errors the recv thread and closed becomes true.
             conn = CrateConnection(sock)
             try:
+                superseded_box["hit"] = False
                 reason = _run_connected_session(conn)
+                if reason != "goodbye" and superseded_box["hit"]:
+                    reason = "superseded"
             except (KeyboardInterrupt, ConnectionError, OSError) as exc:
                 if isinstance(exc, KeyboardInterrupt):
                     quit_ev.set()
@@ -1596,8 +1646,15 @@ def main(argv: list[str] | None = None) -> int:
                     break
                 print(f"disconnected: {exc}")
                 reason = "disconnect"
-            if reason == "goodbye" or quit_ev.is_set():
+            if reason == "goodbye" or quit_ev.is_set() or _SHUTDOWN.is_set():
                 break
+            if reason == "superseded":
+                print("  another crate client took this session; backing off")
+                _play_local_shutdown(kind="disconnect")
+                announce_now = False
+                if _backoff_superseded(quit_ev):
+                    break
+                continue
             # Desktop dropped or never became ready — announce, then wait again.
             print("  desktop gone; will retry when it returns")
             _play_local_shutdown(kind="disconnect")
