@@ -285,10 +285,10 @@ def _install_signal_handlers() -> list[int]:
 def _cleanup_devices(*, force: bool = False, camera_wait_s: float = 2.0) -> bool:
     """Stop PortAudio, pw-play, and the camera. Idempotent; never raises.
 
-    Does not take ``_AUDIO_LOCK``. In-flight TTS is cancelled with ``sd.stop``
-    or by killing the pw-play process group. The uplink thread may still be
-    inside ``sd.wait()``. The camera lock, once acquired, is held so a snap
-    cannot open a new device.
+    Does not take ``_AUDIO_LOCK``. In-flight TTS and a shutdown chime are
+    cancelled with ``sd.stop`` or by killing their pw-play process groups.
+    The uplink thread may still be inside ``sd.wait()``. The camera lock,
+    once acquired, is held so a snap cannot open a new device.
     """
     global _CLEANUP_DONE
     if not _CLEANUP_LOCK.acquire(blocking=False):
@@ -331,20 +331,17 @@ def _cleanup_devices(*, force: bool = False, camera_wait_s: float = 2.0) -> bool
 
 def _reset_shutdown_state_for_tests() -> None:
     """Reset signal-shutdown flags so unit tests do not leak into each other."""
-    global _SHUTDOWN_SIGNAL, _CLEANUP_DONE, _PW_PLAY_PROC, _SESSION_HAD_TRAFFIC
+    global _SHUTDOWN_SIGNAL, _CLEANUP_DONE, _SESSION_HAD_TRAFFIC
     global _UPLINK_STREAM, _UPLINK_STREAM_STATE, _DEFERRED_CHIME, _RECONNECT_STEP_AT
     _stop_reconnect_watchdog()
     _SHUTDOWN.clear()
     _SHUTDOWN_SIGNAL = None
     _CLEANUP_DONE = False
     _ACTIVE_CAPS.clear()
-    proc = _PW_PLAY_PROC
-    _PW_PLAY_PROC = None
-    if proc is not None:
-        try:
-            _kill_pw_play_group(proc, grace=0.1)
-        except Exception:
-            pass
+    try:
+        _reap_pw_play_groups(grace=0.1)
+    except Exception:
+        pass
     _PW_PLAY_GROUPS.clear()
     _PLAYBACK_CANCEL.clear()
     _SESSION_HAD_TRAFFIC = False
@@ -713,7 +710,9 @@ def _kill_pw_play_group(proc, grace: float | None = None) -> None:
     """SIGTERM the pw-play process group, then SIGKILL after a short grace.
 
     A process started with ``start_new_session`` is signalled via ``killpg``.
-    Anything else gets ``terminate`` / ``kill`` on that process only. Never raises.
+    Anything else gets ``terminate`` / ``kill`` on that process only. A leader
+    that has already exited still gets ``killpg`` so a forked grandchild does
+    not keep the group alive. Never raises. The pid leaves ``_PW_PLAY_GROUPS``.
     """
     if proc is None:
         return
@@ -728,10 +727,6 @@ def _kill_pw_play_group(proc, grace: float | None = None) -> None:
         already = proc.poll() is not None
     except Exception:
         already = False
-    if already:
-        if pid_i:
-            _PW_PLAY_GROUPS.discard(pid_i)
-        return
 
     def _signal(sig: int) -> None:
         sent = False
@@ -751,27 +746,114 @@ def _kill_pw_play_group(proc, grace: float | None = None) -> None:
         except Exception:
             pass
 
-    _signal(signal.SIGTERM)
-    try:
-        proc.wait(timeout=max(0.05, grace_s))
-    except Exception:
-        pass
-    try:
-        still = proc.poll() is None
-    except Exception:
-        still = False
-    if still:
-        _signal(signal.SIGKILL)
+    def _killpg(sig: int) -> None:
+        if not grouped:
+            return
         try:
-            proc.wait(timeout=max(0.05, grace_s))
+            os.killpg(pid_i, sig)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+
+    try:
+        if not already:
+            _signal(signal.SIGTERM)
+            try:
+                proc.wait(timeout=max(0.05, grace_s))
+            except Exception:
+                pass
+            try:
+                still = proc.poll() is None
+            except Exception:
+                still = False
+            if still:
+                _signal(signal.SIGKILL)
+                try:
+                    proc.wait(timeout=max(0.05, grace_s))
+                except Exception:
+                    pass
+            else:
+                # Leader exited. killpg only — the pid may already have been
+                # reaped, and a grandchild can still be in the group.
+                _killpg(signal.SIGKILL)
+        else:
+            _killpg(signal.SIGKILL)
+    finally:
+        if pid_i:
+            _PW_PLAY_GROUPS.discard(pid_i)
+
+
+class _PwPlayGroup:
+    """Popen-shaped handle for a tracked pid whose ``Popen`` is already gone."""
+
+    def __init__(self, pid: int) -> None:
+        self.pid = int(pid)
+        self.returncode: int | None = None
+
+    def poll(self):
+        if self.returncode is not None:
+            return self.returncode
+        try:
+            os.kill(self.pid, 0)
+        except ProcessLookupError:
+            self.returncode = 0
+            return 0
+        except OSError:
+            return None
+        return None
+
+    def wait(self, timeout=None):
+        deadline = None if timeout is None else time.monotonic() + float(timeout)
+        while self.poll() is None:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired(["pw-play"], timeout)
+            time.sleep(0.02)
+        return self.returncode
+
+    def terminate(self) -> None:
+        try:
+            os.kill(self.pid, signal.SIGTERM)
+        except OSError:
+            pass
+
+    def kill(self) -> None:
+        try:
+            os.kill(self.pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+
+def _reap_pw_play_groups(grace: float | None = None) -> None:
+    """Kill every tracked pw-play process group. Never raises.
+
+    Session teardown and process shutdown both come through here, so a chime
+    group is reaped even when it is not the current ``_PW_PLAY_PROC``.
+    """
+    global _PW_PLAY_PROC
+    proc = _PW_PLAY_PROC
+    _PW_PLAY_PROC = None
+    seen: set[int] = set()
+    if proc is not None:
+        try:
+            pid_i = int(proc.pid) if getattr(proc, "pid", None) else 0
+        except (TypeError, ValueError):
+            pid_i = 0
+        if pid_i:
+            seen.add(pid_i)
+        try:
+            _kill_pw_play_group(proc, grace=grace)
         except Exception:
             pass
-    if pid_i:
-        _PW_PLAY_GROUPS.discard(pid_i)
+    for pid_i in list(_PW_PLAY_GROUPS):
+        if pid_i in seen:
+            continue
+        try:
+            _kill_pw_play_group(_PwPlayGroup(pid_i), grace=grace)
+        except Exception:
+            pass
 
 
 def _cancel_inflight_playback() -> None:
-    """Stop TTS so teardown cannot wait out a wedged play. Does not take the lock."""
+    """Stop TTS or a chime so teardown cannot wait it out. Does not take the lock."""
     _PLAYBACK_CANCEL.set()
     try:
         import sounddevice as sd
@@ -779,10 +861,7 @@ def _cancel_inflight_playback() -> None:
         sd.stop()
     except Exception:
         pass
-    try:
-        _kill_pw_play_group(_PW_PLAY_PROC)
-    except Exception:
-        pass
+    _reap_pw_play_groups()
 
 
 def _mark_session_traffic() -> None:
@@ -1165,32 +1244,71 @@ def _shutdown_wav_path(kind: str) -> Path | None:
 def _pw_play_chime(path: Path) -> None:
     """Play one canned wav with ``pw-play``. Never raises and never uses PortAudio.
 
-    ``subprocess.run`` kills the child when ``timeout`` expires, then raises
-    ``TimeoutExpired``. A missing ``pw-play`` or a timeout is logged and ignored.
+    The player is its own session, same as TTS. ``wait`` is bounded by the
+    chime timeout. On timeout, session teardown, or shutdown the whole process
+    group is killed (SIGTERM, then SIGKILL). A missing ``pw-play`` or a timeout
+    is logged and ignored. The group pid is not left in ``_PW_PLAY_GROUPS``.
     """
+    global _PW_PLAY_PROC
     timeout = _chime_timeout_s()
     wavpath = os.fspath(path)
+    proc = None
     try:
-        completed = subprocess.run(
-            ["pw-play", wavpath],
-            timeout=timeout,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-    except FileNotFoundError:
-        print("  (pw-play missing; skip local shutdown line)")
-        return
-    except subprocess.TimeoutExpired:
-        print(f"  (pw-play chime timed out after {timeout:.1f}s)")
-        return
+        try:
+            proc = subprocess.Popen(
+                ["pw-play", wavpath],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except FileNotFoundError:
+            print("  (pw-play missing; skip local shutdown line)")
+            return
+        except Exception as exc:
+            print(f"  (shutdown wav failed: {exc})")
+            return
+        try:
+            pid_i = int(proc.pid) if proc.pid else 0
+        except (TypeError, ValueError):
+            pid_i = 0
+        if pid_i:
+            _PW_PLAY_GROUPS.add(pid_i)
+        _PW_PLAY_PROC = proc
+        if _PLAYBACK_CANCEL.is_set() or _SHUTDOWN.is_set():
+            _kill_pw_play_group(proc)
+            return
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _kill_pw_play_group(proc)
+            print(f"  (pw-play chime timed out after {timeout:.1f}s)")
+            return
+        except Exception as exc:
+            print(f"  (shutdown wav failed: {exc})")
+            return
+        code = proc.returncode
+        if code not in (0, None):
+            print(f"  (pw-play chime failed: exit {code})")
+            return
+        if code == 0:
+            print(f"  shutdown line: {path.name}  playback=pw")
     except Exception as exc:
         print(f"  (shutdown wav failed: {exc})")
-        return
-    if completed.returncode != 0:
-        print(f"  (pw-play chime failed: exit {completed.returncode})")
-        return
-    print(f"  shutdown line: {path.name}  playback=pw")
+    finally:
+        if proc is not None:
+            try:
+                if proc.poll() is None:
+                    _kill_pw_play_group(proc)
+            except Exception:
+                pass
+            if _PW_PLAY_PROC is proc:
+                _PW_PLAY_PROC = None
+            try:
+                pid_i = int(proc.pid) if getattr(proc, "pid", None) else 0
+            except (TypeError, ValueError):
+                pid_i = 0
+            if pid_i:
+                _PW_PLAY_GROUPS.discard(pid_i)
 
 
 def _play_local_shutdown(*, kind: str = "disconnect") -> None:

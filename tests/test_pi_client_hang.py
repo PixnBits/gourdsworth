@@ -22,18 +22,19 @@ import crate_client as cc  # noqa: E402
 
 
 class _HangStream:
-    """stop() and close() never return."""
+    """stop() and close() block until ``release`` is set."""
 
     def __init__(self) -> None:
         self.calls: list[str] = []
+        self.release = threading.Event()
 
     def stop(self) -> None:
         self.calls.append("stop")
-        threading.Event().wait()
+        self.release.wait()
 
     def close(self) -> None:
         self.calls.append("close")
-        threading.Event().wait()
+        self.release.wait()
 
 
 class _FastStream:
@@ -48,11 +49,13 @@ class _FastStream:
 
 
 class _HangPwPlay:
-    """Stand-in for ``subprocess.Popen`` whose ``communicate`` waits out the timeout."""
+    """Stand-in for ``subprocess.Popen`` that blocks until kill or ``timeout``."""
 
     def __init__(self, args, **kwargs) -> None:
         self.args = list(args)
-        self.pid = 4242
+        self.kwargs = dict(kwargs)
+        # Above any real pid, so a group kill cannot signal another process.
+        self.pid = 1 << 30
         self.returncode = None
         self.stdout = None
         self.stderr = None
@@ -62,22 +65,32 @@ class _HangPwPlay:
 
     live: list[_HangPwPlay] = []
 
-    def communicate(self, input=None, timeout=None):
+    def _block(self, timeout):
         if timeout is None:
-            threading.Event().wait()
-            return (None, None)
+            while not self.killed and self.returncode is None:
+                time.sleep(0.01)
+            return
         deadline = time.monotonic() + float(timeout)
         while time.monotonic() < deadline:
             if self.killed or self.returncode is not None:
-                return (None, None)
+                return
             time.sleep(0.01)
         raise subprocess.TimeoutExpired(self.args, timeout)
+
+    def communicate(self, input=None, timeout=None):
+        self._block(timeout)
+        return (None, None)
+
+    def terminate(self) -> None:
+        self.killed = True
+        self.returncode = -15
 
     def kill(self) -> None:
         self.killed = True
         self.returncode = -9
 
     def wait(self, timeout=None):
+        self._block(timeout)
         return self.returncode
 
     def poll(self):
@@ -123,73 +136,103 @@ def _patch_exit(monkeypatch) -> list[int]:
 
 
 def test_hanging_uplink_close_exits_within_bound(monkeypatch, fake_sd):
-    monkeypatch.setattr(cc, "UPLINK_CLOSE_TIMEOUT_S", 0.25)
-    monkeypatch.setattr(cc, "EXIT_CLEANUP_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(cc, "UPLINK_CLOSE_TIMEOUT_S", 0.25, raising=False)
+    monkeypatch.setattr(cc, "EXIT_CLEANUP_TIMEOUT_S", 0.05, raising=False)
+    monkeypatch.setenv("CRATE_UPLINK_CLOSE_TIMEOUT_S", "0.25")
     codes = _patch_exit(monkeypatch)
     stream = _HangStream()
     box: dict = {}
 
     def run() -> None:
-        # A missing close helper blocks the way the pre-fix uplink close did.
         fn = getattr(cc, "_close_uplink_stream", None)
         if not callable(fn):
-            threading.Event().wait()
             return
         box["v"] = fn(stream)
 
     worker = threading.Thread(target=run, name="uplink-close", daemon=True)
     started = time.monotonic()
-    worker.start()
-    worker.join(timeout=3.0)
-    elapsed = time.monotonic() - started
-    assert not worker.is_alive(), "uplink close did not return within 3s"
-    assert box.get("v") is False
-    assert elapsed < 1.5
-    assert elapsed >= 0.2
-    assert codes == [cc.WEDGED_EXIT_CODE]
-    assert fake_sd.plays == []
-    assert cc._uplink_stream_busy() is True
+    try:
+        worker.start()
+        worker.join(timeout=3.0)
+        elapsed = time.monotonic() - started
+        assert not worker.is_alive(), "uplink close did not return within 3s"
+        assert box.get("v") is False
+        assert elapsed < 1.5
+        assert elapsed >= 0.2
+        assert codes == [getattr(cc, "WEDGED_EXIT_CODE", None)]
+        assert fake_sd.plays == []
+        busy = getattr(cc, "_uplink_stream_busy", lambda: None)
+        assert busy() is True
+    finally:
+        stream.release.set()
+        worker.join(timeout=1.0)
 
 
 def test_uplink_close_returns_when_stream_stops(monkeypatch, fake_sd):
     codes = _patch_exit(monkeypatch)
     stream = _FastStream()
-    started = time.monotonic()
-    assert cc._close_uplink_stream(stream, timeout_s=1.0) is True
-    assert time.monotonic() - started < 1.0
-    assert stream.calls == ["stop", "close"]
-    assert codes == []
-    assert cc._uplink_stream_busy() is False
-    assert fake_sd.plays == []
-
-
-def test_pw_play_chime_timeout_kills_and_skips_portaudio(monkeypatch, fake_sd, capsys):
-    monkeypatch.setattr(cc, "CHIME_PW_PLAY_TIMEOUT_S", 0.25)
-    _HangPwPlay.live.clear()
-    monkeypatch.setattr(subprocess, "Popen", _HangPwPlay)
-    cc._set_uplink_stream_state("closed")
+    box: dict = {}
 
     def run() -> None:
-        play = getattr(cc, "_play_local_shutdown", None)
-        if not callable(play):
-            threading.Event().wait()
+        fn = getattr(cc, "_close_uplink_stream", None)
+        if not callable(fn):
             return
-        play(kind="disconnect")
+        box["v"] = fn(stream, timeout_s=1.0)
 
-    worker = threading.Thread(target=run, name="chime-timeout", daemon=True)
+    worker = threading.Thread(target=run, name="uplink-close-fast", daemon=True)
     started = time.monotonic()
     worker.start()
     worker.join(timeout=3.0)
     elapsed = time.monotonic() - started
-    assert not worker.is_alive(), "shutdown chime did not return within 3s"
-    assert elapsed < 1.5
-    assert elapsed >= 0.2
-    assert _HangPwPlay.live, "pw-play was not started"
-    proc = _HangPwPlay.live[-1]
-    assert proc.args[0] == "pw-play"
-    assert proc.killed is True
+    assert not worker.is_alive(), "uplink close did not return within 3s"
+    assert box.get("v") is True
+    assert elapsed < 1.0
+    assert stream.calls == ["stop", "close"]
+    assert codes == []
+    busy = getattr(cc, "_uplink_stream_busy", lambda: True)
+    assert busy() is False
     assert fake_sd.plays == []
-    assert "timed out" in capsys.readouterr().out
+
+
+def test_pw_play_chime_timeout_kills_and_skips_portaudio(monkeypatch, fake_sd, capsys):
+    monkeypatch.setattr(cc, "CHIME_PW_PLAY_TIMEOUT_S", 5.0, raising=False)
+    monkeypatch.setenv("CRATE_CHIME_TIMEOUT_S", "0.25")
+    _HangPwPlay.live.clear()
+    monkeypatch.setattr(subprocess, "Popen", _HangPwPlay)
+    setter = getattr(cc, "_set_uplink_stream_state", None)
+    if callable(setter):
+        setter("closed")
+    box: dict = {}
+
+    def run() -> None:
+        play = getattr(cc, "_play_local_shutdown", None)
+        if not callable(play):
+            return
+        play(kind="disconnect")
+        box["done"] = True
+
+    worker = threading.Thread(target=run, name="chime-timeout", daemon=True)
+    started = time.monotonic()
+    try:
+        worker.start()
+        worker.join(timeout=3.0)
+        elapsed = time.monotonic() - started
+        assert not worker.is_alive(), "shutdown chime did not return within 3s"
+        assert box.get("done") is True
+        assert elapsed < 1.5
+        assert elapsed >= 0.2
+        assert _HangPwPlay.live, "pw-play was not started"
+        proc = _HangPwPlay.live[-1]
+        assert proc.args[0] == "pw-play"
+        assert proc.kwargs.get("start_new_session") is True
+        assert proc.killed is True
+        assert fake_sd.plays == []
+        assert "timed out" in capsys.readouterr().out
+        assert not getattr(cc, "_PW_PLAY_GROUPS", set())
+    finally:
+        for proc in list(_HangPwPlay.live):
+            proc.kill()
+        worker.join(timeout=1.0)
 
 
 def test_missing_pw_play_is_logged_and_swallowed(monkeypatch, fake_sd, capsys):
@@ -198,8 +241,23 @@ def test_missing_pw_play_is_logged_and_swallowed(monkeypatch, fake_sd, capsys):
             raise FileNotFoundError("pw-play")
 
     monkeypatch.setattr(subprocess, "Popen", _Missing)
-    cc._set_uplink_stream_state("closed")
-    cc._play_local_shutdown(kind="goodbye")
+    setter = getattr(cc, "_set_uplink_stream_state", None)
+    if callable(setter):
+        setter("closed")
+    box: dict = {}
+
+    def run() -> None:
+        play = getattr(cc, "_play_local_shutdown", None)
+        if not callable(play):
+            return
+        play(kind="goodbye")
+        box["done"] = True
+
+    worker = threading.Thread(target=run, name="chime-missing", daemon=True)
+    worker.start()
+    worker.join(timeout=3.0)
+    assert not worker.is_alive(), "missing pw-play hung the shutdown chime"
+    assert box.get("done") is True
     assert fake_sd.plays == []
     assert "pw-play missing" in capsys.readouterr().out
 
@@ -213,48 +271,83 @@ def test_chime_not_played_while_uplink_stream_open_or_closing(monkeypatch, fake_
 
     monkeypatch.setattr(subprocess, "run", _run)
     monkeypatch.setattr(subprocess, "Popen", _run)
-    for state in ("open", "closing"):
-        cc._set_uplink_stream_state(state)
-        cc._play_local_shutdown(kind="disconnect")
-        cc._play_local_shutdown(kind="goodbye")
+    setter = getattr(cc, "_set_uplink_stream_state", None)
+    play = getattr(cc, "_play_local_shutdown", None)
+
+    def drive() -> None:
+        if not callable(play):
+            return
+        for state in ("open", "closing"):
+            if callable(setter):
+                setter(state)
+            play(kind="disconnect")
+            play(kind="goodbye")
+
+    worker = threading.Thread(target=drive, name="chime-deferred", daemon=True)
+    worker.start()
+    worker.join(timeout=3.0)
+    assert not worker.is_alive(), "shutdown chime did not return within 3s"
     assert runs == []
     assert fake_sd.plays == []
     assert "deferring shutdown line" in capsys.readouterr().out
 
 
 def test_timeouts_follow_env_over_constants(monkeypatch):
-    monkeypatch.setattr(cc, "UPLINK_CLOSE_TIMEOUT_S", 5.0)
-    monkeypatch.setattr(cc, "CHIME_PW_PLAY_TIMEOUT_S", 5.0)
-    monkeypatch.setattr(cc, "RECONNECT_STEP_TIMEOUT_S", 20.0)
+    monkeypatch.setattr(cc, "UPLINK_CLOSE_TIMEOUT_S", 5.0, raising=False)
+    monkeypatch.setattr(cc, "CHIME_PW_PLAY_TIMEOUT_S", 5.0, raising=False)
+    monkeypatch.setattr(cc, "RECONNECT_STEP_TIMEOUT_S", 20.0, raising=False)
     monkeypatch.setenv("CRATE_UPLINK_CLOSE_TIMEOUT_S", "0.3")
     monkeypatch.setenv("CRATE_CHIME_TIMEOUT_S", "0.4")
     monkeypatch.setenv("CRATE_RECONNECT_STEP_TIMEOUT_S", "0.5")
-    assert cc._uplink_close_timeout_s() == 0.3
-    assert cc._chime_timeout_s() == 0.4
-    assert cc._reconnect_step_timeout_s() == 0.5
+    uplink = getattr(cc, "_uplink_close_timeout_s", lambda: None)
+    chime = getattr(cc, "_chime_timeout_s", lambda: None)
+    step = getattr(cc, "_reconnect_step_timeout_s", lambda: None)
+    assert uplink() == 0.3
+    assert chime() == 0.4
+    assert step() == 0.5
 
 
 def test_reconnect_watchdog_exits_when_step_is_stale(monkeypatch, fake_sd):
-    monkeypatch.setattr(cc, "RECONNECT_STEP_TIMEOUT_S", 0.2)
-    monkeypatch.setattr(cc, "EXIT_CLEANUP_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(cc, "RECONNECT_STEP_TIMEOUT_S", 0.2, raising=False)
+    monkeypatch.setattr(cc, "EXIT_CLEANUP_TIMEOUT_S", 0.05, raising=False)
+    monkeypatch.setenv("CRATE_RECONNECT_STEP_TIMEOUT_S", "0.2")
     codes = _patch_exit(monkeypatch)
     start = getattr(cc, "_start_reconnect_watchdog", None)
-    stop = getattr(cc, "_stop_reconnect_watchdog", lambda: None)
-    if not callable(start):
-        time.sleep(0.3)
-        assert codes == [getattr(cc, "WEDGED_EXIT_CODE", 1)]
-        return
-    start()
-    try:
-        with cc._RECONNECT_STEP_LOCK:
+    stop = getattr(cc, "_stop_reconnect_watchdog", None)
+    release = threading.Event()
+
+    def run() -> None:
+        if not callable(start):
+            release.wait(timeout=5.0)
+            return
+        start()
+        lock = getattr(cc, "_RECONNECT_STEP_LOCK", None)
+        if lock is not None:
+            with lock:
+                cc._RECONNECT_STEP_AT = time.monotonic() - 1.0
+        elif hasattr(cc, "_RECONNECT_STEP_AT"):
             cc._RECONNECT_STEP_AT = time.monotonic() - 1.0
-        cc._RECONNECT_WATCH_ARMED.set()
+        armed = getattr(cc, "_RECONNECT_WATCH_ARMED", None)
+        if armed is not None and hasattr(armed, "set"):
+            armed.set()
+        else:
+            release.wait(timeout=5.0)
+
+    worker = threading.Thread(target=run, name="reconnect-watch", daemon=True)
+    try:
+        worker.start()
         deadline = time.monotonic() + 2.0
         while not codes and time.monotonic() < deadline:
             time.sleep(0.02)
-        assert codes == [cc.WEDGED_EXIT_CODE]
+        assert codes == [getattr(cc, "WEDGED_EXIT_CODE", None)]
     finally:
-        stop()
+        release.set()
+        if callable(stop):
+            try:
+                stop()
+            except Exception:
+                pass
+        worker.join(timeout=1.0)
 
 
 def test_timeout_env_rejects_zero_negative_nan_and_inf(monkeypatch, capsys):
@@ -302,33 +395,44 @@ def _pid_alive(pid: int) -> bool:
     return state != "Z"
 
 
-def _install_wedged_pw_play(tmp_path, monkeypatch) -> Path:
-    """Put a pw-play that sleeps, and records its pid plus a child, first on PATH."""
+def _install_wedged_pw_play(tmp_path, monkeypatch, request) -> Path:
+    """Put a pw-play first on PATH and reap every pid it records.
+
+    TTS wavs (``crate-play-*``) fork a grandchild and sleep. Chimes record
+    their pid and exit unless ``CRATE_TEST_PW_PLAY_WEDGE`` is ``chime`` or
+    ``all``, in which case they fork and sleep too. The finalizer kills every
+    recorded pid and process group, including when the test fails.
+    """
     bindir = tmp_path / "bin"
     bindir.mkdir()
     script = bindir / "pw-play"
-    # TTS temp wavs (crate-play-*) fork a grandchild and sleep. Canned
-    # shutdown wavs exit at once so a disconnect chime cannot sit on the
-    # reconnect path. The grandchild stays up if only the parent is killed.
     script.write_text(
         "#!/usr/bin/env python3\n"
         "import os\n"
         "import sys\n"
         "import time\n"
         "args = sys.argv[1:]\n"
-        "if not any('crate-play-' in arg for arg in args):\n"
-        "    raise SystemExit(0)\n"
-        "child = os.fork()\n"
-        "if child == 0:\n"
-        "    time.sleep(3600)\n"
-        "    raise SystemExit(0)\n"
+        "is_tts = any('crate-play-' in arg for arg in args)\n"
+        "wedge = os.environ.get('CRATE_TEST_PW_PLAY_WEDGE', '')\n"
+        "fork = is_tts or wedge == 'all' or (wedge == 'chime' and not is_tts)\n"
+        "child = 0\n"
+        "if fork:\n"
+        "    child = os.fork()\n"
+        "    if child == 0:\n"
+        "        time.sleep(3600)\n"
+        "        raise SystemExit(0)\n"
         "path = os.environ.get('CRATE_TEST_PW_PLAY_PIDFILE', '')\n"
         "if path:\n"
-        "    with open(path, 'w', encoding='utf-8') as handle:\n"
-        "        handle.write(f'{os.getpid()} {child}\\n')\n"
-        "        handle.flush()\n"
-        "        os.fsync(handle.fileno())\n"
-        "time.sleep(3600)\n",
+        "    line = f'{os.getpid()} {os.getpgrp()} {child}\\n'.encode()\n"
+        "    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)\n"
+        "    try:\n"
+        "        os.write(fd, line)\n"
+        "        os.fsync(fd)\n"
+        "    finally:\n"
+        "        os.close(fd)\n"
+        "if fork:\n"
+        "    time.sleep(3600)\n"
+        "raise SystemExit(0)\n",
         encoding="utf-8",
     )
     script.chmod(0o755)
@@ -340,21 +444,45 @@ def _install_wedged_pw_play(tmp_path, monkeypatch) -> Path:
         "PATH",
         str(bindir) + os.pathsep + os.environ.get("PATH", ""),
     )
+
+    def _reap() -> None:
+        _kill_recorded(pidfile)
+
+    request.addfinalizer(_reap)
     return pidfile
 
 
+def _recorded_pw(path: Path) -> list[tuple[int, int, int]]:
+    """Lines written by the fake: ``pid pgid child`` (child is 0 when none)."""
+    if not path.is_file():
+        return []
+    rows: list[tuple[int, int, int]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        try:
+            pid = int(parts[0])
+            pgid = int(parts[1])
+            child = int(parts[2]) if len(parts) >= 3 else 0
+        except ValueError:
+            continue
+        rows.append((pid, pgid, child))
+    return rows
+
+
 def _read_pw_pids(path: Path, timeout: float = 2.0) -> tuple[int, int]:
+    """Return the first forked pw-play's ``(parent, child)``."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if path.is_file():
-            parts = path.read_text(encoding="utf-8").split()
-            if len(parts) >= 2:
-                return int(parts[0]), int(parts[1])
+        for pid, _pgid, child in _recorded_pw(path):
+            if child > 0:
+                return pid, child
         time.sleep(0.01)
     raise AssertionError(f"pw-play did not record pids in {path}")
 
 
-def _wait_pids_dead(pids: tuple[int, int], timeout: float) -> bool:
+def _wait_pids_dead(pids: tuple[int, ...] | list[int], timeout: float) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if not any(_pid_alive(pid) for pid in pids):
@@ -363,46 +491,75 @@ def _wait_pids_dead(pids: tuple[int, int], timeout: float) -> bool:
     return False
 
 
-def _kill_leftover(pids: tuple[int, ...] | None) -> None:
-    if not pids:
-        return
-    for pid in pids:
-        try:
-            os.killpg(int(pid), signal.SIGKILL)
-        except (ProcessLookupError, PermissionError, OSError):
-            pass
-        try:
-            os.kill(int(pid), signal.SIGKILL)
-        except (ProcessLookupError, PermissionError, OSError):
-            pass
+def _assert_pw_procs_dead(path: Path, timeout: float = 2.0) -> None:
+    """Parent and any forked grandchild are gone. Zombies count as dead."""
+    pids: list[int] = []
+    for pid, _pgid, child in _recorded_pw(path):
+        if pid > 1:
+            pids.append(pid)
+        if child > 1:
+            pids.append(child)
+    assert pids, f"pw-play did not record any pid in {path}"
+    assert _wait_pids_dead(pids, timeout), f"fake pw-play still alive: {pids}"
 
 
-def test_wedged_pw_play_is_killed_after_play_bound(monkeypatch, tmp_path, fake_sd):
+def _kill_recorded(path: Path) -> None:
+    """SIGKILL every pid and foreign process group the fake recorded."""
+    me_pid = os.getpid()
+    me_pgid = os.getpgrp()
+    for pid, pgid, child in _recorded_pw(path):
+        for target in (child, pid):
+            if target <= 1 or target == me_pid:
+                continue
+            try:
+                os.kill(int(target), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+        if pgid > 1 and pgid != me_pgid:
+            try:
+                os.killpg(int(pgid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+
+
+def test_wedged_pw_play_is_killed_after_play_bound(monkeypatch, tmp_path, fake_sd, request):
     """A pw-play that never exits is killed once duration + margin elapses."""
-    pidfile = _install_wedged_pw_play(tmp_path, monkeypatch)
+    pidfile = _install_wedged_pw_play(tmp_path, monkeypatch, request)
     monkeypatch.setenv("CRATE_TTS_PLAY_MARGIN_S", "0.35")
-    pids: tuple[int, int] | None = None
+    box: dict = {}
+
+    def run() -> None:
+        try:
+            box["finished"] = cc._play_pcm_f32([0.0] * 160, 16000)
+        except BaseException as exc:
+            box["err"] = exc
+
+    worker = threading.Thread(target=run, name="wedged-pw-play", daemon=True)
+    started = time.monotonic()
+    worker.start()
+    worker.join(timeout=10.0)
+    elapsed = time.monotonic() - started
     try:
-        started = time.monotonic()
-        finished = cc._play_pcm_f32([0.0] * 160, 16000)
-        elapsed = time.monotonic() - started
-        pids = _read_pw_pids(pidfile, timeout=0.2)
-        assert finished is False
+        assert not worker.is_alive(), "pw-play playback did not return within 10s"
+        assert "err" not in box, box.get("err")
+        assert box.get("finished") is False
         assert not cc._AUDIO_LOCK.locked()
         assert elapsed < 2.0
         assert elapsed >= 0.3
-        assert _wait_pids_dead(pids, 1.0), f"pw-play still running: {pids}"
         assert fake_sd.plays == []
+        _assert_pw_procs_dead(pidfile, timeout=2.0)
+        assert not getattr(cc, "_PW_PLAY_GROUPS", set())
     finally:
-        _kill_leftover(pids)
+        _kill_recorded(pidfile)
+        worker.join(timeout=1.0)
 
 
-def test_teardown_during_tts_lets_next_session_mic_start(monkeypatch, tmp_path, fake_sd):
+def test_teardown_during_tts_lets_next_session_mic_start(monkeypatch, tmp_path, fake_sd, request):
     """Session teardown during TTS frees the lock so the next mic starts quickly."""
     import numpy as np
     from gourdsworth.net import PROTO, recv_msg, send_msg
 
-    pidfile = _install_wedged_pw_play(tmp_path, monkeypatch)
+    pidfile = _install_wedged_pw_play(tmp_path, monkeypatch, request)
     monkeypatch.setenv("CRATE_TTS_PLAY_MARGIN_S", "4")
     monkeypatch.setattr(cc, "RECONNECT_BACKOFF_MIN_S", 0.05)
     monkeypatch.setattr(cc, "RECONNECT_BACKOFF_JITTER_S", 0.0)
@@ -559,6 +716,8 @@ def test_teardown_during_tts_lets_next_session_mic_start(monkeypatch, tmp_path, 
         assert elapsed < 2.0
         assert not cc._AUDIO_LOCK.locked()
         assert server_err == [], server_err
+        _assert_pw_procs_dead(pidfile, timeout=2.0)
+        assert not getattr(cc, "_PW_PLAY_GROUPS", set())
     finally:
         second_mic.set()
         stop.set()
@@ -569,7 +728,92 @@ def test_teardown_during_tts_lets_next_session_mic_start(monkeypatch, tmp_path, 
                 cancel()
             except Exception:
                 pass
-        _kill_leftover(pids_box.get("pids"))
+        _kill_recorded(pidfile)
         client.join(timeout=3.0)
         server.join(timeout=2.0)
         cc._reset_shutdown_state_for_tests()
+
+
+def test_chime_pw_play_timeout_kills_grandchild(monkeypatch, tmp_path, fake_sd, request, capsys):
+    """A chime pw-play that forks and sleeps is killed, grandchild included."""
+    pidfile = _install_wedged_pw_play(tmp_path, monkeypatch, request)
+    timeout_s = 0.35
+    monkeypatch.setenv("CRATE_CHIME_TIMEOUT_S", str(timeout_s))
+    monkeypatch.setenv("CRATE_TEST_PW_PLAY_WEDGE", "chime")
+    monkeypatch.setattr(cc, "CHIME_PW_PLAY_TIMEOUT_S", 5.0, raising=False)
+    grace = float(getattr(cc, "PW_PLAY_KILL_GRACE_S", 0.25))
+    wav = tmp_path / "disconnect_1.wav"
+    wav.write_bytes(b"RIFF")
+    box: dict = {}
+
+    def run() -> None:
+        fn = getattr(cc, "_pw_play_chime", None)
+        if not callable(fn):
+            box["missing"] = True
+            return
+        fn(wav)
+        box["done"] = True
+
+    worker = threading.Thread(target=run, name="chime-grandchild", daemon=True)
+    started = time.monotonic()
+    worker.start()
+    worker.join(timeout=10.0)
+    elapsed = time.monotonic() - started
+    try:
+        assert not worker.is_alive(), "chime pw-play did not return within 10s"
+        assert not box.get("missing"), "chime playback has no pw-play timeout"
+        assert box.get("done") is True
+        assert elapsed >= timeout_s * 0.5
+        assert elapsed <= timeout_s + grace + 0.5
+        assert fake_sd.plays == []
+        assert "timed out" in capsys.readouterr().out
+        rows = _recorded_pw(pidfile)
+        assert any(child > 0 for _pid, _pgid, child in rows), rows
+        _assert_pw_procs_dead(pidfile, timeout=2.0)
+        assert not getattr(cc, "_PW_PLAY_GROUPS", set())
+    finally:
+        _kill_recorded(pidfile)
+        worker.join(timeout=1.0)
+
+
+def test_cleanup_reaps_live_chime_group(monkeypatch, tmp_path, fake_sd, request):
+    """Session cleanup kills a chime group that has not hit its timeout yet."""
+    pidfile = _install_wedged_pw_play(tmp_path, monkeypatch, request)
+    monkeypatch.setenv("CRATE_CHIME_TIMEOUT_S", "30")
+    monkeypatch.setenv("CRATE_TEST_PW_PLAY_WEDGE", "chime")
+    wav = tmp_path / "disconnect_2.wav"
+    wav.write_bytes(b"RIFF")
+    box: dict = {}
+
+    def run() -> None:
+        fn = getattr(cc, "_pw_play_chime", None)
+        if not callable(fn):
+            box["missing"] = True
+            return
+        fn(wav)
+        box["done"] = True
+
+    worker = threading.Thread(target=run, name="chime-cleanup", daemon=True)
+    worker.start()
+    try:
+        parent, child = _read_pw_pids(pidfile, timeout=2.0)
+        assert _pid_alive(parent) and _pid_alive(child)
+        cleanup = getattr(cc, "_cleanup_devices", None)
+        assert callable(cleanup)
+        cleanup()
+        worker.join(timeout=3.0)
+        assert not worker.is_alive(), "cleanup did not unblock the chime"
+        assert box.get("done") is True
+        assert not box.get("missing")
+        _assert_pw_procs_dead(pidfile, timeout=2.0)
+        assert not getattr(cc, "_PW_PLAY_GROUPS", set())
+        assert fake_sd.plays == []
+    finally:
+        _kill_recorded(pidfile)
+        cancel = getattr(cc, "_cancel_inflight_playback", None)
+        if callable(cancel):
+            try:
+                cancel()
+            except Exception:
+                pass
+        worker.join(timeout=1.0)
