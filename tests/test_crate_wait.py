@@ -560,6 +560,10 @@ def test_busy_backs_off_and_announces_once_per_outage(crate_client, monkeypatch,
     monkeypatch.setattr(crate_client, "SUPERSEDED_BACKOFF_S", 0.40)
     monkeypatch.setattr(crate_client, "SUPERSEDED_BACKOFF_JITTER_S", 0.0)
     monkeypatch.setattr(crate_client, "DISCONNECT_ANNOUNCE_EVERY_S", 30.0)
+    # A ready-then-immediate-disconnect is unserved and waits the minimum.
+    # This test is about the busy chime, so keep that pause short.
+    monkeypatch.setattr(crate_client, "RECONNECT_BACKOFF_MIN_S", 0.05)
+    monkeypatch.setattr(crate_client, "RECONNECT_BACKOFF_JITTER_S", 0.0)
     backoffs = {"n": 0}
     second_backoff = threading.Event()
     real_backoff = crate_client._backoff_superseded
@@ -765,3 +769,366 @@ def test_shutdown_interrupts_busy_backoff(crate_client, monkeypatch, tmp_path):
         crate_client._reset_shutdown_state_for_tests()
         assert not client.is_alive()
         assert not server.is_alive(), f"fake desktop still running: {server_err!r}"
+
+
+def _virtual_reconnect_waits(crate_client, monkeypatch, waits: list[float], stop_when):
+    """Replace the reconnect sleep with an instant wait that records delays.
+
+    ``stop_when(waits)`` true ends the client. Missing on the old client, so
+    a hot loop is left to the caller's safety cap instead of hanging here.
+    """
+    monkeypatch.setattr(crate_client, "RECONNECT_BACKOFF_JITTER_S", 0.0, raising=False)
+
+    def virtual(quit_ev, delay):
+        del quit_ev
+        waits.append(float(delay))
+        return bool(stop_when(waits))
+
+    if hasattr(crate_client, "_backoff_wait"):
+        monkeypatch.setattr(crate_client, "_backoff_wait", virtual)
+        return True
+    return False
+
+
+def _drive_pi_main(crate_client, on_accept, tmp_path, *, join_s=3.0, safety=12):
+    """Run the real Pi main loop against a 127.0.0.1 ephemeral desktop.
+
+    ``on_accept(conn, n, held)`` sees each accepted socket, n starting at 1.
+    The safety cap stops a reconnect spin so a missing backoff fails fast.
+    """
+    port_ready = threading.Event()
+    stop = threading.Event()
+    accepted: list = []
+    held: list = []
+    server_err: list = []
+    port_box: dict = {}
+    srv_box: dict = {}
+
+    def desktop() -> None:
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv_box["srv"] = srv
+        try:
+            srv.bind(("127.0.0.1", 0))
+            srv.listen(8)
+            srv.settimeout(0.2)
+            port_box["port"] = int(srv.getsockname()[1])
+            port_ready.set()
+            while not stop.is_set() and not crate_client._SHUTDOWN.is_set():
+                try:
+                    conn, _addr = srv.accept()
+                except TimeoutError:
+                    continue
+                except OSError:
+                    break
+                accepted.append(conn)
+                if len(accepted) >= safety:
+                    crate_client._SHUTDOWN.set()
+                    try:
+                        conn.close()
+                    except OSError:
+                        pass
+                    break
+                try:
+                    on_accept(conn, len(accepted), held)
+                except BaseException as exc:
+                    server_err.append(exc)
+                    try:
+                        conn.close()
+                    except OSError:
+                        pass
+        except BaseException as exc:
+            server_err.append(exc)
+        finally:
+            for sock in held:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+            try:
+                srv.close()
+            except OSError:
+                pass
+
+    server = threading.Thread(target=desktop, name="crate-backoff-desktop", daemon=True)
+    server.start()
+    assert port_ready.wait(timeout=2.0), f"desktop did not bind: {server_err!r}"
+    rc: dict = {}
+
+    def run_client() -> None:
+        try:
+            rc["v"] = crate_client.main(
+                [
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    str(port_box["port"]),
+                    "--no-camera",
+                    "--no-mic",
+                    "--log-file",
+                    str(tmp_path / "crate-pi.log"),
+                ]
+            )
+        except BaseException as exc:
+            rc["err"] = exc
+
+    client = threading.Thread(target=run_client, name="crate-backoff-client", daemon=True)
+    try:
+        client.start()
+        client.join(timeout=join_s)
+        if client.is_alive():
+            crate_client._SHUTDOWN.set()
+            stop.set()
+            srv = srv_box.get("srv")
+            if srv is not None:
+                try:
+                    srv.close()
+                except OSError:
+                    pass
+            for sock in accepted:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+            client.join(timeout=2.0)
+        else:
+            stop.set()
+        server.join(timeout=2.0)
+        assert not client.is_alive(), f"client still running rc={rc} err={server_err!r}"
+        assert not server.is_alive(), f"desktop still running err={server_err!r}"
+        assert "err" not in rc, rc.get("err")
+        assert server_err == [], server_err
+        return accepted, rc.get("v")
+    finally:
+        stop.set()
+        crate_client._SHUTDOWN.set()
+        srv = srv_box.get("srv")
+        if srv is not None:
+            try:
+                srv.close()
+            except OSError:
+                pass
+        for sock in accepted:
+            try:
+                sock.close()
+            except OSError:
+                pass
+        client.join(timeout=2.0)
+        server.join(timeout=2.0)
+        crate_client._reset_shutdown_state_for_tests()
+
+
+def test_reconnect_backoff_is_interruptible(crate_client, monkeypatch):
+    """Quit during the reconnect wait returns before the capped delay."""
+    crate_client._reset_shutdown_state_for_tests()
+    monkeypatch.setattr(crate_client, "RECONNECT_BACKOFF_JITTER_S", 0.0)
+    monkeypatch.setattr(crate_client, "_stdin_ready", lambda timeout: False)
+    quit_ev = threading.Event()
+    done: dict = {}
+
+    def quitter() -> None:
+        time.sleep(0.05)
+        quit_ev.set()
+
+    def run() -> None:
+        done["v"] = crate_client._backoff_reconnect(
+            quit_ev, float(crate_client.RECONNECT_BACKOFF_MAX_S)
+        )
+
+    threading.Thread(target=quitter, daemon=True).start()
+    worker = threading.Thread(target=run, daemon=True)
+    try:
+        t0 = time.monotonic()
+        worker.start()
+        worker.join(timeout=1.5)
+        if worker.is_alive():
+            quit_ev.set()
+            crate_client._SHUTDOWN.set()
+            worker.join(timeout=1.0)
+        assert not worker.is_alive(), "reconnect backoff ignored quit"
+        assert done.get("v") is True
+        assert (time.monotonic() - t0) < 1.0
+    finally:
+        quit_ev.set()
+        crate_client._SHUTDOWN.set()
+        worker.join(timeout=1.0)
+        crate_client._reset_shutdown_state_for_tests()
+
+
+def test_close_at_accept_backs_off_within_ten_seconds(crate_client, monkeypatch, tmp_path):
+    """A desktop that closes at accept is not polled in a hot loop.
+
+    Waits are the real 1s, 2s, 4s, … schedule (jitter zeroed). The virtual
+    clock stops once those delays add up to 10s. That window allows at most
+    six connects: 1+2+4 = 7, and the next 8s wait is still inside the window.
+    """
+    _stub_client_side(crate_client, monkeypatch)
+    monkeypatch.setattr(
+        crate_client, "_wait_trigger", lambda gpio, stop, conn=None: "disconnect"
+    )
+    waits: list[float] = []
+    _virtual_reconnect_waits(
+        crate_client, monkeypatch, waits, lambda seen: sum(seen) >= 10.0
+    )
+
+    def on_accept(conn, _n, _held) -> None:
+        conn.close()
+
+    accepted, rc = _drive_pi_main(crate_client, on_accept, tmp_path)
+    assert crate_client.RECONNECT_BACKOFF_MIN_S == 1.0
+    assert crate_client.RECONNECT_BACKOFF_MAX_S == 30.0
+    assert len(accepted) <= 6, f"connects={len(accepted)} waits={waits}"
+    assert sum(waits) >= 10.0, waits
+    assert waits[0] == pytest.approx(1.0)
+    assert rc == 0
+
+
+def test_reconnect_backoff_resets_after_served_session(crate_client, monkeypatch, tmp_path):
+    """A session that stays up past the minimum good duration resets the backoff."""
+    from gourdsworth.net import PROTO, send_msg
+
+    _stub_client_side(crate_client, monkeypatch)
+    monkeypatch.setenv("CRATE_MIN_GOOD_SESSION_S", "0.05")
+
+    def wait_trigger(gpio, stop, conn=None):
+        time.sleep(0.12)
+        return "disconnect"
+
+    monkeypatch.setattr(crate_client, "_wait_trigger", wait_trigger)
+    waits: list[float] = []
+    assert _virtual_reconnect_waits(
+        crate_client, monkeypatch, waits, lambda seen: len(seen) >= 4
+    )
+
+    def on_accept(conn, n, held) -> None:
+        if n != 4:
+            conn.close()
+            return
+        conn.settimeout(1.0)
+        try:
+            data = conn.recv(4096)
+        except OSError:
+            data = b""
+        if not data:
+            conn.close()
+            raise AssertionError("served connection sent no hello")
+        send_msg(conn, {"event": "hello", "role": "desktop", "proto": PROTO})
+        send_msg(conn, {"event": "ready"})
+        held.append(conn)
+
+    accepted, rc = _drive_pi_main(crate_client, on_accept, tmp_path)
+    assert waits == pytest.approx([1.0, 2.0, 4.0, 1.0]), waits
+    assert len(accepted) <= 6, len(accepted)
+    assert rc == 0
+
+
+def test_short_ready_close_grows_backoff_and_announces_once(
+    crate_client, monkeypatch, tmp_path
+):
+    """hello + ready + immediate close keeps doubling and chimes once."""
+    import builtins
+
+    from gourdsworth.net import PROTO, recv_msg, send_msg
+
+    _stub_client_side(crate_client, monkeypatch)
+    plays: list[str] = []
+    lines: list[str] = []
+    orig_print = builtins.print
+
+    def spy(*args, **kwargs):
+        lines.append(" ".join(str(item) for item in args))
+        return orig_print(*args, **kwargs)
+
+    def play(**kwargs):
+        plays.append(str(kwargs.get("kind") or ""))
+
+    monkeypatch.setattr(builtins, "print", spy)
+    monkeypatch.setattr(crate_client, "_play_local_shutdown", play)
+    waits: list[float] = []
+    assert _virtual_reconnect_waits(
+        crate_client, monkeypatch, waits, lambda seen: len(seen) >= 4
+    )
+
+    def on_accept(conn, _n, _held) -> None:
+        conn.settimeout(1.0)
+        buf = bytearray()
+        header, _payload = recv_msg(conn, buf)
+        if header.get("event") != "hello":
+            raise AssertionError(f"expected hello, got {header!r}")
+        send_msg(conn, {"event": "hello", "role": "desktop", "proto": PROTO})
+        send_msg(conn, {"event": "ready"})
+        try:
+            conn.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        conn.close()
+
+    accepted, rc = _drive_pi_main(crate_client, on_accept, tmp_path)
+    assert len(accepted) >= 4, len(accepted)
+    assert waits[0] == pytest.approx(1.0)
+    assert all(nxt + 1e-9 >= prev for prev, nxt in zip(waits, waits[1:]))
+    cap = float(crate_client.RECONNECT_BACKOFF_MAX_S)
+    for prev, nxt in zip(waits, waits[1:]):
+        assert nxt == pytest.approx(min(prev * 2.0, cap))
+    assert len(waits) >= 4, waits
+    ready_lines = [line for line in lines if line.strip() == "ready."]
+    gone_lines = [line for line in lines if "desktop gone" in line]
+    assert len(ready_lines) >= 4, lines
+    assert len(gone_lines) == 1, gone_lines
+    assert plays == ["disconnect"], plays
+    assert rc == 0
+
+
+def test_completed_tts_resets_backoff_without_min_duration(
+    crate_client, monkeypatch, tmp_path
+):
+    """A finished server reply resets backoff even when the session is short."""
+    from gourdsworth.net import PROTO, recv_msg, send_msg
+
+    _stub_client_side(crate_client, monkeypatch)
+    monkeypatch.setenv("CRATE_MIN_GOOD_SESSION_S", "30")
+
+    def fake_tts(header, payload):
+        del header
+        return bool(payload)
+
+    monkeypatch.setattr(crate_client, "_play_tts", fake_tts)
+
+    def wait_trigger(gpio, stop, conn=None):
+        del gpio, stop
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            if crate_client._SESSION_HAD_TRAFFIC:
+                break
+            if conn is not None and conn.closed:
+                break
+            time.sleep(0.01)
+        return "disconnect"
+
+    monkeypatch.setattr(crate_client, "_wait_trigger", wait_trigger)
+    waits: list[float] = []
+    assert _virtual_reconnect_waits(
+        crate_client, monkeypatch, waits, lambda seen: len(seen) >= 4
+    )
+
+    def on_accept(conn, n, held) -> None:
+        if n != 4:
+            conn.close()
+            return
+        conn.settimeout(1.0)
+        buf = bytearray()
+        header, _payload = recv_msg(conn, buf)
+        if header.get("event") != "hello":
+            raise AssertionError(header)
+        send_msg(conn, {"event": "hello", "role": "desktop", "proto": PROTO})
+        send_msg(conn, {"event": "ready"})
+        send_msg(
+            conn,
+            {"event": "play", "rate": 16000, "channels": 1, "format": "f32le"},
+            b"\x00\x00\x00\x00" * 8,
+        )
+        held.append(conn)
+
+    _accepted, rc = _drive_pi_main(crate_client, on_accept, tmp_path, join_s=4.0)
+    assert waits == pytest.approx([1.0, 2.0, 4.0, 1.0]), waits
+    assert rc == 0

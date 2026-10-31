@@ -17,6 +17,7 @@ from gourdsworth.net import (
     CrateListener,
     carry_history_for_peer,
     is_loopback,
+    TrustedPeersError,
     load_trusted_peers,
     resolve_bind,
     serve_echo,
@@ -679,24 +680,25 @@ def _crate_settings(cfg: dict) -> tuple[str, int]:
 
 
 def _trusted_for_start(cfg: dict, host: str):
-    """Merge trusted peers once and warn when a LAN bind has an empty list.
+    """Merge trusted peers once.
 
-    An empty list still starts. The returned set is what the listener uses;
-    it does not read ``CRATE_TRUSTED_PEERS`` again.
+    A non-loopback bind with an empty list raises ``TrustedPeersError``
+    and callers exit 2. Loopback with an empty list still starts. An entry
+    that is not an IP raises ``TrustedPeersError`` as well. The returned set
+    is what the listener uses; it does not read ``CRATE_TRUSTED_PEERS`` again.
     """
     raw = (cfg.get("crate") or {}).get("trusted_peers")
     trusted = load_trusted_peers(raw)
     if not is_loopback(host) and not trusted:
-        print(
-            "warning: crate is bound off loopback and trusted_peers is empty. "
-            "Any LAN host may take an empty slot and hold it. Set "
-            "CRATE_TRUSTED_PEERS to the Pi's address only "
-            "(Environment=CRATE_TRUSTED_PEERS=192.0.2.55 in the user unit, "
-            "or a drop-in from `systemctl --user edit gourdsworth-server`) "
-            "or set crate.trusted_peers in config.yaml. The list should "
-            "contain only the Pi. Starting anyway.",
-            file=sys.stderr,
-            flush=True,
+        raise TrustedPeersError(
+            "Refusing to start: crate would bind a non-loopback address "
+            f"({host}) and trusted_peers is empty. Any host that can reach "
+            "the port may take an empty slot. Set CRATE_TRUSTED_PEERS to the "
+            "Pi's address only (Environment=CRATE_TRUSTED_PEERS=192.0.2.55 "
+            "in the user unit, or a drop-in from "
+            "`systemctl --user edit gourdsworth-server`) or set "
+            "crate.trusted_peers in config.yaml. The list should contain "
+            "only the Pi."
         )
     return trusted
 
@@ -722,7 +724,11 @@ def _run_crate_echo(args) -> int:
     else:
         print(f"  bind {host}:{port}  WARNING: LAN bind. PCM/JPEG reachable on this network. No TLS.")
     print("  Ctrl+C to quit")
-    trusted = _trusted_for_start(cfg, host)
+    try:
+        trusted = _trusted_for_start(cfg, host)
+    except TrustedPeersError as exc:
+        print(exc, file=sys.stderr, flush=True)
+        return 2
     try:
         code = serve_echo(host, port, trusted_peers=trusted, trust_env=False)
     except KeyboardInterrupt:
@@ -757,12 +763,16 @@ def _serve_crate(cfg, mayor, stt, speaker, sidecar, canned) -> int:
         print("  vision: JPEG stills from the crate (desktop camera unused)")
     print("  Talk is the Pi button / Enter. Ctrl+C to quit.")
     print()
+    try:
+        trusted = _trusted_for_start(cfg, host)
+    except TrustedPeersError as exc:
+        print(exc, file=sys.stderr, flush=True)
+        return 2
     listener = CrateListener(host, port)
     # History survives only an exact same-IP reconnect. A different IP,
     # trusted or not, starts empty. The turn cap stays in the turn handler.
     history: list[dict] = []
     last_peer: dict[str, str | None] = {"ip": None}
-    trusted = _trusted_for_start(cfg, host)
 
     def _one(conn) -> None:
         peer = conn.peer or ("?", 0)
