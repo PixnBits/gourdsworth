@@ -1189,3 +1189,64 @@ def test_vet_thread_start_failure_releases_slot_and_serves_next(monkeypatch, cap
             pass
         thread.join(timeout=2.0)
         assert not thread.is_alive(), f"server still running err={box.get('err')!r}"
+
+
+def test_vet_start_log_while_slot_held_and_socket_open(monkeypatch, capsys):
+    """vet-start is logged before the hello slot is released or the socket closed."""
+    from gourdsworth import net as netmod
+
+    monkeypatch.delenv("CRATE_TRUSTED_PEERS", raising=False)
+    real_start = threading.Thread.start
+    state = {"boom": False}
+
+    def start(self):
+        if self.name == "gourdsworth-crate-hello" and not state["boom"]:
+            state["boom"] = True
+            raise RuntimeError("cannot start thread")
+        return real_start(self)
+
+    monkeypatch.setattr(threading.Thread, "start", start)
+    observed = {"logged": False, "held": None, "open": None}
+    real_log = netmod._NewestAccept._log_limited
+
+    def spy(self, kind, message):
+        if kind == "vet-start":
+            observed["logged"] = True
+            with self._cv:
+                socks = list(self._vet_socks)
+                held = bool(socks) and all(sock in self._hello_ips for sock in socks)
+            open_ok = True
+            if not socks:
+                open_ok = False
+            for sock in socks:
+                try:
+                    open_ok = open_ok and sock.fileno() >= 0
+                except OSError:
+                    open_ok = False
+            observed["held"] = held
+            observed["open"] = open_ok
+        return real_log(self, kind, message)
+
+    monkeypatch.setattr(netmod._NewestAccept, "_log_limited", spy)
+    listener, thread, box = _serve(lambda conn: None)
+    sock = None
+    try:
+        sock = socket.create_connection(("127.0.0.1", listener.port), timeout=2)
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline and not observed["logged"]:
+            time.sleep(0.01)
+        assert observed["logged"] is True, capsys.readouterr().err
+        assert observed["held"] is True, observed
+        assert observed["open"] is True, observed
+        assert state["boom"] is True
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+        try:
+            listener.close()
+        except OSError:
+            pass
+        thread.join(timeout=2.0)

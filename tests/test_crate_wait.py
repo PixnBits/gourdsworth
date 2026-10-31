@@ -1079,14 +1079,15 @@ def test_short_ready_close_grows_backoff_and_announces_once(
     assert rc == 0
 
 
-def test_completed_tts_resets_backoff_without_min_duration(
+def test_completed_reply_meeting_traffic_minimum_resets_backoff(
     crate_client, monkeypatch, tmp_path
 ):
-    """A finished server reply resets backoff even when the session is short."""
+    """A finished reply resets backoff once the session meets the traffic minimum."""
     from gourdsworth.net import PROTO, recv_msg, send_msg
 
     _stub_client_side(crate_client, monkeypatch)
     monkeypatch.setenv("CRATE_MIN_GOOD_SESSION_S", "30")
+    monkeypatch.setenv("CRATE_MIN_TRAFFIC_SESSION_S", "0.05")
 
     def fake_tts(header, payload):
         del header
@@ -1099,6 +1100,7 @@ def test_completed_tts_resets_backoff_without_min_duration(
         deadline = time.monotonic() + 1.0
         while time.monotonic() < deadline:
             if crate_client._SESSION_HAD_TRAFFIC:
+                time.sleep(0.08)
                 break
             if conn is not None and conn.closed:
                 break
@@ -1131,4 +1133,126 @@ def test_completed_tts_resets_backoff_without_min_duration(
 
     _accepted, rc = _drive_pi_main(crate_client, on_accept, tmp_path, join_s=4.0)
     assert waits == pytest.approx([1.0, 2.0, 4.0, 1.0]), waits
+    assert rc == 0
+
+
+def test_short_completed_reply_keeps_backoff_and_announces_once(
+    crate_client, monkeypatch, tmp_path
+):
+    """A completed reply that ends ~0.3 s later does not reset backoff or the announce clock."""
+    import builtins
+
+    from gourdsworth.net import PROTO, recv_msg, send_msg
+
+    _stub_client_side(crate_client, monkeypatch)
+    monkeypatch.delenv("CRATE_MIN_TRAFFIC_SESSION_S", raising=False)
+    monkeypatch.delenv("CRATE_MIN_GOOD_SESSION_S", raising=False)
+    plays: list[str] = []
+    lines: list[str] = []
+    saw = {"traffic": 0}
+    orig_print = builtins.print
+
+    def spy(*args, **kwargs):
+        lines.append(" ".join(str(item) for item in args))
+        return orig_print(*args, **kwargs)
+
+    def play(**kwargs):
+        plays.append(str(kwargs.get("kind") or ""))
+
+    def fake_tts(header, payload):
+        del header
+        return bool(payload)
+
+    monkeypatch.setattr(builtins, "print", spy)
+    monkeypatch.setattr(crate_client, "_play_local_shutdown", play)
+    monkeypatch.setattr(crate_client, "_play_tts", fake_tts)
+
+    def wait_trigger(gpio, stop, conn=None):
+        del gpio, stop
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            if crate_client._SESSION_HAD_TRAFFIC:
+                saw["traffic"] += 1
+                time.sleep(0.3)
+                return "disconnect"
+            if conn is not None and conn.closed:
+                break
+            time.sleep(0.01)
+        return "disconnect"
+
+    monkeypatch.setattr(crate_client, "_wait_trigger", wait_trigger)
+    waits: list[float] = []
+    assert _virtual_reconnect_waits(
+        crate_client, monkeypatch, waits, lambda seen: len(seen) >= 4
+    )
+
+    def on_accept(conn, _n, held) -> None:
+        conn.settimeout(1.0)
+        buf = bytearray()
+        header, _payload = recv_msg(conn, buf)
+        if header.get("event") != "hello":
+            raise AssertionError(header)
+        send_msg(conn, {"event": "hello", "role": "desktop", "proto": PROTO})
+        send_msg(conn, {"event": "ready"})
+        send_msg(
+            conn,
+            {"event": "play", "rate": 16000, "channels": 1, "format": "f32le"},
+            b"\x00\x00\x00\x00" * 4,
+        )
+        held.append(conn)
+
+    accepted, rc = _drive_pi_main(crate_client, on_accept, tmp_path, join_s=8.0)
+    assert len(accepted) >= 4, len(accepted)
+    assert saw["traffic"] >= 4, saw
+    assert waits[0] == pytest.approx(1.0)
+    assert all(nxt + 1e-9 >= prev for prev, nxt in zip(waits, waits[1:]))
+    cap = float(crate_client.RECONNECT_BACKOFF_MAX_S)
+    for prev, nxt in zip(waits, waits[1:]):
+        assert nxt == pytest.approx(min(prev * 2.0, cap))
+    assert len(waits) >= 4, waits
+    gone_lines = [line for line in lines if "desktop gone" in line]
+    assert len(gone_lines) == 1, gone_lines
+    assert plays == ["disconnect"], plays
+    assert rc == 0
+
+
+def test_good_session_reconnect_waits_at_least_minimum_backoff(
+    crate_client, monkeypatch, tmp_path
+):
+    """After a good session the next reconnect still waits at least the minimum backoff."""
+    from gourdsworth.net import PROTO, recv_msg, send_msg
+
+    _stub_client_side(crate_client, monkeypatch)
+    monkeypatch.setenv("CRATE_MIN_GOOD_SESSION_S", "0.05")
+    floor = float(crate_client.RECONNECT_BACKOFF_MIN_S)
+
+    def wait_trigger(gpio, stop, conn=None):
+        del gpio, stop, conn
+        time.sleep(0.12)
+        return "disconnect"
+
+    monkeypatch.setattr(crate_client, "_wait_trigger", wait_trigger)
+    waits: list[float] = []
+    assert _virtual_reconnect_waits(
+        crate_client, monkeypatch, waits, lambda seen: len(seen) >= 4
+    )
+
+    def on_accept(conn, n, held) -> None:
+        if n != 4:
+            conn.close()
+            return
+        conn.settimeout(1.0)
+        buf = bytearray()
+        header, _payload = recv_msg(conn, buf)
+        if header.get("event") != "hello":
+            raise AssertionError(header)
+        send_msg(conn, {"event": "hello", "role": "desktop", "proto": PROTO})
+        send_msg(conn, {"event": "ready"})
+        held.append(conn)
+
+    accepted, rc = _drive_pi_main(crate_client, on_accept, tmp_path, join_s=4.0)
+    assert waits == pytest.approx([1.0, 2.0, 4.0, floor]), waits
+    assert waits[-1] >= floor
+    # The fourth wait is the post-good pause, before any further connect.
+    assert len(accepted) == 4, len(accepted)
     assert rc == 0

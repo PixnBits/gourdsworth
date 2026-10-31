@@ -20,6 +20,7 @@ import argparse
 import math
 import os
 import select
+import shutil
 import signal
 import socket
 import subprocess
@@ -200,7 +201,11 @@ _CLEANUP_DONE = False
 _ACTIVE_CAPS: set = set()  # live cv2.VideoCapture objects
 _PW_PLAY_PROC = None  # live pw-play Popen
 _PW_PLAY_GROUPS: set[int] = set()  # pids started with start_new_session
-_PLAYBACK_CANCEL = threading.Event()
+_PW_PLAY_LOCK = threading.Lock()
+# Session TTS cancel. A bump stops in-flight TTS only. Chimes do not read it.
+_PLAYBACK_GEN = 0
+_SESSION_PLAY_TOKEN = 0
+_PLAYBACK_GEN_LOCK = threading.Lock()
 _SESSION_HAD_TRAFFIC = False
 _BAD_TIMEOUTS: set[str] = set()
 _FACE: face_link.FaceLink | None = None
@@ -224,9 +229,11 @@ _RECONNECT_WATCH_LOCK = threading.Lock()
 UPLINK_CLOSE_TIMEOUT_S = 5.0
 CHIME_PW_PLAY_TIMEOUT_S = 5.0
 RECONNECT_STEP_TIMEOUT_S = 20.0
-# A ready-then-close is not a good session until it lasts this long, unless
-# a reply was actually played. Override with CRATE_MIN_GOOD_SESSION_S.
+# A session is good when its span reaches MIN_GOOD_SESSION_S after ready, or
+# when a completed reply is paired with a span of at least MIN_TRAFFIC_SESSION_S.
+# Override with CRATE_MIN_GOOD_SESSION_S and CRATE_MIN_TRAFFIC_SESSION_S.
 MIN_GOOD_SESSION_S = 15.0
+MIN_TRAFFIC_SESSION_S = 3.0
 # pw-play wait budget beyond the PCM duration. Override with CRATE_TTS_PLAY_MARGIN_S.
 TTS_PLAY_MARGIN_S = 5.0
 PW_PLAY_KILL_GRACE_S = 0.25
@@ -333,6 +340,7 @@ def _reset_shutdown_state_for_tests() -> None:
     """Reset signal-shutdown flags so unit tests do not leak into each other."""
     global _SHUTDOWN_SIGNAL, _CLEANUP_DONE, _SESSION_HAD_TRAFFIC
     global _UPLINK_STREAM, _UPLINK_STREAM_STATE, _DEFERRED_CHIME, _RECONNECT_STEP_AT
+    global _PW_PLAY_PROC, _PLAYBACK_GEN, _SESSION_PLAY_TOKEN
     _stop_reconnect_watchdog()
     _SHUTDOWN.clear()
     _SHUTDOWN_SIGNAL = None
@@ -342,8 +350,12 @@ def _reset_shutdown_state_for_tests() -> None:
         _reap_pw_play_groups(grace=0.1)
     except Exception:
         pass
-    _PW_PLAY_GROUPS.clear()
-    _PLAYBACK_CANCEL.clear()
+    with _PW_PLAY_LOCK:
+        _PW_PLAY_GROUPS.clear()
+        _PW_PLAY_PROC = None
+    with _PLAYBACK_GEN_LOCK:
+        _PLAYBACK_GEN = 0
+        _SESSION_PLAY_TOKEN = 0
     _SESSION_HAD_TRAFFIC = False
     _BAD_TIMEOUTS.clear()
     with _UPLINK_STREAM_LOCK:
@@ -706,80 +718,81 @@ def _warn_bad_timeout(env_name: str, text: str, default: float) -> None:
     )
 
 
+def _pw_play_pid(proc) -> int:
+    try:
+        pid = getattr(proc, "pid", None)
+        return int(pid) if pid else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def _signal_pw_group(proc, sig: int) -> None:
+    """Signal a tracked process group before anyone reaps the leader.
+
+    ``ProcessLookupError`` means the group is already gone. A handle that is
+    not a real process group still gets ``terminate`` / ``kill``. Never raises.
+    """
+    pid_i = _pw_play_pid(proc)
+    grouped = False
+    if pid_i > 1:
+        with _PW_PLAY_LOCK:
+            grouped = pid_i in _PW_PLAY_GROUPS
+    sent = False
+    if grouped:
+        try:
+            os.killpg(pid_i, sig)
+            sent = True
+        except ProcessLookupError:
+            sent = False
+        except OSError:
+            sent = False
+    if sent:
+        return
+    try:
+        if sig == signal.SIGKILL:
+            proc.kill()
+        else:
+            proc.terminate()
+    except Exception:
+        pass
+
+
+def _kill_exited_group(pid_i: int) -> None:
+    """SIGKILL a group whose leader has exited and has not been reaped yet."""
+    if pid_i <= 1:
+        return
+    try:
+        os.killpg(pid_i, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except OSError:
+        pass
+
+
 def _kill_pw_play_group(proc, grace: float | None = None) -> None:
     """SIGTERM the pw-play process group, then SIGKILL after a short grace.
 
-    A process started with ``start_new_session`` is signalled via ``killpg``.
-    Anything else gets ``terminate`` / ``kill`` on that process only. A leader
-    that has already exited still gets ``killpg`` so a forked grandchild does
-    not keep the group alive. Never raises. The pid leaves ``_PW_PLAY_GROUPS``.
+    The group is signalled before ``wait`` reaps the leader, so a grandchild
+    is still in the group. Never raises. The pid leaves ``_PW_PLAY_GROUPS``.
     """
     if proc is None:
         return
     grace_s = float(PW_PLAY_KILL_GRACE_S if grace is None else grace)
-    pid = getattr(proc, "pid", None)
+    pid_i = _pw_play_pid(proc)
     try:
-        pid_i = int(pid) if pid else 0
-    except (TypeError, ValueError):
-        pid_i = 0
-    grouped = bool(pid_i) and pid_i in _PW_PLAY_GROUPS
-    try:
-        already = proc.poll() is not None
-    except Exception:
-        already = False
-
-    def _signal(sig: int) -> None:
-        sent = False
-        if grouped:
-            try:
-                os.killpg(pid_i, sig)
-                sent = True
-            except (ProcessLookupError, PermissionError, OSError):
-                sent = False
-        if sent:
-            return
+        _signal_pw_group(proc, signal.SIGTERM)
         try:
-            if sig == signal.SIGKILL:
-                proc.kill()
-            else:
-                proc.terminate()
+            proc.wait(timeout=max(0.05, grace_s))
         except Exception:
-            pass
-
-    def _killpg(sig: int) -> None:
-        if not grouped:
-            return
-        try:
-            os.killpg(pid_i, sig)
-        except (ProcessLookupError, PermissionError, OSError):
-            pass
-
-    try:
-        if not already:
-            _signal(signal.SIGTERM)
+            _signal_pw_group(proc, signal.SIGKILL)
             try:
                 proc.wait(timeout=max(0.05, grace_s))
             except Exception:
                 pass
-            try:
-                still = proc.poll() is None
-            except Exception:
-                still = False
-            if still:
-                _signal(signal.SIGKILL)
-                try:
-                    proc.wait(timeout=max(0.05, grace_s))
-                except Exception:
-                    pass
-            else:
-                # Leader exited. killpg only — the pid may already have been
-                # reaped, and a grandchild can still be in the group.
-                _killpg(signal.SIGKILL)
-        else:
-            _killpg(signal.SIGKILL)
     finally:
         if pid_i:
-            _PW_PLAY_GROUPS.discard(pid_i)
+            with _PW_PLAY_LOCK:
+                _PW_PLAY_GROUPS.discard(pid_i)
 
 
 class _PwPlayGroup:
@@ -829,21 +842,20 @@ def _reap_pw_play_groups(grace: float | None = None) -> None:
     group is reaped even when it is not the current ``_PW_PLAY_PROC``.
     """
     global _PW_PLAY_PROC
-    proc = _PW_PLAY_PROC
-    _PW_PLAY_PROC = None
+    with _PW_PLAY_LOCK:
+        proc = _PW_PLAY_PROC
+        _PW_PLAY_PROC = None
+        pids = list(_PW_PLAY_GROUPS)
     seen: set[int] = set()
     if proc is not None:
-        try:
-            pid_i = int(proc.pid) if getattr(proc, "pid", None) else 0
-        except (TypeError, ValueError):
-            pid_i = 0
+        pid_i = _pw_play_pid(proc)
         if pid_i:
             seen.add(pid_i)
         try:
             _kill_pw_play_group(proc, grace=grace)
         except Exception:
             pass
-    for pid_i in list(_PW_PLAY_GROUPS):
+    for pid_i in pids:
         if pid_i in seen:
             continue
         try:
@@ -852,9 +864,128 @@ def _reap_pw_play_groups(grace: float | None = None) -> None:
             pass
 
 
+def _track_pw_play(proc) -> int:
+    global _PW_PLAY_PROC
+    pid_i = _pw_play_pid(proc)
+    with _PW_PLAY_LOCK:
+        if pid_i:
+            _PW_PLAY_GROUPS.add(pid_i)
+        _PW_PLAY_PROC = proc
+    return pid_i
+
+
+def _untrack_pw_play(proc) -> None:
+    global _PW_PLAY_PROC
+    if proc is None:
+        return
+    pid_i = _pw_play_pid(proc)
+    with _PW_PLAY_LOCK:
+        if _PW_PLAY_PROC is proc:
+            _PW_PLAY_PROC = None
+        if pid_i:
+            _PW_PLAY_GROUPS.discard(pid_i)
+
+
+def _leader_exited_unreaped(pid_i: int) -> bool | None:
+    """True when ``pid_i`` has exited and is still waitable.
+
+    None when ``waitid`` cannot answer (not our child, or the flag is missing).
+    This does not reap.
+    """
+    if pid_i <= 0 or not hasattr(os, "waitid"):
+        return None
+    no_wait = getattr(os, "WNOWAIT", None)
+    if no_wait is None:
+        return None
+    try:
+        info = os.waitid(os.P_PID, pid_i, os.WEXITED | os.WNOHANG | no_wait)
+    except (ChildProcessError, OSError, AttributeError):
+        return None
+    if info is None:
+        return False
+    return True
+
+
+def _await_pw_play(proc, timeout_s: float, stop) -> str:
+    """Wait for pw-play. Returns ``ok``, ``fail``, ``timeout``, or ``stopped``.
+
+    A normal exit still SIGKILLs the process group before ``wait`` reaps the
+    leader, so a forked grandchild does not stay behind. ``stop`` is polled
+    for session TTS cancel or process shutdown; chimes pass shutdown only.
+    """
+    pid_i = _pw_play_pid(proc)
+    deadline = time.monotonic() + max(0.0, float(timeout_s))
+    while True:
+        if stop():
+            _kill_pw_play_group(proc)
+            return "stopped"
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            _kill_pw_play_group(proc)
+            return "timeout"
+        state = _leader_exited_unreaped(pid_i)
+        if state is True:
+            _kill_exited_group(pid_i)
+            try:
+                proc.wait(timeout=1.0)
+            except Exception:
+                pass
+            return "ok" if proc.returncode == 0 else "fail"
+        if state is None:
+            try:
+                proc.wait(timeout=min(0.05, remaining))
+            except subprocess.TimeoutExpired:
+                continue
+            _kill_exited_group(pid_i)
+            return "ok" if proc.returncode == 0 else "fail"
+        time.sleep(min(0.05, remaining))
+
+
+def _spawn_pw_play(wav_path: str, *, env: dict | None = None):
+    """Start ``pw-play`` in its own session. None when the binary is missing.
+
+    The path is resolved here, not cached, so a test can put a fake first on
+    ``PATH``. A missing binary uses the same log line as a failed exec.
+    """
+    binary = shutil.which("pw-play")
+    if not binary:
+        print("  (pw-play missing; skip local shutdown line)")
+        return None
+    try:
+        proc = subprocess.Popen(
+            [binary, os.fspath(wav_path)],
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except FileNotFoundError:
+        print("  (pw-play missing; skip local shutdown line)")
+        return None
+    _track_pw_play(proc)
+    return proc
+
+
+def _playback_generation() -> int:
+    with _PLAYBACK_GEN_LOCK:
+        return _PLAYBACK_GEN
+
+
+def _session_playback_token() -> int:
+    with _PLAYBACK_GEN_LOCK:
+        return _SESSION_PLAY_TOKEN
+
+
+def _playback_cancelled(token: int) -> bool:
+    with _PLAYBACK_GEN_LOCK:
+        return _PLAYBACK_GEN != int(token)
+
+
 def _cancel_inflight_playback() -> None:
-    """Stop TTS or a chime so teardown cannot wait it out. Does not take the lock."""
-    _PLAYBACK_CANCEL.set()
+    """Stop in-flight TTS. A later chime does not see this cancel."""
+    global _PLAYBACK_GEN
+    with _PLAYBACK_GEN_LOCK:
+        _PLAYBACK_GEN += 1
     try:
         import sounddevice as sd
 
@@ -865,31 +996,87 @@ def _cancel_inflight_playback() -> None:
 
 
 def _mark_session_traffic() -> None:
-    """A finished server reply counts as a good session even if it was short."""
+    """A finished server reply happened during this session."""
     global _SESSION_HAD_TRAFFIC
-    if _PLAYBACK_CANCEL.is_set():
+    if _playback_cancelled(_session_playback_token()):
         return
     _SESSION_HAD_TRAFFIC = True
 
 
 def _reset_session_playback() -> None:
-    global _SESSION_HAD_TRAFFIC
+    global _SESSION_HAD_TRAFFIC, _SESSION_PLAY_TOKEN
     _SESSION_HAD_TRAFFIC = False
-    _PLAYBACK_CANCEL.clear()
+    with _PLAYBACK_GEN_LOCK:
+        _SESSION_PLAY_TOKEN = _PLAYBACK_GEN
 
 
-def _play_pcm_f32(samples, rate: int) -> bool:
+def _play_pcm_sounddevice(samples, rate: int, timeout_s: float, stop) -> bool:
+    """Non-blocking PortAudio play with a deadline. Always releases the lock.
+
+    ``sd.wait`` has no timeout. A side thread calls it. This thread stops the
+    stream when the deadline passes or the session TTS token is cancelled.
+    """
+    import sounddevice as sd
+
+    with _AUDIO_LOCK:
+        if stop():
+            return False
+        try:
+            sd.play(samples, int(rate), blocking=False)
+        except TypeError:
+            sd.play(samples, int(rate))
+        done = threading.Event()
+
+        def _wait() -> None:
+            try:
+                sd.wait()
+            except Exception:
+                pass
+            finally:
+                done.set()
+
+        threading.Thread(target=_wait, name="crate-sd-wait", daemon=True).start()
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        while not done.is_set():
+            if stop():
+                try:
+                    sd.stop()
+                except Exception:
+                    pass
+                return False
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                try:
+                    sd.stop()
+                except Exception:
+                    pass
+                return False
+            done.wait(timeout=min(0.05, remaining))
+        if stop():
+            try:
+                sd.stop()
+            except Exception:
+                pass
+            return False
+        return True
+
+
+def _play_pcm_f32(samples, rate: int, token: int | None = None) -> bool:
     """Play mono float32 PCM. True when playback finishes without cancel or timeout.
 
     Prefer pw-play for PipeWire/Bluetooth sinks. The player is its own process
-    group. ``wait`` is bounded by the clip length plus ``CRATE_TTS_PLAY_MARGIN_S``;
-    on timeout the group is killed so ``_AUDIO_LOCK`` is always released.
+    group. The wait is bounded by the clip length plus ``CRATE_TTS_PLAY_MARGIN_S``.
+    On timeout or session cancel the group is killed and ``_AUDIO_LOCK`` is released.
+    ``token`` is the session TTS generation. Chimes do not use this path.
     """
-    global _PW_PLAY_PROC
     import numpy as np
 
     samples = np.asarray(samples, dtype=np.float32).reshape(-1)
     if samples.size == 0 or rate <= 0:
+        return False
+    if token is None:
+        token = _session_playback_token()
+    if _playback_cancelled(token) or _SHUTDOWN.is_set():
         return False
     # Bluetooth A2DP often clips the first ~100ms — prime with short silence.
     prime_ms = _bt_prime_ms()
@@ -898,14 +1085,19 @@ def _play_pcm_f32(samples, rate: int) -> bool:
         n_prime = max(1, int(rate * (prime_ms / 1000.0)))
         samples = np.concatenate([np.zeros(n_prime, dtype=np.float32), samples])
     duration = float(samples.size) / float(rate) if rate else 0.0
+    timeout_s = max(0.0, duration) + _tts_play_margin_s()
+
+    def _stop() -> bool:
+        return _playback_cancelled(token) or _SHUTDOWN.is_set()
+
     if backend == "pw":
         import tempfile
-        import wave
 
         clipped = np.clip(samples, -1.0, 1.0)
         pcm = np.clip(np.rint(clipped * 32767.0), -32768, 32767).astype("<i2")
         fd, wav_path = tempfile.mkstemp(prefix="crate-play-", suffix=".wav")
         os.close(fd)
+        proc = None
         try:
             with wave.open(wav_path, "wb") as wf:
                 wf.setnchannels(1)
@@ -914,51 +1106,25 @@ def _play_pcm_f32(samples, rate: int) -> bool:
                 wf.writeframes(pcm.tobytes())
             env = os.environ.copy()
             env.setdefault("PIPEWIRE_LATENCY", "1024/48000")
-            timeout_s = max(0.0, duration) + _tts_play_margin_s()
             with _AUDIO_LOCK:
-                proc = None
-                finished = False
+                if _stop():
+                    return False
+                proc = _spawn_pw_play(wav_path, env=env)
+                if proc is None:
+                    return False
                 try:
-                    proc = subprocess.Popen(
-                        ["pw-play", wav_path],
-                        env=env,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        start_new_session=True,
-                    )
-                    if proc.pid:
-                        _PW_PLAY_GROUPS.add(int(proc.pid))
-                    _PW_PLAY_PROC = proc
-                    if _PLAYBACK_CANCEL.is_set():
-                        _kill_pw_play_group(proc)
-                    else:
-                        try:
-                            proc.wait(timeout=timeout_s)
-                        except subprocess.TimeoutExpired:
-                            _kill_pw_play_group(proc)
-                    finished = proc.returncode == 0 and not _PLAYBACK_CANCEL.is_set()
+                    outcome = _await_pw_play(proc, timeout_s, _stop)
+                    return outcome == "ok" and not _stop()
                 finally:
-                    if proc is not None and _PW_PLAY_PROC is proc:
-                        _PW_PLAY_PROC = None
-                    if proc is not None and getattr(proc, "pid", None):
-                        _PW_PLAY_GROUPS.discard(int(proc.pid))
-                return finished
+                    if proc.returncode is None:
+                        _kill_pw_play_group(proc)
+                    _untrack_pw_play(proc)
         finally:
             try:
                 os.unlink(wav_path)
             except OSError:
                 pass
-    import sounddevice as sd
-
-    with _AUDIO_LOCK:
-        if _PLAYBACK_CANCEL.is_set():
-            return False
-        try:
-            sd.play(samples, int(rate), blocking=True)
-        except TypeError:
-            sd.play(samples, int(rate))
-            sd.wait()
-        return not _PLAYBACK_CANCEL.is_set()
+    return _play_pcm_sounddevice(samples, int(rate), timeout_s, _stop)
 
 
 def _timeout_s(env_name: str, default: float) -> float:
@@ -1001,6 +1167,10 @@ def _exit_cleanup_timeout_s() -> float:
 
 def _min_good_session_s() -> float:
     return _timeout_s("CRATE_MIN_GOOD_SESSION_S", MIN_GOOD_SESSION_S)
+
+
+def _min_traffic_session_s() -> float:
+    return _timeout_s("CRATE_MIN_TRAFFIC_SESSION_S", MIN_TRAFFIC_SESSION_S)
 
 
 def _tts_play_margin_s() -> float:
@@ -1244,71 +1414,48 @@ def _shutdown_wav_path(kind: str) -> Path | None:
 def _pw_play_chime(path: Path) -> None:
     """Play one canned wav with ``pw-play``. Never raises and never uses PortAudio.
 
-    The player is its own session, same as TTS. ``wait`` is bounded by the
-    chime timeout. On timeout, session teardown, or shutdown the whole process
-    group is killed (SIGTERM, then SIGKILL). A missing ``pw-play`` or a timeout
-    is logged and ignored. The group pid is not left in ``_PW_PLAY_GROUPS``.
+    The player is its own session, same as TTS. The wait is bounded by the
+    chime timeout. Process shutdown and that timeout kill the process group.
+    A session TTS cancel does not. A normal exit still signals the group
+    before the leader is reaped. A missing ``pw-play`` or a timeout is logged
+    and ignored. The group pid is not left in ``_PW_PLAY_GROUPS``.
     """
-    global _PW_PLAY_PROC
     timeout = _chime_timeout_s()
     wavpath = os.fspath(path)
     proc = None
     try:
         try:
-            proc = subprocess.Popen(
-                ["pw-play", wavpath],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
-            )
-        except FileNotFoundError:
-            print("  (pw-play missing; skip local shutdown line)")
-            return
+            proc = _spawn_pw_play(wavpath)
         except Exception as exc:
             print(f"  (shutdown wav failed: {exc})")
             return
-        try:
-            pid_i = int(proc.pid) if proc.pid else 0
-        except (TypeError, ValueError):
-            pid_i = 0
-        if pid_i:
-            _PW_PLAY_GROUPS.add(pid_i)
-        _PW_PLAY_PROC = proc
-        if _PLAYBACK_CANCEL.is_set() or _SHUTDOWN.is_set():
-            _kill_pw_play_group(proc)
+        if proc is None:
             return
         try:
-            proc.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            _kill_pw_play_group(proc)
+            outcome = _await_pw_play(proc, timeout, _SHUTDOWN.is_set)
+        except Exception as exc:
+            print(f"  (shutdown wav failed: {exc})")
+            return
+        if outcome == "timeout":
             print(f"  (pw-play chime timed out after {timeout:.1f}s)")
             return
-        except Exception as exc:
-            print(f"  (shutdown wav failed: {exc})")
+        if outcome == "stopped":
             return
-        code = proc.returncode
-        if code not in (0, None):
+        if outcome != "ok":
+            code = proc.returncode
             print(f"  (pw-play chime failed: exit {code})")
             return
-        if code == 0:
-            print(f"  shutdown line: {path.name}  playback=pw")
+        print(f"  shutdown line: {path.name}  playback=pw")
     except Exception as exc:
         print(f"  (shutdown wav failed: {exc})")
     finally:
         if proc is not None:
             try:
-                if proc.poll() is None:
+                if proc.returncode is None:
                     _kill_pw_play_group(proc)
             except Exception:
                 pass
-            if _PW_PLAY_PROC is proc:
-                _PW_PLAY_PROC = None
-            try:
-                pid_i = int(proc.pid) if getattr(proc, "pid", None) else 0
-            except (TypeError, ValueError):
-                pid_i = 0
-            if pid_i:
-                _PW_PLAY_GROUPS.discard(pid_i)
+            _untrack_pw_play(proc)
 
 
 def _play_local_shutdown(*, kind: str = "disconnect") -> None:
@@ -1342,9 +1489,11 @@ SUPERSEDED_BACKOFF_JITTER_S = 5.0
 # Failed or unserved connects: refused TCP, close/EOF/RST at accept, or a
 # session that ends before it counts as good. Start at MIN and double up to
 # MAX. Jitter is added on top, so a retry is never sooner than the base.
-# A session is good when it stays up for MIN_GOOD_SESSION_S after ready, or
-# when a server reply finishes playing. Ready by itself is not enough.
-# Busy and superseded keep their own wait.
+# A session is good when its span reaches MIN_GOOD_SESSION_S, or when a
+# completed reply is paired with a span of at least MIN_TRAFFIC_SESSION_S.
+# Only a good session resets the backoff base and the announce clock.
+# Every reconnect waits at least MIN plus jitter, including after a good
+# session. Busy and superseded keep their own longer wait.
 RECONNECT_BACKOFF_MIN_S = 1.0
 RECONNECT_BACKOFF_MAX_S = 30.0
 RECONNECT_BACKOFF_JITTER_S = 1.0
@@ -1485,17 +1634,18 @@ def _play_tts(header: dict, payload: bytes | None) -> bool:
     if face is not None:
         face.begin_playback(samples, int(play_rate), start_delay_s=_face_start_delay_s())
     # Play on this thread under the audio lock — never overlap sd.rec (double-free).
+    token = _session_playback_token()
     finished = False
     try:
         try:
-            finished = bool(_play_pcm_f32(samples, play_rate))
+            finished = bool(_play_pcm_f32(samples, play_rate, token))
         except Exception as exc:
             print(f"  (playback failed: {exc})")
             return False
     finally:
         if face is not None:
             face.end_playback()
-    if not finished or _PLAYBACK_CANCEL.is_set():
+    if not finished or _playback_cancelled(token):
         return False
     del samples
     _log(f"play done ({duration:.1f}s @ {play_rate} Hz) backend={_playback_backend()}")
@@ -2404,9 +2554,9 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"disconnected: {exc}")
                 reason = "disconnect"
             span = float(session_span["s"])
-            good = bool(_SESSION_HAD_TRAFFIC) or (
-                bool(reached_ready["hit"]) and span >= _min_good_session_s()
-            )
+            good = (
+                bool(_SESSION_HAD_TRAFFIC) and span >= _min_traffic_session_s()
+            ) or span >= _min_good_session_s()
             if good:
                 _session_succeeded()
             if reason == "goodbye" or quit_ev.is_set() or _SHUTDOWN.is_set():
@@ -2421,12 +2571,14 @@ def main(argv: list[str] | None = None) -> int:
                 if _backoff_superseded(quit_ev):
                     break
                 continue
-            # Desktop dropped, or the session never counted as good. One line
-            # per outage. A short ready keeps the backoff and the announce clock.
+            # Desktop dropped. One line per outage unless a good session reset
+            # the announce clock. A short ready keeps the backoff.
             _note_outage("  desktop gone; will retry when it returns")
-            if not good:
-                if _pause_unserved():
+            if good:
+                if _backoff_reconnect(quit_ev, float(RECONNECT_BACKOFF_MIN_S)):
                     break
+            elif _pause_unserved():
+                break
     except KeyboardInterrupt:
         quit_ev.set()
         _play_local_shutdown(kind="goodbye")

@@ -194,9 +194,15 @@ def test_uplink_close_returns_when_stream_stops(monkeypatch, fake_sd):
     assert fake_sd.plays == []
 
 
-def test_pw_play_chime_timeout_kills_and_skips_portaudio(monkeypatch, fake_sd, capsys):
+def test_pw_play_chime_timeout_kills_and_skips_portaudio(monkeypatch, fake_sd, capsys, tmp_path):
     monkeypatch.setattr(cc, "CHIME_PW_PLAY_TIMEOUT_S", 5.0, raising=False)
     monkeypatch.setenv("CRATE_CHIME_TIMEOUT_S", "0.25")
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    stub = bindir / "pw-play"
+    stub.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    stub.chmod(0o755)
+    monkeypatch.setenv("PATH", str(bindir) + os.pathsep + os.environ.get("PATH", ""))
     _HangPwPlay.live.clear()
     monkeypatch.setattr(subprocess, "Popen", _HangPwPlay)
     setter = getattr(cc, "_set_uplink_stream_state", None)
@@ -223,7 +229,8 @@ def test_pw_play_chime_timeout_kills_and_skips_portaudio(monkeypatch, fake_sd, c
         assert elapsed >= 0.2
         assert _HangPwPlay.live, "pw-play was not started"
         proc = _HangPwPlay.live[-1]
-        assert proc.args[0] == "pw-play"
+        assert os.path.basename(proc.args[0]) == "pw-play"
+        assert os.path.isabs(proc.args[0])
         assert proc.kwargs.get("start_new_session") is True
         assert proc.killed is True
         assert fake_sd.plays == []
@@ -357,6 +364,7 @@ def test_timeout_env_rejects_zero_negative_nan_and_inf(monkeypatch, capsys):
     monkeypatch.setattr(cc, "RECONNECT_STEP_TIMEOUT_S", 20.0)
     monkeypatch.setattr(cc, "TTS_PLAY_MARGIN_S", 5.0, raising=False)
     monkeypatch.setattr(cc, "MIN_GOOD_SESSION_S", 15.0, raising=False)
+    monkeypatch.setattr(cc, "MIN_TRAFFIC_SESSION_S", 3.0, raising=False)
     warned = getattr(cc, "_BAD_TIMEOUTS", None)
     if isinstance(warned, set):
         warned.clear()
@@ -366,6 +374,7 @@ def test_timeout_env_rejects_zero_negative_nan_and_inf(monkeypatch, capsys):
         ("CRATE_RECONNECT_STEP_TIMEOUT_S", cc._reconnect_step_timeout_s, 20.0),
         ("CRATE_TTS_PLAY_MARGIN_S", cc._tts_play_margin_s, 5.0),
         ("CRATE_MIN_GOOD_SESSION_S", cc._min_good_session_s, 15.0),
+        ("CRATE_MIN_TRAFFIC_SESSION_S", cc._min_traffic_session_s, 3.0),
     )
     for raw in ("0", "-1", "nan", "inf", "-inf", "nope"):
         monkeypatch.setenv("CRATE_UPLINK_CLOSE_TIMEOUT_S", raw)
@@ -816,4 +825,195 @@ def test_cleanup_reaps_live_chime_group(monkeypatch, tmp_path, fake_sd, request)
                 cancel()
             except Exception:
                 pass
+        worker.join(timeout=1.0)
+
+
+def _install_script_pw_play(tmp_path, monkeypatch, request, source: str) -> Path:
+    """Put a script named pw-play first on PATH and reap whatever it records."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    script = bindir / "pw-play"
+    script.write_text(source, encoding="utf-8")
+    script.chmod(0o755)
+    pidfile = tmp_path / "pw-play.pids"
+    monkeypatch.setenv("CRATE_TEST_PW_PLAY_PIDFILE", str(pidfile))
+    monkeypatch.setenv(
+        "PATH",
+        str(bindir) + os.pathsep + os.environ.get("PATH", ""),
+    )
+
+    def _reap() -> None:
+        _kill_recorded(pidfile)
+
+    request.addfinalizer(_reap)
+    return pidfile
+
+
+_CHIME_SLEEPS_THEN_MARKS = """#!/usr/bin/env python3
+import os
+import time
+pidfile = os.environ.get("CRATE_TEST_PW_PLAY_PIDFILE", "")
+if pidfile:
+    line = f"{os.getpid()} {os.getpgrp()} 0\\n".encode()
+    fd = os.open(pidfile, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    try:
+        os.write(fd, line)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+time.sleep(0.5)
+marker = os.environ.get("CRATE_TEST_CHIME_MARKER", "")
+if marker:
+    fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    try:
+        os.write(fd, b"done\\n")
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+raise SystemExit(0)
+"""
+
+
+_EXIT_ZERO_WITH_GRANDCHILD = """#!/usr/bin/env python3
+import os
+import time
+child = os.fork()
+if child == 0:
+    time.sleep(3600)
+    raise SystemExit(0)
+pidfile = os.environ.get("CRATE_TEST_PW_PLAY_PIDFILE", "")
+if pidfile:
+    line = f"{os.getpid()} {os.getpgrp()} {child}\\n".encode()
+    fd = os.open(pidfile, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    try:
+        os.write(fd, line)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+raise SystemExit(0)
+"""
+
+
+def test_disconnect_chime_finishes_after_session_cancel(
+    monkeypatch, tmp_path, fake_sd, request, capsys
+):
+    """Session TTS cancel must not cut the later disconnect chime short.
+
+    The fake sleeps, then writes a marker. Teardown cancels in-flight playback
+    first. The real deferred chime path has to let that fake finish.
+    """
+    pidfile = _install_script_pw_play(
+        tmp_path, monkeypatch, request, _CHIME_SLEEPS_THEN_MARKS
+    )
+    marker = tmp_path / "chime-done"
+    monkeypatch.setenv("CRATE_TEST_CHIME_MARKER", str(marker))
+    monkeypatch.setenv("CRATE_CHIME_TIMEOUT_S", "5")
+    cc._set_uplink_stream_state("closed")
+    box: dict = {}
+
+    def run() -> None:
+        try:
+            cc._cancel_inflight_playback()
+            cc._set_uplink_stream_state("open")
+            cc._play_local_shutdown(kind="disconnect")
+            box["deferred"] = not marker.exists()
+            cc._set_uplink_stream_state("closed")
+            box["t0"] = time.monotonic()
+            cc._play_deferred_chime()
+            box["elapsed"] = time.monotonic() - box["t0"]
+        except BaseException as exc:
+            box["err"] = exc
+
+    worker = threading.Thread(target=run, name="chime-after-cancel", daemon=True)
+    worker.start()
+    worker.join(timeout=10.0)
+    try:
+        assert not worker.is_alive(), "disconnect chime did not return within 10s"
+        assert "err" not in box, box.get("err")
+        assert box.get("deferred") is True, "chime played while the uplink was open"
+        assert marker.is_file(), "fake pw-play did not finish"
+        assert marker.read_text(encoding="utf-8").strip() == "done"
+        assert float(box.get("elapsed") or 0.0) >= 0.4
+        assert "shutdown line:" in capsys.readouterr().out
+        assert fake_sd.plays == []
+        assert not getattr(cc, "_PW_PLAY_GROUPS", set())
+    finally:
+        _kill_recorded(pidfile)
+        worker.join(timeout=1.0)
+
+
+def test_sounddevice_wait_is_bounded(monkeypatch, fake_sd):
+    """A sounddevice wait that never returns still releases the audio lock."""
+    monkeypatch.setenv("CRATE_PLAYBACK", "sounddevice")
+    monkeypatch.setenv("CRATE_TTS_PLAY_MARGIN_S", "0.35")
+    monkeypatch.setenv("CRATE_BT_PRIME_MS", "0")
+    monkeypatch.setattr(cc, "TTS_PLAY_MARGIN_S", 5.0, raising=False)
+    waited: list[str] = []
+
+    def wait(*_args, **_kwargs) -> None:
+        waited.append(threading.current_thread().name)
+        threading.Event().wait()
+
+    fake_sd.wait = wait
+    box: dict = {}
+
+    def run() -> None:
+        try:
+            box["finished"] = cc._play_pcm_f32([0.0] * 160, 16000)
+        except BaseException as exc:
+            box["err"] = exc
+
+    worker = threading.Thread(target=run, name="bounded-sd", daemon=True)
+    started = time.monotonic()
+    worker.start()
+    worker.join(timeout=3.0)
+    elapsed = time.monotonic() - started
+    assert not worker.is_alive(), "sounddevice playback did not return within 3s"
+    assert "err" not in box, box.get("err")
+    assert box.get("finished") is False
+    assert not cc._AUDIO_LOCK.locked()
+    assert elapsed >= 0.3
+    assert elapsed < 2.0
+    assert fake_sd.plays, "sounddevice play was not called"
+    _args, kwargs = fake_sd.plays[-1]
+    assert kwargs.get("blocking") is False
+    assert fake_sd.stops, "sounddevice stop was not called on timeout"
+    assert waited, "sd.wait was not called"
+    assert all(name != worker.name for name in waited)
+
+
+def test_pw_play_exit_zero_kills_grandchild(monkeypatch, tmp_path, fake_sd, request):
+    """A pw-play that exits 0 still takes its forked grandchild with it."""
+    pidfile = _install_script_pw_play(
+        tmp_path, monkeypatch, request, _EXIT_ZERO_WITH_GRANDCHILD
+    )
+    monkeypatch.setenv("CRATE_PLAYBACK", "pw")
+    monkeypatch.setenv("CRATE_BT_PRIME_MS", "0")
+    monkeypatch.setenv("CRATE_TTS_PLAY_MARGIN_S", "2")
+    box: dict = {}
+
+    def run() -> None:
+        try:
+            box["finished"] = cc._play_pcm_f32([0.0] * 160, 16000)
+        except BaseException as exc:
+            box["err"] = exc
+
+    worker = threading.Thread(target=run, name="pw-exit-0", daemon=True)
+    started = time.monotonic()
+    worker.start()
+    worker.join(timeout=10.0)
+    elapsed = time.monotonic() - started
+    try:
+        assert not worker.is_alive(), "pw-play playback did not return within 10s"
+        assert "err" not in box, box.get("err")
+        assert box.get("finished") is True
+        _parent, child = _read_pw_pids(pidfile, timeout=1.0)
+        assert child > 1
+        assert _wait_pids_dead([child], timeout=2.0), f"grandchild {child} still alive"
+        assert elapsed < 2.0
+        assert not cc._AUDIO_LOCK.locked()
+        assert not getattr(cc, "_PW_PLAY_GROUPS", set())
+        assert fake_sd.plays == []
+    finally:
+        _kill_recorded(pidfile)
         worker.join(timeout=1.0)
