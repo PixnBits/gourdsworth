@@ -17,6 +17,7 @@ before exit). A nohup launch keeps SIGHUP ignored.
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import select
 import signal
@@ -198,6 +199,10 @@ _CLEANUP_LOCK = threading.Lock()
 _CLEANUP_DONE = False
 _ACTIVE_CAPS: set = set()  # live cv2.VideoCapture objects
 _PW_PLAY_PROC = None  # live pw-play Popen
+_PW_PLAY_GROUPS: set[int] = set()  # pids started with start_new_session
+_PLAYBACK_CANCEL = threading.Event()
+_SESSION_HAD_TRAFFIC = False
+_BAD_TIMEOUTS: set[str] = set()
 _FACE: face_link.FaceLink | None = None
 # Uplink PortAudio capture: "closed", "open", or "closing". Shutdown chimes
 # must not start while this is open or closing (PortAudio deadlocks if play
@@ -219,6 +224,12 @@ _RECONNECT_WATCH_LOCK = threading.Lock()
 UPLINK_CLOSE_TIMEOUT_S = 5.0
 CHIME_PW_PLAY_TIMEOUT_S = 5.0
 RECONNECT_STEP_TIMEOUT_S = 20.0
+# A ready-then-close is not a good session until it lasts this long, unless
+# a reply was actually played. Override with CRATE_MIN_GOOD_SESSION_S.
+MIN_GOOD_SESSION_S = 15.0
+# pw-play wait budget beyond the PCM duration. Override with CRATE_TTS_PLAY_MARGIN_S.
+TTS_PLAY_MARGIN_S = 5.0
+PW_PLAY_KILL_GRACE_S = 0.25
 WEDGED_EXIT_CODE = 1
 EXIT_CLEANUP_TIMEOUT_S = 0.5
 
@@ -274,8 +285,10 @@ def _install_signal_handlers() -> list[int]:
 def _cleanup_devices(*, force: bool = False, camera_wait_s: float = 2.0) -> bool:
     """Stop PortAudio, pw-play, and the camera. Idempotent; never raises.
 
-    Does not take ``_AUDIO_LOCK`` — the uplink thread may hold it inside ``sd.wait()``.
-    The camera lock, once acquired, is held so a snap cannot open a new device.
+    Does not take ``_AUDIO_LOCK``. In-flight TTS is cancelled with ``sd.stop``
+    or by killing the pw-play process group. The uplink thread may still be
+    inside ``sd.wait()``. The camera lock, once acquired, is held so a snap
+    cannot open a new device.
     """
     global _CLEANUP_DONE
     if not _CLEANUP_LOCK.acquire(blocking=False):
@@ -284,23 +297,7 @@ def _cleanup_devices(*, force: bool = False, camera_wait_s: float = 2.0) -> bool
         if _CLEANUP_DONE:
             return True
         try:
-            import sounddevice as sd
-
-            sd.stop(ignore_errors=True)
-        except ImportError:
-            pass
-        except Exception:
-            pass
-        try:
-            proc = _PW_PLAY_PROC
-            if proc is not None and proc.poll() is None:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=1)
-                except Exception:
-                    pass
-                if proc.poll() is None:
-                    proc.kill()
+            _cancel_inflight_playback()
         except Exception:
             pass
         try:
@@ -334,14 +331,24 @@ def _cleanup_devices(*, force: bool = False, camera_wait_s: float = 2.0) -> bool
 
 def _reset_shutdown_state_for_tests() -> None:
     """Reset signal-shutdown flags so unit tests do not leak into each other."""
-    global _SHUTDOWN_SIGNAL, _CLEANUP_DONE, _PW_PLAY_PROC
+    global _SHUTDOWN_SIGNAL, _CLEANUP_DONE, _PW_PLAY_PROC, _SESSION_HAD_TRAFFIC
     global _UPLINK_STREAM, _UPLINK_STREAM_STATE, _DEFERRED_CHIME, _RECONNECT_STEP_AT
     _stop_reconnect_watchdog()
     _SHUTDOWN.clear()
     _SHUTDOWN_SIGNAL = None
     _CLEANUP_DONE = False
     _ACTIVE_CAPS.clear()
+    proc = _PW_PLAY_PROC
     _PW_PLAY_PROC = None
+    if proc is not None:
+        try:
+            _kill_pw_play_group(proc, grace=0.1)
+        except Exception:
+            pass
+    _PW_PLAY_GROUPS.clear()
+    _PLAYBACK_CANCEL.clear()
+    _SESSION_HAD_TRAFFIC = False
+    _BAD_TIMEOUTS.clear()
     with _UPLINK_STREAM_LOCK:
         _UPLINK_STREAM = None
         _UPLINK_STREAM_STATE = "closed"
@@ -689,22 +696,130 @@ def _face_start_delay_s() -> float:
     return (lead + _face_latency_ms()) / 1000.0
 
 
-def _play_pcm_f32(samples, rate: int) -> None:
-    """Play mono float32 PCM. Prefer pw-play for PipeWire/Bluetooth sinks."""
+def _warn_bad_timeout(env_name: str, text: str, default: float) -> None:
+    """Log one warning per bad env value, then the caller uses ``default``."""
+    key = f"{env_name}={text}"
+    if key in _BAD_TIMEOUTS:
+        return
+    _BAD_TIMEOUTS.add(key)
+    print(
+        f"  (warning: {env_name}={text!r} is not a positive finite number; "
+        f"using {float(default):g})",
+        flush=True,
+    )
+
+
+def _kill_pw_play_group(proc, grace: float | None = None) -> None:
+    """SIGTERM the pw-play process group, then SIGKILL after a short grace.
+
+    A process started with ``start_new_session`` is signalled via ``killpg``.
+    Anything else gets ``terminate`` / ``kill`` on that process only. Never raises.
+    """
+    if proc is None:
+        return
+    grace_s = float(PW_PLAY_KILL_GRACE_S if grace is None else grace)
+    pid = getattr(proc, "pid", None)
+    try:
+        pid_i = int(pid) if pid else 0
+    except (TypeError, ValueError):
+        pid_i = 0
+    grouped = bool(pid_i) and pid_i in _PW_PLAY_GROUPS
+    try:
+        already = proc.poll() is not None
+    except Exception:
+        already = False
+    if already:
+        if pid_i:
+            _PW_PLAY_GROUPS.discard(pid_i)
+        return
+
+    def _signal(sig: int) -> None:
+        sent = False
+        if grouped:
+            try:
+                os.killpg(pid_i, sig)
+                sent = True
+            except (ProcessLookupError, PermissionError, OSError):
+                sent = False
+        if sent:
+            return
+        try:
+            if sig == signal.SIGKILL:
+                proc.kill()
+            else:
+                proc.terminate()
+        except Exception:
+            pass
+
+    _signal(signal.SIGTERM)
+    try:
+        proc.wait(timeout=max(0.05, grace_s))
+    except Exception:
+        pass
+    try:
+        still = proc.poll() is None
+    except Exception:
+        still = False
+    if still:
+        _signal(signal.SIGKILL)
+        try:
+            proc.wait(timeout=max(0.05, grace_s))
+        except Exception:
+            pass
+    if pid_i:
+        _PW_PLAY_GROUPS.discard(pid_i)
+
+
+def _cancel_inflight_playback() -> None:
+    """Stop TTS so teardown cannot wait out a wedged play. Does not take the lock."""
+    _PLAYBACK_CANCEL.set()
+    try:
+        import sounddevice as sd
+
+        sd.stop()
+    except Exception:
+        pass
+    try:
+        _kill_pw_play_group(_PW_PLAY_PROC)
+    except Exception:
+        pass
+
+
+def _mark_session_traffic() -> None:
+    """A finished server reply counts as a good session even if it was short."""
+    global _SESSION_HAD_TRAFFIC
+    if _PLAYBACK_CANCEL.is_set():
+        return
+    _SESSION_HAD_TRAFFIC = True
+
+
+def _reset_session_playback() -> None:
+    global _SESSION_HAD_TRAFFIC
+    _SESSION_HAD_TRAFFIC = False
+    _PLAYBACK_CANCEL.clear()
+
+
+def _play_pcm_f32(samples, rate: int) -> bool:
+    """Play mono float32 PCM. True when playback finishes without cancel or timeout.
+
+    Prefer pw-play for PipeWire/Bluetooth sinks. The player is its own process
+    group. ``wait`` is bounded by the clip length plus ``CRATE_TTS_PLAY_MARGIN_S``;
+    on timeout the group is killed so ``_AUDIO_LOCK`` is always released.
+    """
     global _PW_PLAY_PROC
     import numpy as np
 
     samples = np.asarray(samples, dtype=np.float32).reshape(-1)
     if samples.size == 0 or rate <= 0:
-        return
+        return False
     # Bluetooth A2DP often clips the first ~100ms — prime with short silence.
     prime_ms = _bt_prime_ms()
     backend = _playback_backend()
     if backend == "pw" and prime_ms > 0:
         n_prime = max(1, int(rate * (prime_ms / 1000.0)))
         samples = np.concatenate([np.zeros(n_prime, dtype=np.float32), samples])
+    duration = float(samples.size) / float(rate) if rate else 0.0
     if backend == "pw":
-        import subprocess
         import tempfile
         import wave
 
@@ -720,57 +835,72 @@ def _play_pcm_f32(samples, rate: int) -> None:
                 wf.writeframes(pcm.tobytes())
             env = os.environ.copy()
             env.setdefault("PIPEWIRE_LATENCY", "1024/48000")
+            timeout_s = max(0.0, duration) + _tts_play_margin_s()
             with _AUDIO_LOCK:
-                # Popen (not run) so signal cleanup can terminate an in-flight pw-play.
-                proc = subprocess.Popen(
-                    ["pw-play", wav_path],
-                    env=env,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-                _PW_PLAY_PROC = proc
+                proc = None
+                finished = False
                 try:
-                    proc.wait()
-                finally:
-                    if proc.poll() is None:  # interrupted (signal) — don't orphan it
+                    proc = subprocess.Popen(
+                        ["pw-play", wav_path],
+                        env=env,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        start_new_session=True,
+                    )
+                    if proc.pid:
+                        _PW_PLAY_GROUPS.add(int(proc.pid))
+                    _PW_PLAY_PROC = proc
+                    if _PLAYBACK_CANCEL.is_set():
+                        _kill_pw_play_group(proc)
+                    else:
                         try:
-                            proc.terminate()
-                            proc.wait(timeout=1)
-                        except Exception:
-                            proc.kill()
-                    if _PW_PLAY_PROC is proc:
+                            proc.wait(timeout=timeout_s)
+                        except subprocess.TimeoutExpired:
+                            _kill_pw_play_group(proc)
+                    finished = proc.returncode == 0 and not _PLAYBACK_CANCEL.is_set()
+                finally:
+                    if proc is not None and _PW_PLAY_PROC is proc:
                         _PW_PLAY_PROC = None
+                    if proc is not None and getattr(proc, "pid", None):
+                        _PW_PLAY_GROUPS.discard(int(proc.pid))
+                return finished
         finally:
             try:
                 os.unlink(wav_path)
             except OSError:
                 pass
-        return
     import sounddevice as sd
 
     with _AUDIO_LOCK:
+        if _PLAYBACK_CANCEL.is_set():
+            return False
         try:
             sd.play(samples, int(rate), blocking=True)
         except TypeError:
             sd.play(samples, int(rate))
             sd.wait()
+        return not _PLAYBACK_CANCEL.is_set()
 
 
 def _timeout_s(env_name: str, default: float) -> float:
-    """``env_name`` if it is a non-negative number, otherwise ``default``.
+    """Positive finite ``env_name``, otherwise ``default``.
 
-    ``default`` is read at call time so tests can monkeypatch the constant.
-    An environment value wins over the constant.
+    ``0``, negatives, NaN, inf, and non-numeric text fall back to ``default``
+    and log a warning. ``default`` is read at call time so tests can
+    monkeypatch the constant. A valid environment value wins over the constant.
     """
     raw = os.environ.get(env_name)
     if raw is None or str(raw).strip() == "":
         return float(default)
+    text = str(raw).strip()
     try:
-        value = float(str(raw).strip())
+        value = float(text)
     except (TypeError, ValueError):
+        _warn_bad_timeout(env_name, text, default)
         return float(default)
-    if value < 0:
-        return 0.0
+    if not math.isfinite(value) or value <= 0.0:
+        _warn_bad_timeout(env_name, text, default)
+        return float(default)
     return value
 
 
@@ -788,6 +918,14 @@ def _reconnect_step_timeout_s() -> float:
 
 def _exit_cleanup_timeout_s() -> float:
     return _timeout_s("CRATE_EXIT_CLEANUP_TIMEOUT_S", EXIT_CLEANUP_TIMEOUT_S)
+
+
+def _min_good_session_s() -> float:
+    return _timeout_s("CRATE_MIN_GOOD_SESSION_S", MIN_GOOD_SESSION_S)
+
+
+def _tts_play_margin_s() -> float:
+    return _timeout_s("CRATE_TTS_PLAY_MARGIN_S", TTS_PLAY_MARGIN_S)
 
 
 def _set_uplink_stream_state(state: str) -> None:
@@ -1084,14 +1222,16 @@ def _play_local_shutdown(*, kind: str = "disconnect") -> None:
 SUPERSEDED_BACKOFF_S = 30.0
 SUPERSEDED_BACKOFF_JITTER_S = 5.0
 # Failed or unserved connects: refused TCP, close/EOF/RST at accept, or a
-# session that ends before "ready". Start at MIN and double up to MAX.
-# Jitter is added on top, so a retry is never sooner than the base. Reset
-# only after a session reaches ready. Busy and superseded keep their own wait.
+# session that ends before it counts as good. Start at MIN and double up to
+# MAX. Jitter is added on top, so a retry is never sooner than the base.
+# A session is good when it stays up for MIN_GOOD_SESSION_S after ready, or
+# when a server reply finishes playing. Ready by itself is not enough.
+# Busy and superseded keep their own wait.
 RECONNECT_BACKOFF_MIN_S = 1.0
 RECONNECT_BACKOFF_MAX_S = 30.0
 RECONNECT_BACKOFF_JITTER_S = 1.0
 # Spoken disconnect line: once per outage, then at most this often until a
-# session reaches "ready" again. _wait_for_desktop uses the same spacing.
+# good session. _wait_for_desktop uses the same spacing.
 DISCONNECT_ANNOUNCE_EVERY_S = 45.0
 
 
@@ -1201,9 +1341,10 @@ def _wait_for_desktop(
     return None
 
 
-def _play_tts(header: dict, payload: bytes | None) -> None:
+def _play_tts(header: dict, payload: bytes | None) -> bool:
+    """Play one server reply. True when the clip finishes without cancel or timeout."""
     if not payload:
-        return
+        return False
     rate = int(header.get("rate") or 22050)
     fmt = str(header.get("format") or "f32le")
     try:
@@ -1211,7 +1352,7 @@ def _play_tts(header: dict, payload: bytes | None) -> None:
         import sounddevice as sd
     except ImportError:
         print(f"  (no sounddevice; dropped {len(payload)} bytes of TTS)")
-        return
+        return False
     if fmt == "s16le":
         samples = np.frombuffer(payload, dtype="<i2").astype(np.float32) / 32768.0
     else:
@@ -1226,17 +1367,21 @@ def _play_tts(header: dict, payload: bytes | None) -> None:
     if face is not None:
         face.begin_playback(samples, int(play_rate), start_delay_s=_face_start_delay_s())
     # Play on this thread under the audio lock — never overlap sd.rec (double-free).
+    finished = False
     try:
         try:
-            _play_pcm_f32(samples, play_rate)
+            finished = bool(_play_pcm_f32(samples, play_rate))
         except Exception as exc:
             print(f"  (playback failed: {exc})")
-            return
+            return False
     finally:
         if face is not None:
             face.end_playback()
+    if not finished or _PLAYBACK_CANCEL.is_set():
+        return False
     del samples
     _log(f"play done ({duration:.1f}s @ {play_rate} Hz) backend={_playback_backend()}")
+    return True
 
 
 def _send_silence(conn: CrateConnection, seconds: float = 0.8) -> None:
@@ -1363,7 +1508,8 @@ def _pump(
         if ev == "play":
             if pause_mic is not None:
                 pause_mic.set()
-            _play_tts(header, payload)
+            if _play_tts(header, payload):
+                _mark_session_traffic()
             try:
                 conn.send({"event": "play_done"})
             except (ConnectionError, OSError):
@@ -1873,10 +2019,10 @@ def main(argv: list[str] | None = None) -> int:
     # turns that into a backoff. No return-in-finally (Python warns on it).
     superseded_box = {"hit": False}
     busy_box = {"hit": False}
-    served_box = {"hit": False}
-    # Set once _wait_ready succeeds. The talk loop clears the ready event, so
-    # the flag at teardown is not enough to know the desktop served us.
+    # Set once _wait_ready succeeds. Duration is measured from that moment.
     reached_ready = {"hit": False}
+    # Seconds the session stayed up after ready. 0 if ready never arrived.
+    session_span = {"s": 0.0}
     # Shared with _wait_for_desktop. 0 means the disconnect line is due.
     announce_clock = [0.0]
     announce_every_s = float(DISCONNECT_ANNOUNCE_EVERY_S)
@@ -1901,9 +2047,15 @@ def main(argv: list[str] | None = None) -> int:
         reconnect_base = float(RECONNECT_BACKOFF_MIN_S)
 
     def _pause_unserved() -> bool:
-        """Backoff for one failed or unserved connect. True if we should stop."""
+        """Backoff for one failed or unserved connect. True if we should stop.
+
+        The wait is at least ``RECONNECT_BACKOFF_MIN_S`` plus jitter.
+        """
         nonlocal reconnect_base
+        floor = float(RECONNECT_BACKOFF_MIN_S)
         base = float(reconnect_base)
+        if base < floor:
+            base = floor
         interrupted = _backoff_reconnect(quit_ev, base)
         reconnect_base = _next_reconnect_backoff(base)
         return interrupted
@@ -1913,6 +2065,8 @@ def main(argv: list[str] | None = None) -> int:
         # A live session can sit for a long time. The watchdog covers reconnect
         # and teardown only; the finally block arms it again.
         _disarm_reconnect_watchdog()
+        _reset_session_playback()
+        ready_at = {"t": None}
         stop = threading.Event()
         ready = threading.Event()
         end_talk = threading.Event()
@@ -1939,6 +2093,8 @@ def main(argv: list[str] | None = None) -> int:
                     print("No ready from desktop (is --serve-crate / --crate-echo running?)")
                 return "disconnect"
             reached_ready["hit"] = True
+            if ready_at["t"] is None:
+                ready_at["t"] = time.monotonic()
             telemetry = threading.Thread(
                 target=_telemetry_loop,
                 args=(conn, stop),
@@ -2062,6 +2218,15 @@ def main(argv: list[str] | None = None) -> int:
                 shutdown_played = True
             return kind
         finally:
+            # Span is the live session, not teardown. A slow join must not
+            # turn a ready-then-close into a good session.
+            if ready_at["t"] is not None:
+                session_span["s"] = time.monotonic() - float(ready_at["t"])
+            else:
+                session_span["s"] = 0.0
+            # Drop in-flight TTS before joining the pump. Otherwise pw-play
+            # holds _AUDIO_LOCK and the next session cannot open the mic.
+            _cancel_inflight_playback()
             # Teardown is on the reconnect path: a stuck send or stream close
             # must not wedge the process.
             _arm_reconnect_watchdog()
@@ -2084,8 +2249,6 @@ def main(argv: list[str] | None = None) -> int:
                 superseded_box["hit"] = True
             if busy.is_set():
                 busy_box["hit"] = True
-            if ready.is_set():
-                served_box["hit"] = True
 
     try:
         _start_reconnect_watchdog()
@@ -2108,8 +2271,8 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 superseded_box["hit"] = False
                 busy_box["hit"] = False
-                served_box["hit"] = False
                 reached_ready["hit"] = False
+                session_span["s"] = 0.0
                 reason = _run_connected_session(conn)
                 if reason != "goodbye" and superseded_box["hit"]:
                     reason = "superseded"
@@ -2122,13 +2285,12 @@ def main(argv: list[str] | None = None) -> int:
                     break
                 print(f"disconnected: {exc}")
                 reason = "disconnect"
-            if served_box["hit"]:
+            span = float(session_span["s"])
+            good = bool(_SESSION_HAD_TRAFFIC) or (
+                bool(reached_ready["hit"]) and span >= _min_good_session_s()
+            )
+            if good:
                 _session_succeeded()
-            elif reached_ready["hit"]:
-                # Reached ready, then the talk loop cleared the event. The
-                # outage chime stays on the existing schedule; the reconnect
-                # penalty still starts over.
-                reconnect_base = float(RECONNECT_BACKOFF_MIN_S)
             if reason == "goodbye" or quit_ev.is_set() or _SHUTDOWN.is_set():
                 break
             if reason == "superseded":
@@ -2141,11 +2303,10 @@ def main(argv: list[str] | None = None) -> int:
                 if _backoff_superseded(quit_ev):
                     break
                 continue
-            # Desktop dropped, or the connect never reached ready. One line
-            # per outage. A session that reached ready retries at once; the
-            # next failure starts again at RECONNECT_BACKOFF_MIN_S.
+            # Desktop dropped, or the session never counted as good. One line
+            # per outage. A short ready keeps the backoff and the announce clock.
             _note_outage("  desktop gone; will retry when it returns")
-            if not served_box["hit"] and not reached_ready["hit"]:
+            if not good:
                 if _pause_unserved():
                     break
     except KeyboardInterrupt:

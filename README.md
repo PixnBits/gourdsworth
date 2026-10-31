@@ -8,6 +8,11 @@ Phase 2 is the porch **crate**: a Raspberry Pi streams mic PCM and optional JPEG
 
 Nothing is sent to a cloud API. Audio and stills are kept in RAM and discarded after each turn. They never leave the LAN.
 
+## Upgrading
+
+- Invalid `trusted_peers` / `CRATE_TRUSTED_PEERS` entries (CIDR, hostname, `*`) make the server exit with code 2 at startup instead of warning.
+- A non-loopback crate bind with an empty trusted-peer list is refused (exit 2). A loopback bind with an empty list still starts.
+
 ## Quick start
 
 ```bash
@@ -105,14 +110,14 @@ crate:
   host: 0.0.0.0
   port: 8746
   allow_lan: true   # required; PCM/JPEG then visible to the whole LAN, no TLS
-  trusted_peers: [192.0.2.55]  # only the Pi. Empty still starts, and warns.
+  trusted_peers: [192.0.2.55]  # only the Pi. Empty on a non-loopback bind refuses startup.
 ```
 
 A new TCP connection is not served until it sends a crate hello (`role` `crate`, `proto` 1, no payload) within 3 seconds. That deadline covers the whole hello. A line over about 1 KiB, or a hello that declares a payload, is closed without reading the payload. Pending hellos are capped (16 at once, 2 per address). Anything else is closed and the Mayor stays up.
 
 When `crate.trusted_peers` or `CRATE_TRUSTED_PEERS` is non-empty, that list is an allowlist: other addresses are closed at accept, even if nobody is connected. Put **only the Pi** on it. A second trusted address can evict the Pi and hold it in the 30 second backoff. Entries are IP addresses, split on commas or whitespace. A CIDR, a hostname, or `*` refuses startup and is named in the error. `::ffff:a.b.c.d` is compared as IPv4. The environment variable is read once at startup.
 
-With `allow_lan` and an empty list the server still starts, and it warns: any LAN host may take an empty slot. Pin the Pi in `config.yaml` (`trusted_peers: [192.0.2.55]`) or in the user systemd unit:
+With `allow_lan` and an empty list the server refuses to start (exit 2). A loopback bind with an empty list still starts. Pin the Pi in `config.yaml` (`trusted_peers: [192.0.2.55]`) or in the user systemd unit:
 
 ```
 systemctl --user edit gourdsworth-server

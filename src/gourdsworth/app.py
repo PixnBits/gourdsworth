@@ -680,25 +680,25 @@ def _crate_settings(cfg: dict) -> tuple[str, int]:
 
 
 def _trusted_for_start(cfg: dict, host: str):
-    """Merge trusted peers once and warn when a LAN bind has an empty list.
+    """Merge trusted peers once.
 
-    An empty list still starts. An entry that is not an IP raises
-    ``TrustedPeersError``; callers exit nonzero. The returned set is what
-    the listener uses; it does not read ``CRATE_TRUSTED_PEERS`` again.
+    A non-loopback bind with an empty list raises ``TrustedPeersError``
+    and callers exit 2. Loopback with an empty list still starts. An entry
+    that is not an IP raises ``TrustedPeersError`` as well. The returned set
+    is what the listener uses; it does not read ``CRATE_TRUSTED_PEERS`` again.
     """
     raw = (cfg.get("crate") or {}).get("trusted_peers")
     trusted = load_trusted_peers(raw)
     if not is_loopback(host) and not trusted:
-        print(
-            "warning: crate is bound off loopback and trusted_peers is empty. "
-            "Any LAN host may take an empty slot and hold it. Set "
-            "CRATE_TRUSTED_PEERS to the Pi's address only "
-            "(Environment=CRATE_TRUSTED_PEERS=192.0.2.55 in the user unit, "
-            "or a drop-in from `systemctl --user edit gourdsworth-server`) "
-            "or set crate.trusted_peers in config.yaml. The list should "
-            "contain only the Pi. Starting anyway.",
-            file=sys.stderr,
-            flush=True,
+        raise TrustedPeersError(
+            "Refusing to start: crate would bind a non-loopback address "
+            f"({host}) and trusted_peers is empty. Any host that can reach "
+            "the port may take an empty slot. Set CRATE_TRUSTED_PEERS to the "
+            "Pi's address only (Environment=CRATE_TRUSTED_PEERS=192.0.2.55 "
+            "in the user unit, or a drop-in from "
+            "`systemctl --user edit gourdsworth-server`) or set "
+            "crate.trusted_peers in config.yaml. The list should contain "
+            "only the Pi."
         )
     return trusted
 

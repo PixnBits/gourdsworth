@@ -897,23 +897,53 @@ def _expect_desktop_ready(sock: socket.socket) -> None:
     assert any(item.get("event") == "ready" for item in events)
 
 
-def test_lan_bind_with_empty_trust_warns_and_still_returns(monkeypatch, capsys):
+def test_lan_bind_with_empty_trust_is_refused(monkeypatch):
+    from gourdsworth.net import TrustedPeersError
     from gourdsworth.app import _trusted_for_start
 
     monkeypatch.delenv("CRATE_TRUSTED_PEERS", raising=False)
-    trusted = _trusted_for_start({"crate": {"trusted_peers": []}}, "0.0.0.0")
-    assert trusted == frozenset()
-    err = capsys.readouterr().err
-    assert "empty slot" in err
-    assert "CRATE_TRUSTED_PEERS" in err
-    assert "systemctl --user edit gourdsworth-server" in err
-    assert "192.0.2.55" in err
+    with pytest.raises(TrustedPeersError) as excinfo:
+        _trusted_for_start({"crate": {"trusted_peers": []}}, "0.0.0.0")
+    text = str(excinfo.value)
+    assert "Refusing to start" in text
+    assert "empty slot" in text
+    assert "CRATE_TRUSTED_PEERS" in text
+    assert "systemctl --user edit gourdsworth-server" in text
+    assert "192.0.2.55" in text
+    with pytest.raises(TrustedPeersError):
+        _trusted_for_start({"crate": {"trusted_peers": []}}, "192.0.2.10")
     pinned = _trusted_for_start({"crate": {"trusted_peers": ["192.0.2.55"]}}, "0.0.0.0")
     assert pinned == frozenset({"192.0.2.55"})
-    assert capsys.readouterr().err == ""
     loop = _trusted_for_start({"crate": {}}, "127.0.0.1")
     assert loop == frozenset()
-    assert capsys.readouterr().err == ""
+    assert _trusted_for_start({"crate": {"trusted_peers": []}}, "::1") == frozenset()
+
+
+def test_lan_bind_with_empty_trust_exits_2(monkeypatch, capsys, tmp_path):
+    """A non-loopback bind and an empty trusted list must not listen."""
+    from gourdsworth import app as appmod
+
+    monkeypatch.delenv("CRATE_TRUSTED_PEERS", raising=False)
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        "crate:\n"
+        "  host: 0.0.0.0\n"
+        "  port: 0\n"
+        "  allow_lan: true\n"
+        "  trusted_peers: []\n",
+        encoding="utf-8",
+    )
+
+    def _no_serve(*_args, **_kwargs):
+        raise AssertionError("server started with an empty trusted list")
+
+    monkeypatch.setattr(appmod, "serve_echo", _no_serve)
+    code = appmod.main(["--crate-echo", "--config", str(cfg)])
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "Refusing to start" in err
+    assert "0.0.0.0" in err
+    assert "empty slot" in err
 
 
 def test_different_trusted_ip_starts_with_empty_history(monkeypatch):
@@ -1107,21 +1137,38 @@ def test_vet_thread_start_failure_releases_slot_and_serves_next(monkeypatch, cap
     second = None
     try:
         first = socket.create_connection(("127.0.0.1", listener.port), timeout=2)
-        assert _eof_within(first, 1.0), "failed vet socket was not closed"
+        # The gate's accept thread starts inside the constructor, before the
+        # test's wrapper appends it. Poll so a fast close is not a miss.
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline and not gates:
+            time.sleep(0.01)
         assert gates, "accept gate was not created"
         gate = gates[0]
+        assert _eof_within(first, 1.0), "failed vet socket was not closed"
 
-        def slots_clear() -> bool:
+        captured = {"err": ""}
+
+        def settled() -> bool:
+            chunk = capsys.readouterr()
+            captured["err"] += chunk.err
             with gate._cv:
-                return (
+                clear = (
                     len(gate._hello_ips) == 0
                     and len(gate._vet_socks) == 0
                     and not gate._vetters
                 )
+            return clear and "failed to start" in captured["err"]
 
-        _wait_until(slots_clear, 1.0, "hello slot was not released after thread start failed")
-        err = capsys.readouterr().err
-        assert "failed to start" in err
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            if settled():
+                break
+            time.sleep(0.02)
+        else:
+            raise AssertionError(
+                "hello slot or vet-start log missing after thread start failed: "
+                f"{captured['err']!r}"
+            )
         assert state["boom"] is True
         assert thread.is_alive(), "accept loop exited after thread start failed"
         assert served == []

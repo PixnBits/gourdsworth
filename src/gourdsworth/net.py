@@ -61,9 +61,10 @@ PCM/JPEG. There is no TLS and no auth. A hello must finish within
 ``HELLO_DEADLINE_S`` for the whole read, and it must not carry a payload.
 When ``crate.trusted_peers`` / ``CRATE_TRUSTED_PEERS`` is non-empty it is
 an allowlist: other addresses are closed at accept, even if the slot is
-empty. The list should contain only the Pi. A live or not-yet-served
-session is replaced only by the same IP or a trusted IP. History stays
-only with that exact same IP.
+empty. The list should contain only the Pi. Startup refuses a non-loopback
+bind when that list is empty. A live or not-yet-served session is replaced
+only by the same IP or a trusted IP. History stays only with that exact
+same IP.
 """
 
 from __future__ import annotations
@@ -1349,15 +1350,16 @@ class _NewestAccept:
             thread.start()
         except Exception as exc:
             # A failed start never runs _vet, so the reservation would leak
-            # and the exception would stop the accept loop.
-            with self._cv:
-                self._vetters.discard(thread)
-            self._release_hello(sock)
-            _close_socket(sock)
+            # and the exception would stop the accept loop. Log first: a
+            # reader that waits until the slot is free must already see this.
             self._log_limited(
                 "vet-start",
                 f"crate hello thread failed to start for {ip}: {exc}",
             )
+            with self._cv:
+                self._vetters.discard(thread)
+            self._release_hello(sock)
+            _close_socket(sock)
 
     def _vet(self, sock: socket.socket, addr: tuple, ip: str) -> None:
         conn: CrateConnection | None = None

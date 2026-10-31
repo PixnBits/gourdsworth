@@ -45,10 +45,12 @@ DEFAULTS = {
         "host": "127.0.0.1",
         "port": 8746,
         "allow_lan": False,
-        # Allowlist of crate peers. Empty: any peer may take an empty slot,
-        # and only that same IP may replace it. Non-empty: other addresses
-        # are closed at accept. List only the Pi. Also read once from
-        # CRATE_TRUSTED_PEERS (commas or whitespace; a non-IP refuses startup).
+        # Allowlist of crate peers. Empty on loopback: any peer may take an
+        # empty slot, and only that same IP may replace it. A non-loopback
+        # bind with an empty list is refused at startup. Non-empty: other
+        # addresses are closed at accept. List only the Pi. Also read once
+        # from CRATE_TRUSTED_PEERS (commas or whitespace; a non-IP refuses
+        # startup).
         "trusted_peers": [],
     },
 }

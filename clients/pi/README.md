@@ -76,7 +76,7 @@ On a real Pi on the porch LAN:
 #   host: 0.0.0.0
 #   port: 8746
 #   allow_lan: true    # anyone on this LAN can read PCM/JPEG; no TLS
-#   trusted_peers: [192.0.2.55]  # only the Pi. Empty + allow_lan warns and still starts.
+#   trusted_peers: [192.0.2.55]  # only the Pi. Empty on a non-loopback bind refuses startup.
 #   # or, in the desktop user unit / `systemctl --user edit gourdsworth-server`:
 #   # Environment=CRATE_TRUSTED_PEERS=192.0.2.55
 PYTHONPATH=src python clients/pi/crate_client.py --button-pin 17   # host from local.env
@@ -244,6 +244,19 @@ systemctl --user daemon-reload
 systemctl --user enable --now crate-usb-audio-watch.timer
 systemctl --user status crate-usb-audio-watch.timer
 ```
+
+`clients/pi/systemd/gourdsworth-porch.service` is a user unit for the
+continuous crate client. It starts after PipeWire and is not installed
+automatically. From the repo root:
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp clients/pi/systemd/gourdsworth-porch.service ~/.config/systemd/user/
+systemctl --user daemon-reload && systemctl --user enable --now gourdsworth-porch.service
+```
+
+The unit reads `clients/pi/local.env` when that file exists. Put `CRATE_HOST`
+there; the unit does not set an address.
 
 Or cron every 2 minutes:
 
