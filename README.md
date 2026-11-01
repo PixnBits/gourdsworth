@@ -4,7 +4,7 @@
 
 Mayor Gourdsworth of Pumpkinville greets trick-or-treaters on the porch. Halloween 2026 was its first live night.
 
-The Raspberry Pi 4 handles only the mic, wired desktop speakers on the Pi, the camera, the Talk button, and the face. The face is a UART link to an ESP32 that drives one LED strip lighting both the eyes and the mouth. Speech sets the brightness from the reply audio, and between replies the strip runs a flame animation shaped by the LED placement map ([hardware/ledmap231.json](hardware/ledmap231.json), turned into `firmware/esp32/src/led_height.h` by [tools/ledmap_to_header.py](tools/ledmap_to_header.py)). All inference (STT, LLM, TTS, vision) runs locally on the Framework Desktop. No cloud. Audio and stills stay in RAM, and nothing leaves the house.
+The Raspberry Pi 4 handles only the mic, wired desktop speakers on the Pi, the camera, and the face. The face is a UART link to an ESP32 that drives one LED strip lighting both the eyes and the mouth. Speech sets the brightness from the reply audio, and between replies the strip runs a flame animation shaped by the LED placement map ([hardware/ledmap231.json](hardware/ledmap231.json), turned into `firmware/esp32/src/led_height.h` by [tools/ledmap_to_header.py](tools/ledmap_to_header.py)). All inference (STT, LLM, TTS, vision) runs locally on the Framework Desktop. No cloud. Audio and stills stay in RAM, and nothing leaves the house.
 
 ## Halloween 2026 live night
 
@@ -29,7 +29,6 @@ The live night ran VAD mode on the LAN with vision on, unlike the `config.exampl
 flowchart LR
   mic["USB mic"] --> pi["crate_client.py"]
   cam["Webcam stills"] --> pi
-  btn["gpiozero Talk button"] --> pi
   pi --> spk["Wired desktop speakers (PipeWire pw-play)"]
   pi -->|"speech level from playback RMS"| uart["face_link UART /dev/serial0"]
   uart --> esp["ESP32"]
@@ -58,21 +57,21 @@ LED 5 V and the Pi USB-C supply stay on separate rails. Grounds meet at one star
 | Part | Role |
 | --- | --- |
 | Framework Desktop (AMD Ryzen AI Max / Strix Halo) | Inference host |
-| Raspberry Pi 4 | Mic, speaker, camera, Talk button, face UART |
+| Raspberry Pi 4 | Mic, speaker, camera, face UART |
 | ESP32 DevKit V1, WROOM-32, 30-pin | UART from the Pi; drives the LEDs |
 | 74AHCT125 | Level shifter, LED data |
-| WS2812B LED strip, 231 LEDs, GPIO 18 | Whole face, eyes and mouth. TODO: confirm strip product and density |
+| [BTF-LIGHTING WS2812B IC RGB LED Strip, UL listed, DC 5 V, 16.4 ft, 300 LEDs, IP30 (60 LEDs/m)](https://a.co/d/03Zu0j3C) | Whole face, eyes and mouth, on GPIO 18. 231 of the 300 LEDs are used |
 | Mean Well LRS-150-5 | LED supply. BOM also lists LRS-150F-5 |
 | Raspberry Pi 15 W USB-C supply | Pi only |
 | Wired desktop speakers | Pi audio out |
-| USB webcam | Code mentions BRIO. TODO: confirm |
-| USB mic | Code mentions a BRIO mic and a CM108. TODO: confirm |
-| Talk button | gpiozero, BCM pin set by `--button-pin`. TODO: confirm part and pin |
-| Pumpkin shell / enclosure | TODO: confirm |
+| USB webcam and/or USB mic | Any generic USB webcam and/or mic works |
+| [Hobby Lobby Orange Jumbo Pumpkin](https://www.hobbylobby.com/fall-thanksgiving/fall-thanksgiving-decorations/pumpkin-decor/orange-jumbo-pumpkin/p/81281996) | Shell, 22" W x 19" H |
 
 ## Setup and run
 
 ```bash
+git clone git@github.com:PixnBits/gourdsworth.git
+cd gourdsworth
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e .
