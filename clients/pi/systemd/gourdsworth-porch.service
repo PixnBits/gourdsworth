@@ -1,0 +1,15 @@
+[Unit]
+Description=Gourdsworth porch crate client
+After=pipewire.service pipewire-pulse.service wireplumber.service
+Wants=pipewire.service
+
+[Service]
+WorkingDirectory=%h/projects/gourdsworth
+Environment=PYTHONPATH=src
+EnvironmentFile=-%h/projects/gourdsworth/clients/pi/local.env
+ExecStart=/usr/bin/python3 clients/pi/crate_client.py --continuous
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
