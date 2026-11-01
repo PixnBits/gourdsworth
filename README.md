@@ -19,7 +19,9 @@ The desktop server log for the night, after the last server start, records 132 t
 | llm_ttft | 250 ms | 294 ms |
 | tts_first | 182 ms | 269 ms |
 
-Models on that start: faster-whisper `base.en`, Ollama `llama3.1:8b`, Piper `en_US-danny-low`, CLIP ViT-B-32 costume hints, and an optional YOLOv8n person count.
+Models on that start: faster-whisper `base.en`, Ollama `llama3.1:8b` on the Vulkan backend, Piper `en_US-danny-low`, CLIP ViT-B-32 costume hints, and an optional YOLOv8n person count.
+
+The live night ran VAD mode on the LAN with vision on, unlike the `config.example.yaml` defaults (push-to-talk, loopback, vision off).
 
 ## Turn path
 
@@ -38,7 +40,7 @@ flowchart LR
   pi <-->|"TCP 8746 JSON lines, 16 kHz PCM uplink, JPEG stills, Piper float32 downlink, gesture events"| net["net.py listener, trusted_peers allowlist"]
   net --> stt["stt.py faster-whisper"]
   stt --> guard["guardrails and canned/lines.json"]
-  guard --> llm["llm.py Ollama at 127.0.0.1:11434, streaming"]
+  guard --> llm["llm.py Ollama (Vulkan) at 127.0.0.1:11434, streaming"]
   guard --> tts["tts.py Piper"]
   llm --> early["early_speakable flush"]
   early --> tts
@@ -87,6 +89,18 @@ ollama pull llama3.1:8b
 ```
 
 Ollama must already be running on the desktop. Set `ollama.model` in `config.yaml` to the pulled name. If that name is not pulled, startup auto-selects the best already-pulled instruct model (prefers about 7–8B; 14B is accepted when that is the smallest). The example voice is Piper `en_US-danny-low`.
+
+### GPU note / known issue
+
+Ollama on the Framework Desktop runs the Vulkan backend with ROCm hidden. ROCm on gfx1151 produced garbled `llama3.1:8b` output with the full Mayor prompt. Set it in a `systemctl edit ollama` override:
+
+```
+[Service]
+Environment=OLLAMA_VULKAN=1
+Environment=OLLAMA_IGPU_ENABLE=1
+Environment=HIP_VISIBLE_DEVICES=-1
+Environment=ROCR_VISIBLE_DEVICES=-1
+```
 
 Desktop crate block. `192.0.2.55` is a documentation address for the Pi. Use the Pi's address.
 
