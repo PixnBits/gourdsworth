@@ -1,125 +1,108 @@
 # Gourdsworth
 
-Mayor Gourdsworth of Pumpkinville. A family-safe Halloween greeter that listens and answers **entirely on your machine**.
+![Mayor Gourdsworth on the porch](docs/images/mayor-porch.jpg)
 
-Phase 1 is disembodied on purpose: laptop or Framework Desktop, built-in mic and speakers, no pumpkin. Use it to measure latency and watch how kids talk to a voice with no body.
+Mayor Gourdsworth of Pumpkinville greets trick-or-treaters on the porch. Halloween 2026 was its first live night.
 
-Phase 2 is the porch **crate**: a Raspberry Pi streams mic PCM and optional JPEG stills to this same process over the LAN. Inference (STT / LLM / TTS / vision) stays on the desktop. The Pi does not run Whisper, Ollama, or CLIP.
+The Raspberry Pi 4 handles only the mic, the speaker, the camera, the Talk button, and the face. The face is a UART link to an ESP32 that drives the LEDs and the servos. All inference (STT, LLM, TTS, vision) runs locally on the Framework Desktop. No cloud. Audio and stills stay in RAM, and nothing leaves the house.
 
-Nothing is sent to a cloud API. Audio and stills are kept in RAM and discarded after each turn. They never leave the LAN.
+## Halloween 2026 live night
 
-## Upgrading
+The desktop server log for the night, after the last server start, records 132 turns. 131 used the streaming early-TTS path. 1 was a canned line. The table is all 132 turns.
 
-- Invalid `trusted_peers` / `CRATE_TRUSTED_PEERS` entries (CIDR, hostname, `*`) make the server exit with code 2 at startup instead of warning.
-- A non-loopback crate bind with an empty trusted-peer list is refused (exit 2). A loopback bind with an empty list still starts.
+`first_syllable` is the silence after the kid stops talking until the first Mayor audio.
 
-## Quick start
+| | median | p90 |
+| --- | ---: | ---: |
+| first_syllable | 1634 ms | 2619 ms |
+| stt | 214 ms | 317 ms |
+| llm_ttft | 250 ms | 294 ms |
+| tts_first | 182 ms | 269 ms |
+
+Models on that start: faster-whisper `base.en`, Ollama `llama3.1:8b`, Piper `en_US-danny-low`, CLIP ViT-B-32 costume hints, and an optional YOLOv8n person count.
+
+## Turn path
+
+```mermaid
+flowchart LR
+  mic["USB mic"] --> pi["crate_client.py"]
+  cam["Webcam stills"] --> pi
+  btn["gpiozero Talk button"] --> pi
+  pi --> spk["Speaker via PipeWire pw-play / Bluetooth JBL"]
+  pi -->|"viseme from playback RMS, gesture forward"| uart["face_link UART /dev/serial0"]
+  uart --> esp["ESP32"]
+  esp --> lvl["74AHCT125"]
+  lvl --> leds["WS2812B mouth and eyes"]
+  esp --> pca["PCA9685"]
+  pca --> servos["Servos"]
+  pi <-->|"TCP 8746 JSON lines, 16 kHz PCM uplink, JPEG stills, Piper float32 downlink, gesture events"| net["net.py listener, trusted_peers allowlist"]
+  net --> stt["stt.py faster-whisper"]
+  stt --> guard["guardrails and canned/lines.json"]
+  guard --> llm["llm.py Ollama at 127.0.0.1:11434, streaming"]
+  guard --> tts["tts.py Piper"]
+  llm --> early["early_speakable flush"]
+  early --> tts
+  tts --> net
+  net --> clip["vision.py CLIP on Pi JPEGs"]
+  clip -->|"visual note, does not block voice"| llm
+```
+
+The Pi client is `clients/pi/crate_client.py`. The desktop command is `python -m gourdsworth --serve-crate --vision`. CLIP may attach a visual note when the LLM starts. Voice keeps going while CLIP runs. See [ARCHITECTURE.md](ARCHITECTURE.md) and [firmware/esp32/README.md](firmware/esp32/README.md).
+
+## Hardware (BOM)
+
+Summary from [hardware/BOM.md](hardware/BOM.md) and the other hardware docs. Full parts list and the wiring diagram: [hardware/BOM.md](hardware/BOM.md), [hardware/wiring.svg](hardware/wiring.svg), [hardware/README.md](hardware/README.md).
+
+LED 5 V, servo 5 V, and the Pi USB-C supply stay on separate rails. Grounds meet at one star point.
+
+| Part | Role |
+| --- | --- |
+| Framework Desktop (AMD Ryzen AI Max / Strix Halo) | Inference host |
+| Raspberry Pi 4 | Mic, speaker, camera, Talk button, face UART |
+| ESP32 DevKit V1, WROOM-32, 30-pin | UART from the Pi; drives LEDs and servos |
+| 74AHCT125 | Level shifter, LED data |
+| PCA9685 16-channel | Servo pulses |
+| 4× micro servos (SG90 / MG90S) | Brow L, brow R, hat, mustache |
+| BTF-LIGHTING WS2812B 8×32 panel | Mouth |
+| BTF-LIGHTING WS2812B 60 LED/m strip | Eyes, 2×16 px |
+| Mean Well LRS-150-5 | LED supply. BOM also lists LRS-150F-5 |
+| 5 V, 8–10 A brick | Servo supply |
+| Raspberry Pi 15 W USB-C supply | Pi only |
+| JBL Bluetooth speaker | TODO: confirm model |
+| USB webcam | Code mentions BRIO. TODO: confirm |
+| USB mic | Code mentions a BRIO mic and a CM108. TODO: confirm |
+| Talk button | gpiozero, BCM pin set by `--button-pin`. TODO: confirm part and pin |
+| Anker Solix power station | TODO: confirm model |
+| Pumpkin shell / enclosure | TODO: confirm |
+
+## Setup and run
 
 ```bash
-git clone git@github.com:PixnBits/gourdsworth.git
-cd gourdsworth
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e .
-cp config.example.yaml config.yaml
-```
-
-Ollama must already be running with a small instruct model:
-
-```bash
-ollama pull llama3.1:8b
-# or whatever 4B–14B instruct model you already keep warm (e.g. qwen2.5:14b)
-```
-
-Set `ollama.model` in `config.yaml` to that name. If the configured name is not pulled, startup auto-selects the best already-pulled instruct model (prefers ~7–8B; 14B is accepted when that is the smallest).
-
-```bash
-python -m gourdsworth --list-devices   # pick mic/speaker ids
-python -m gourdsworth --input N --output N
-python -m gourdsworth                  # push-to-talk: Enter to listen, Enter to stop
-python -m gourdsworth --mode vad
-python -m gourdsworth --continuous --input 6 --output 8   # hands-free porch loop
-python -m gourdsworth --dry-run
-python -m gourdsworth --stt-model tiny.en --mode vad --input 6 --output 8
-python -m gourdsworth --snap                 # kitchen still (needs extras + webcam)
-python -m gourdsworth --vision               # Talk grabs one RAM frame in parallel
-python -m gourdsworth --serve-crate          # Phase 2: listen for one Pi crate client
-python -m gourdsworth --crate-echo           # protocol smoke (no models)
-```
-
-`--dry-run` skips the mic and speaker playback so you can type kid-proxy lines and still see LLM (+ optional TTS synth) timing. Startup still preloads Whisper, warms Ollama (`keep_alive`), and loads Piper, printing load times.
-
-Every spoken turn prints a metrics line:
-
-```
-record=…ms  stt=…ms  llm_ttft=…ms  llm=…ms  tts_first=…ms  tts=…ms  play=…ms  first_syllable≈…ms  turn=…ms
-```
-
-`first_syllable` is the number that matters for porch magic: silence → first Mayor audio. Target under 1000 ms. Under 1500 ms is usable. Above 2500 ms, shrink the Whisper model or the LLM.
-
-## Privacy
-
-- `save_audio` and `save_transcripts` are hard-refused at startup if set true
-- Ollama is called at `127.0.0.1` only
-- History is four turns of **text**, in process memory
-- No WAV files in the project workflow (espeak / Piper-CLI fallback may use a NamedTemporaryFile that is unlinked immediately)
-- Crate TCP **defaults to `127.0.0.1`**. Binding `0.0.0.0` or a LAN IP requires `crate.allow_lan: true` in `config.yaml`. That opt-in means anyone on that network can read children's PCM and JPEG; there is no TLS and no auth. Do not port-forward this.
-
-Porch sign copy (vision, when enabled):
-
-*A camera looks only when someone is at the crate. No faces are saved. Nothing leaves this house. (Startup may download CLIP/YOLO *model weights* once into `~/.cache`; that is not porch audio or frames. Later runs stay offline for Hub.)*
-
-## Vision (opt-in, V0 kitchen still)
-
-Voice stays the product. A USB webcam is spice. If the lens is unplugged or CLIP is slow, Talk → STT → LLM → TTS behaves exactly as it does without `--vision`. `first_syllable_ms` does **not** wait on a frame.
-
-Install extras only when you want the camera:
-
-```bash
 pip install -e '.[vision]'
-# first CLIP load downloads ViT-B-32 (~350 MB, OpenAI weights via open_clip). Offline after that.
-python -m gourdsworth --snap                 # grab one frame, print top 3 labels + visual_note, exit
-python -m gourdsworth --snap --dry-run       # same; prints the note, does not call the mayor
-python -m gourdsworth --vision               # on Talk: fire-and-forget still; inject note if ready in time
-python -m gourdsworth --vision --camera 0 --dry-run
+cp config.example.yaml config.yaml
+ollama pull llama3.1:8b
 ```
 
-Or set `vision.enabled: true` in `config.yaml`. Labels live in `src/gourdsworth/costume_labels.txt` (closed list; unsure → `homemade`). No JPEG is written. No faces, names, or ages. Neighbors' kids are the threat model.
+Ollama must already be running on the desktop. Set `ollama.model` in `config.yaml` to the pulled name. If that name is not pulled, startup auto-selects the best already-pulled instruct model (prefers about 7–8B; 14B is accepted when that is the smallest). The example voice is Piper `en_US-danny-low`.
 
-V0 kitchen stills are USB-on-the-Framework-Desktop. Phase 2 (`--serve-crate --vision`) classifies JPEG stills the Pi sends over the crate socket instead of opening the desktop camera. Presence / PIR and a local VLM sentence are later issues.
-
-## Character
-
-`prompts/mayor_system.txt` is the whole personality. `canned/lines.json` covers silence, crowds, distress, and model failure. Edit those before you edit code.
-
-## Phase 2 — crate (Pi ↔ desktop)
-
-The desktop runs the existing turn loop. When a crate client is connected, mic/speakers are remote PCM instead of local sounddevice.
-
-**Desktop** (this repo, models already working from Phase 1):
-
-```bash
-python -m gourdsworth --serve-crate
-python -m gourdsworth --serve-crate --vision     # CLIP on Pi JPEGs; voice does not wait
-```
-
-Bind is `crate.host` / `crate.port` in `config.yaml` (default `127.0.0.1:8746`). To listen on the porch LAN:
+Desktop crate block. `192.0.2.55` is a documentation address for the Pi. Use the Pi's address.
 
 ```yaml
 crate:
   host: 0.0.0.0
   port: 8746
-  allow_lan: true   # required; PCM/JPEG then visible to the whole LAN, no TLS
-  trusted_peers: [192.0.2.55]  # only the Pi. Empty on a non-loopback bind refuses startup.
+  allow_lan: true
+  trusted_peers: [192.0.2.55]
 ```
 
-A new TCP connection is not served until it sends a crate hello (`role` `crate`, `proto` 1, no payload) within 3 seconds. That deadline covers the whole hello. A line over about 1 KiB, or a hello that declares a payload, is closed without reading the payload. Pending hellos are capped (16 at once, 2 per address). Anything else is closed and the Mayor stays up.
+`trusted_peers` is an allowlist of IP addresses. Other addresses are closed at accept. Put only the Pi on the list. A second trusted address can replace the Pi and hold it in the 30 second backoff. Entries split on commas or whitespace. A CIDR, a hostname, or `*` exits 2, and the error names the bad entry. An IPv4-mapped address (`::ffff:a.b.c.d`) compares as IPv4. A non-loopback bind with an empty trusted list exits with code 2. A loopback bind with an empty list still starts. `CRATE_TRUSTED_PEERS` is read once at startup and merged with `crate.trusted_peers`.
 
-When `crate.trusted_peers` or `CRATE_TRUSTED_PEERS` is non-empty, that list is an allowlist: other addresses are closed at accept, even if nobody is connected. Put **only the Pi** on it. A second trusted address can evict the Pi and hold it in the 30 second backoff. Entries are IP addresses, split on commas or whitespace. A CIDR, a hostname, or `*` refuses startup and is named in the error. `::ffff:a.b.c.d` is compared as IPv4. The environment variable is read once at startup.
+Pin the Pi in the user unit:
 
-With `allow_lan` and an empty list the server refuses to start (exit 2). A loopback bind with an empty list still starts. Pin the Pi in `config.yaml` (`trusted_peers: [192.0.2.55]`) or in the user systemd unit:
-
-```
+```bash
 systemctl --user edit gourdsworth-server
 ```
 
@@ -128,71 +111,68 @@ systemctl --user edit gourdsworth-server
 Environment=CRATE_TRUSTED_PEERS=192.0.2.55
 ```
 
-`192.0.2.55` is a documentation address. Use the Pi's address there.
+Run the desktop:
 
-A live session, or a hello that is validated but not yet being served, is replaced only for that same IP or a trusted IP, and at most once every few seconds per IP. Anyone else who gets far enough to say hello receives `{"event":"error","message":"busy"}`. The peer that was replaced receives `{"event":"superseded"}` and the Pi client backs off about 30 seconds before reconnecting, so two clients do not kick each other in a loop. The same backoff applies to `busy`. An older Pi that ignores unknown events still reconnects. History is kept only when the new session is the exact same IP. A different trusted IP may replace the session and starts with an empty history. There is still no TLS and no shared secret.
+```bash
+python -m gourdsworth --serve-crate --vision
+```
 
-**Protocol smoke** (no Whisper / Ollama / Piper; fake client or the Pi script):
+On the Pi, see [clients/pi/README.md](clients/pi/README.md). `192.0.2.10` is a documentation address for the desktop.
+
+```bash
+PYTHONPATH=src python clients/pi/crate_client.py --host 192.0.2.10 --continuous
+```
+
+The user unit [clients/pi/systemd/gourdsworth-porch.service](clients/pi/systemd/gourdsworth-porch.service) runs `clients/pi/crate_client.py --continuous` and reads `clients/pi/local.env`. Copy that file from [clients/pi/local.env.example](clients/pi/local.env.example).
+
+Protocol smoke, same machine, no Whisper, Ollama, or Piper:
 
 ```bash
 python -m gourdsworth --crate-echo
-# other terminal, same machine:
 PYTHONPATH=src python clients/pi/crate_client.py --host 127.0.0.1 --no-camera --no-mic
-# Enter = Talk (sends silence). You should see GESTURE: tip and a play round-trip.
 ```
 
-Unit tests cover framing with an in-process loopback client (`pytest tests/test_net_framing.py`) — no hardware.
+Enter is Talk and sends silence. The client prints `GESTURE: tip` and plays a round trip.
 
-**Pi** (I/O only). See `clients/pi/README.md` for apt/pip deps. Do not install the full `gourdsworth` extras on the Pi.
+`--dry-run` skips the mic and speaker playback. Type a kid line and the process still reports LLM and TTS timing. Startup still preloads Whisper, warms Ollama, and loads Piper.
 
 ```bash
-PYTHONPATH=src python clients/pi/crate_client.py --host 192.168.x.desktop
-PYTHONPATH=src python clients/pi/crate_client.py --host 192.168.x.desktop --no-camera
-PYTHONPATH=src python clients/pi/crate_client.py --host 192.168.x.desktop --button-pin 17
+python -m gourdsworth --list-devices
+python -m gourdsworth --dry-run
 ```
 
-Uplink is 16 kHz mono signed 16-bit little-endian, 100 ms chunks (3200 bytes). Downlink is Piper float32 little-endian at the voice's native rate. JPEG is one length-prefixed still per Talk. Control is JSON lines: `{"event":"button","state":"down"}`, `{"event":"gesture","name":"tip"}`.
+Every spoken turn prints a metrics line:
 
-## Hardware
+```
+record=…ms  stt=…ms  llm_ttft=…ms  llm=…ms  tts_first=…ms  tts=…ms  play=…ms  first_syllable≈…ms  turn=…ms
+```
 
-Face, power, and pins live in [`hardware/`](hardware/README.md): [BOM](hardware/BOM.md) and [wiring diagram](hardware/wiring.svg).
+A crate turn can also print `uplink_first`, `uplink_jitter`, `[early-tts]` or `[canned]`, and vision fields. `first_syllable` is the porch wait defined above.
 
-Jaw = RMS of the outgoing samples, sent as a viseme id. The face plays six canned gestures the model *names* (`tip`, `beam`, `reckon`, `chuckle`, `attend`, `twirl`). The Pi forwards that name over UART; the ESP32 turns it into a PCA9685 pulse and clocks the LEDs. Do not generate servo trajectories on the desktop. See `ARCHITECTURE.md` and `firmware/esp32/README.md`.
+### Privacy
 
-## Mayor voice
+Startup exits with code 2 if `save_audio` or `save_transcripts` is true. Ollama stays on `127.0.0.1:11434`. History is four turns of text, in process memory. Crate TCP has no TLS and no auth. With `allow_lan: true`, anyone on that network can read the PCM and the JPEGs. Keep the port on the porch LAN.
 
-Default Piper voice is `en_US-danny-low` (fun, not intimidating). Switch back with `tts.voice: en_US-lessac-medium` in `config.yaml`.
+### Character
 
-## Latency results
+[prompts/mayor_system.txt](prompts/mayor_system.txt) is the personality. [canned/lines.json](canned/lines.json) covers silence, crowds, distress, and model failure.
 
-Measured on Framework Desktop (AMD Ryzen AI Max / Strix Halo), pipewire I/O, Piper `en_US-lessac-medium`.
+### Logs
 
-| Setup | first_syllable | notes |
-|-------|----------------:|-------|
-| M0 · qwen2.5:14b · base.en · wait-for-full-reply | ~1650 ms | live VAD |
-| M1 · early TTS + tiny.en · qwen2.5:14b | **~903 ms** | dry-run `[early-tts]` |
-| M1 · early TTS + tiny.en · llama3.1:8b | **~655–821 ms** | live VAD, pipewire I/O |
-
-`first_syllable ≈ stt + time_to_first_audio` after the kid stops talking.
-
-## STT accuracy
-
-Default is `base.en` (clearer on a noisy porch). `tiny.en` is faster but mangled live lines like "trick or treat" → "check our tree".
-
-Porch bias: Whisper gets an `initial_prompt` / hotwords for candy/costume/pumpkin phrases, plus a light corrector for short near-misses. See issue #4.
-
-## Porch run logs
-
-Both sides tee to `logs/` (gitignored):
+Both sides write under `logs/`, which is gitignored.
 
 - Desktop `--serve-crate`: `logs/crate-desktop.log`
-- Pi client: `logs/crate-pi.log` (override with `--log-file` / `CRATE_LOG`)
+- Pi client: `logs/crate-pi.log` (override with `--log-file` or `CRATE_LOG`)
 
-Pull them from the Framework Desktop / Pi without copy-paste.
+### Tests
 
-## Vision timing (crate continuous)
+```bash
+python -m pytest -q
+```
 
-Stills are fire-and-forget on the Pi (speech-end only in continuous mode, for thermal headroom). The desktop
-never waits on JPEG/CLIP before STT/TTS. If a note is ready when the LLM starts,
-it is attached; otherwise the still/result is carried to the next utterance
-unless a newer frame supersedes it.
+## Docs
+
+- [ARCHITECTURE.md](ARCHITECTURE.md)
+- [hardware/README.md](hardware/README.md)
+- [firmware/esp32/README.md](firmware/esp32/README.md)
+- [clients/pi/README.md](clients/pi/README.md)
