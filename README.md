@@ -4,7 +4,7 @@
 
 Mayor Gourdsworth of Pumpkinville greets trick-or-treaters on the porch. Halloween 2026 was its first live night.
 
-The Raspberry Pi 4 handles only the mic, the speaker, the camera, the Talk button, and the face. The face is a UART link to an ESP32 that drives the LEDs and the servos. All inference (STT, LLM, TTS, vision) runs locally on the Framework Desktop. No cloud. Audio and stills stay in RAM, and nothing leaves the house.
+The Raspberry Pi 4 handles only the mic, wired desktop speakers on the Pi, the camera, the Talk button, and the face. The face is a UART link to an ESP32 that drives one LED strip lighting both the eyes and the mouth. Speech sets the brightness from the reply audio, and between replies the strip runs a flame animation shaped by the LED placement map ([hardware/ledmap231.json](hardware/ledmap231.json), turned into `firmware/esp32/src/led_height.h` by [tools/ledmap_to_header.py](tools/ledmap_to_header.py)). All inference (STT, LLM, TTS, vision) runs locally on the Framework Desktop. No cloud. Audio and stills stay in RAM, and nothing leaves the house.
 
 ## Halloween 2026 live night
 
@@ -30,14 +30,12 @@ flowchart LR
   mic["USB mic"] --> pi["crate_client.py"]
   cam["Webcam stills"] --> pi
   btn["gpiozero Talk button"] --> pi
-  pi --> spk["Speaker via PipeWire pw-play / Bluetooth JBL"]
-  pi -->|"viseme from playback RMS, gesture forward"| uart["face_link UART /dev/serial0"]
+  pi --> spk["Wired desktop speakers (PipeWire pw-play)"]
+  pi -->|"speech level from playback RMS"| uart["face_link UART /dev/serial0"]
   uart --> esp["ESP32"]
   esp --> lvl["74AHCT125"]
-  lvl --> leds["WS2812B mouth and eyes"]
-  esp --> pca["PCA9685"]
-  pca --> servos["Servos"]
-  pi <-->|"TCP 8746 JSON lines, 16 kHz PCM uplink, JPEG stills, Piper float32 downlink, gesture events"| net["net.py listener, trusted_peers allowlist"]
+  lvl --> leds["One WS2812B strip, 231 LEDs, eyes and mouth: speech level + ledmap flame"]
+  pi <-->|"TCP 8746 JSON lines, 16 kHz PCM uplink, JPEG stills, Piper float32 downlink"| net["net.py listener, trusted_peers allowlist"]
   net --> stt["stt.py faster-whisper"]
   stt --> guard["guardrails and canned/lines.json"]
   guard --> llm["llm.py Ollama (Vulkan) at 127.0.0.1:11434, streaming"]
@@ -55,26 +53,21 @@ The Pi client is `clients/pi/crate_client.py`. The desktop command is `python -m
 
 Summary from [hardware/BOM.md](hardware/BOM.md) and the other hardware docs. Full parts list and the wiring diagram: [hardware/BOM.md](hardware/BOM.md), [hardware/wiring.svg](hardware/wiring.svg), [hardware/README.md](hardware/README.md).
 
-LED 5 V, servo 5 V, and the Pi USB-C supply stay on separate rails. Grounds meet at one star point.
+LED 5 V and the Pi USB-C supply stay on separate rails. Grounds meet at one star point.
 
 | Part | Role |
 | --- | --- |
 | Framework Desktop (AMD Ryzen AI Max / Strix Halo) | Inference host |
 | Raspberry Pi 4 | Mic, speaker, camera, Talk button, face UART |
-| ESP32 DevKit V1, WROOM-32, 30-pin | UART from the Pi; drives LEDs and servos |
+| ESP32 DevKit V1, WROOM-32, 30-pin | UART from the Pi; drives the LEDs |
 | 74AHCT125 | Level shifter, LED data |
-| PCA9685 16-channel | Servo pulses |
-| 4× micro servos (SG90 / MG90S) | Brow L, brow R, hat, mustache |
-| BTF-LIGHTING WS2812B 8×32 panel | Mouth |
-| BTF-LIGHTING WS2812B 60 LED/m strip | Eyes, 2×16 px |
+| WS2812B LED strip, 231 LEDs, GPIO 18 | Whole face, eyes and mouth. TODO: confirm strip product and density |
 | Mean Well LRS-150-5 | LED supply. BOM also lists LRS-150F-5 |
-| 5 V, 8–10 A brick | Servo supply |
 | Raspberry Pi 15 W USB-C supply | Pi only |
-| JBL Bluetooth speaker | TODO: confirm model |
+| Wired desktop speakers | Pi audio out |
 | USB webcam | Code mentions BRIO. TODO: confirm |
 | USB mic | Code mentions a BRIO mic and a CM108. TODO: confirm |
 | Talk button | gpiozero, BCM pin set by `--button-pin`. TODO: confirm part and pin |
-| Anker Solix power station | TODO: confirm model |
 | Pumpkin shell / enclosure | TODO: confirm |
 
 ## Setup and run
@@ -146,7 +139,7 @@ python -m gourdsworth --crate-echo
 PYTHONPATH=src python clients/pi/crate_client.py --host 127.0.0.1 --no-camera --no-mic
 ```
 
-Enter is Talk and sends silence. The client prints `GESTURE: tip` and plays a round trip.
+Enter is Talk and sends silence. The client plays a round trip.
 
 `--dry-run` skips the mic and speaker playback. Type a kid line and the process still reports LLM and TTS timing. Startup still preloads Whisper, warms Ollama, and loads Piper.
 
